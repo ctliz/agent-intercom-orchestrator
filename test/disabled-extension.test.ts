@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-test("Pi coworker kill switch prevents the orchestrator from registering tools or lifecycle hooks", async () => {
-  const previous = process.env.AGENT_INTERCOM_ORCHESTRATOR_DISABLED;
+test("Pi coworker kill switch prevents fleet tools and lifecycle hooks without a worker permission profile", async () => {
+  const previousDisabled = process.env.AGENT_INTERCOM_ORCHESTRATOR_DISABLED;
+  const previousPermissionProfile = process.env.AGENT_INTERCOM_PERMISSION_PROFILE;
   process.env.AGENT_INTERCOM_ORCHESTRATOR_DISABLED = "1";
+  delete process.env.AGENT_INTERCOM_PERMISSION_PROFILE;
   try {
     const registered: string[] = [];
     const pi: any = {
@@ -16,7 +18,9 @@ test("Pi coworker kill switch prevents the orchestrator from registering tools o
     extension(pi);
     assert.deepEqual(registered, []);
   } finally {
-    if (previous === undefined) delete process.env.AGENT_INTERCOM_ORCHESTRATOR_DISABLED;
-    else process.env.AGENT_INTERCOM_ORCHESTRATOR_DISABLED = previous;
+    if (previousDisabled === undefined) delete process.env.AGENT_INTERCOM_ORCHESTRATOR_DISABLED;
+    else process.env.AGENT_INTERCOM_ORCHESTRATOR_DISABLED = previousDisabled;
+    if (previousPermissionProfile === undefined) delete process.env.AGENT_INTERCOM_PERMISSION_PROFILE;
+    else process.env.AGENT_INTERCOM_PERMISSION_PROFILE = previousPermissionProfile;
   }
 });
