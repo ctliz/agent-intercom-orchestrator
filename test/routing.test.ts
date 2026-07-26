@@ -132,6 +132,9 @@ test("explicit model identifiers select direct Codex or Claude harnesses", () =>
   assert.equal(inferHarnessFromModel("openai/gpt-5.4"), "codex");
   assert.equal(inferHarnessFromModel("gpt-5.6-sol"), "codex");
   assert.equal(inferHarnessFromModel("codex-mini-latest"), "codex");
+  assert.equal(inferHarnessFromModel("o2"), "codex");
+  assert.equal(inferHarnessFromModel("o9-reasoning"), "codex");
+  assert.equal(inferHarnessFromModel("o1x"), undefined);
   assert.equal(inferHarnessFromModel("claude/claude-fable-5"), "claude");
   assert.equal(inferHarnessFromModel("anthropic/claude-opus-4-8"), "claude");
   assert.equal(inferHarnessFromModel("opus"), "claude");

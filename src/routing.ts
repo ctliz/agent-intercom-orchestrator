@@ -5,7 +5,7 @@ export const ROUTABLE_HARNESSES: Harness[] = ["pi", "codex", "claude", "opencode
 export const DEFAULT_MODEL_ROUTING: ModelRoutingConfig = {
   unmatchedHarness: null,
   rules: [
-    { harness: "codex", patterns: ["codex/*", "openai/*", "codex-*", "gpt-*", "o1*", "o3*", "o4*"] },
+    { harness: "codex", patterns: ["codex/*", "openai/*", "codex-*", "gpt-*", "o1", "o1-*", "o2", "o2-*", "o3", "o3-*", "o4", "o4-*", "o5", "o5-*", "o6", "o6-*", "o7", "o7-*", "o8", "o8-*", "o9", "o9-*"] },
     { harness: "claude", patterns: ["claude/*", "anthropic/*", "claude-*", "opus", "opus-*", "sonnet", "sonnet-*", "haiku", "haiku-*", "fable", "fable-*"] },
   ],
   stripPrefixes: {
