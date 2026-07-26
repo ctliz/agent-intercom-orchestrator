@@ -464,6 +464,17 @@ This prevents:
 
 Install the orchestrator package in the manager Pi, then use `agent_fleet`. It creates a durable ownership record and launches the complete harness process tree inside a transient systemd user service. Do not use tmux when `agent_fleet` can own the lifecycle.
 
+If the user asks for “orc work”, “orchestrate this”, or to “use coworkers”, treat that as an Agent Intercom Orchestrator request. You can omit both `harness` and `profile` to use capability-aware routing, or preview it without spawning:
+
+```typescript
+agent_fleet({ action: "route", role: "advisor" })
+agent_fleet({ action: "route", role: "builder", requiresSubagents: true })
+```
+
+The resolver checks the selected profile's executable or verified Pi runtime, persistence mode, requested effort, and nested-agent capability. It favors Pi for advisory/research/review/challenge work and direct Codex then direct Claude for implementation or nested-agent work. Explicit harness/profile choices always win; explicit Codex/OpenAI or Claude/Anthropic model identifiers select the corresponding direct harness. OpenCode is explicit-only. A configured `routing.preference` is authoritative, while legacy files without that block migrate an explicitly configured `defaultHarness` to the front. The preview explains every rank, warning, exclusion, selected profile/mode, and permission profile. Automatic routing checks the explicit, role-preset, or per-harness default profile; choose another profile explicitly rather than silently falling through within a harness.
+
+Use a bounded Ralph loop for substantial iterative assignments that need context refreshes, not quick one-shot work. After spawn, arrange a bounded `return_on` watcher or timed completion/timeout check-in and re-arm it deliberately; Intercom message delivery alone does not guarantee that the manager wakes.
+
 ### Independent Pi advisor
 
 ```typescript

@@ -3,7 +3,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { DEFAULT_PERMISSION_PROFILES } from "./permissions.ts";
-import type { Effort, GitPolicy, Harness, LaunchProfile, OrchestratorConfig, PermissionProfile, RolePreset, WorkspacePolicy } from "./types.ts";
+import type { Effort, GitPolicy, Harness, LaunchProfile, OrchestratorConfig, PermissionProfile, RolePreset, RoutingConfig, WorkspacePolicy } from "./types.ts";
 
 const HARNESSES: Harness[] = ["pi", "codex", "claude", "opencode"];
 const EFFORTS: Effort[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -103,11 +103,18 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
       instructions: "Implement the assigned scope and report verifiable evidence with completion claims.",
     },
     challenger: {
-      harness: "claude",
-      profile: "claude-safe",
+      harness: "pi",
+      profile: "pi-peer",
       permissionProfile: "review-readonly",
       effort: "high",
       instructions: "Challenge completion claims, inspect the actual evidence, and identify missing proof or defects.",
+    },
+    reviewer: {
+      harness: "pi",
+      profile: "pi-peer",
+      permissionProfile: "review-readonly",
+      effort: "high",
+      instructions: "Review the assigned work independently, inspect concrete evidence, and report defects or missing proof without editing unless asked.",
     },
     researcher: {
       harness: "pi",
@@ -115,6 +122,20 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
       permissionProfile: "review-readonly",
       effort: "medium",
       instructions: "Research the assigned question independently, cite concrete evidence, and report uncertainty clearly.",
+    },
+  },
+  routing: {
+    preference: ["pi", "codex", "claude", "opencode"],
+    explicitOnly: ["opencode"],
+    roles: {
+      advisor: ["pi", "codex", "claude"],
+      researcher: ["pi", "codex", "claude"],
+      reviewer: ["pi", "codex", "claude"],
+      challenger: ["pi", "codex", "claude"],
+      builder: ["codex", "claude", "pi"],
+    },
+    capabilities: {
+      requiresSubagents: ["codex", "claude"],
     },
   },
   leaseMinutes: 30,
@@ -237,6 +258,38 @@ function mergeHarnessEfforts(
   return result;
 }
 
+function mergeHarnessList(value: unknown, fallback: Harness[]): Harness[] {
+  if (!Array.isArray(value)) return [...fallback];
+  return [...new Set(value.filter(isHarness))];
+}
+
+function mergeRouting(value: unknown, legacyDefaultHarness?: Harness): RoutingConfig {
+  const fallback = DEFAULT_CONFIG.routing;
+  if (!isRecord(value)) {
+    const routing = structuredClone(fallback);
+    if (legacyDefaultHarness) {
+      routing.preference = [...new Set([legacyDefaultHarness, ...routing.preference])];
+    }
+    return routing;
+  }
+  const roles = structuredClone(fallback.roles);
+  if (isRecord(value.roles)) {
+    for (const [role, preference] of Object.entries(value.roles)) {
+      if (Array.isArray(preference)) roles[role] = [...new Set(preference.filter(isHarness))];
+    }
+  }
+  const capabilities = isRecord(value.capabilities) ? value.capabilities : {};
+  return {
+    preference: mergeHarnessList(value.preference, fallback.preference),
+    // OpenCode is always explicit-only even if an older/custom file omits it.
+    explicitOnly: [...new Set([...mergeHarnessList(value.explicitOnly, fallback.explicitOnly), "opencode" as const])],
+    roles,
+    capabilities: {
+      requiresSubagents: mergeHarnessList(capabilities.requiresSubagents, fallback.capabilities.requiresSubagents),
+    },
+  };
+}
+
 export function mergeConfig(value: unknown): OrchestratorConfig {
   if (!isRecord(value)) return structuredClone(DEFAULT_CONFIG);
   const profiles = structuredClone(DEFAULT_CONFIG.profiles);
@@ -260,19 +313,21 @@ export function mergeConfig(value: unknown): OrchestratorConfig {
       if (role) roles[name] = { ...(roles[name] ?? {}), ...role };
     }
   }
+  const defaultHarness = isHarness(value.defaultHarness) ? value.defaultHarness : DEFAULT_CONFIG.defaultHarness;
   const idleTimeoutMinutes = positiveNumber(value.idleTimeoutMinutes, DEFAULT_CONFIG.idleTimeoutMinutes);
   const checkpointWarningMinutes = Math.min(
     positiveNumber(value.checkpointWarningMinutes, DEFAULT_CONFIG.checkpointWarningMinutes),
     idleTimeoutMinutes,
   );
   return {
-    defaultHarness: isHarness(value.defaultHarness) ? value.defaultHarness : DEFAULT_CONFIG.defaultHarness,
+    defaultHarness,
     defaultProfiles: mergeHarnessStrings(value.defaultProfiles, DEFAULT_CONFIG.defaultProfiles),
     defaultModels: mergeHarnessStrings(value.defaultModels, DEFAULT_CONFIG.defaultModels),
     defaultEfforts: mergeHarnessEfforts(value.defaultEfforts, DEFAULT_CONFIG.defaultEfforts),
     profiles,
     permissionProfiles,
     roles,
+    routing: mergeRouting(value.routing, !isRecord(value.routing) && isHarness(value.defaultHarness) ? defaultHarness : undefined),
     leaseMinutes: positiveNumber(value.leaseMinutes, DEFAULT_CONFIG.leaseMinutes),
     heartbeatSeconds: positiveNumber(value.heartbeatSeconds, DEFAULT_CONFIG.heartbeatSeconds),
     maxRuntime: typeof value.maxRuntime === "string" && value.maxRuntime.trim() ? value.maxRuntime : DEFAULT_CONFIG.maxRuntime,
@@ -344,6 +399,23 @@ export async function writeConfigDefaults(path: string, config: OrchestratorConf
       return Object.keys(delta).length ? [[name, delta]] : [];
     }),
   );
+  const hadRoutingObject = isRecord(existing.routing);
+  const routingRoles = Object.fromEntries(
+    Object.entries(config.routing.roles).filter(([name, preference]) =>
+      JSON.stringify(preference) !== JSON.stringify(DEFAULT_CONFIG.routing.roles[name])),
+  );
+  const routing = {
+    ...(JSON.stringify(config.routing.preference) !== JSON.stringify(DEFAULT_CONFIG.routing.preference)
+      ? { preference: config.routing.preference }
+      : {}),
+    ...(JSON.stringify(config.routing.explicitOnly) !== JSON.stringify(DEFAULT_CONFIG.routing.explicitOnly)
+      ? { explicitOnly: config.routing.explicitOnly }
+      : {}),
+    ...(Object.keys(routingRoles).length ? { roles: routingRoles } : {}),
+    ...(JSON.stringify(config.routing.capabilities.requiresSubagents) !== JSON.stringify(DEFAULT_CONFIG.routing.capabilities.requiresSubagents)
+      ? { capabilities: { requiresSubagents: config.routing.capabilities.requiresSubagents } }
+      : {}),
+  };
   await writeConfigValue(path, {
     ...existing,
     defaultHarness: config.defaultHarness,
@@ -352,6 +424,7 @@ export async function writeConfigDefaults(path: string, config: OrchestratorConf
     defaultEfforts: config.defaultEfforts,
     permissionProfiles,
     roles,
+    routing: Object.keys(routing).length ? routing : hadRoutingObject ? {} : undefined,
     leaseMinutes: config.leaseMinutes,
     heartbeatSeconds: config.heartbeatSeconds,
     maxRuntime: config.maxRuntime,
@@ -375,7 +448,14 @@ export function expandHome(path: string): string {
 
 export function resolveProfileCommand(command: string, pathEnv = process.env.PATH ?? ""): string | undefined {
   const expanded = expandHome(command);
-  if (isAbsolute(expanded)) return expanded;
+  if (isAbsolute(expanded)) {
+    try {
+      const stat = statSync(expanded);
+      return stat.isFile() && (stat.mode & 0o111) !== 0 ? expanded : undefined;
+    } catch {
+      return undefined;
+    }
+  }
   for (const directory of pathEnv.split(":")) {
     if (!directory) continue;
     const candidate = join(directory, expanded);

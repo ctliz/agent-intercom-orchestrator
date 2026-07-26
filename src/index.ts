@@ -12,6 +12,7 @@ import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-ti
 import { buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy } from "./permissions.ts";
 import { resolvePiRuntime } from "./pi-runtime.ts";
 import { prepareWorkerRuntime, workerRuntimeRoot, workerSocketRuntimeRoot } from "./runtime.ts";
+import { detectHarnessAvailability, formatRoutingDecision, inferHarnessFromModel, resolveHarnessRoute, type HarnessAvailability, type RoutingDecision } from "./routing.ts";
 import { WorkerStore } from "./store.ts";
 import { getUnitStatus, launchUnit, listWorkerUnits, makeUnitName, parseDurationToSeconds, readUnitLogs, readUnitProcessTree, stopUnit, systemdAvailable } from "./systemd.ts";
 import type { CommandRunner, Effort, Harness, OrchestratorConfig, PermissionProfile, RolePreset, WorkerRecord, WorkerStateFile } from "./types.ts";
@@ -37,6 +38,7 @@ import { detectHarnessVersions, formatAdapterVersions, formatHarnessVersions, fo
 
 const ACTIONS = [
   "spawn",
+  "route",
   "list",
   "status",
   "stop",
@@ -81,6 +83,7 @@ const AgentFleetParams = Type.Object({
   model: Type.Optional(Type.String({ description: "Harness model name or provider/model identifier" })),
   effort: Type.Optional(StringEnum(EFFORTS)),
   instructions: Type.Optional(Type.String({ description: "Additional standing instructions for the coworker" })),
+  requiresSubagents: Type.Optional(Type.Boolean({ description: "Require a harness capable of delegating to nested subagents during automatic routing" })),
   fresh: Type.Optional(Type.Boolean({ description: "Start a fresh persistent harness session instead of resuming state for this worker id" })),
   all: Type.Optional(Type.Boolean({ description: "Include workers owned by other manager sessions for list/status diagnostics" })),
   execute: Type.Optional(Type.Boolean({ description: "Actually execute cleanup or updates; false previews them" })),
@@ -100,6 +103,7 @@ type FleetParams = {
   model?: string;
   effort?: Effort;
   instructions?: string;
+  requiresSubagents?: boolean;
   fresh?: boolean;
   all?: boolean;
   execute?: boolean;
@@ -118,6 +122,17 @@ type ResolvedSpawn = {
   model?: string;
   effort?: Effort;
   instructions?: string;
+  routing: RoutingDecision;
+};
+
+type ResolvedRoute = {
+  role: string;
+  harness?: Harness;
+  profileName?: string;
+  permissionProfileName: string;
+  effectiveEffort?: Effort;
+  availability: Record<Harness, HarnessAvailability>;
+  decision: RoutingDecision;
 };
 
 function textResult(text: string, details?: unknown) {
@@ -402,6 +417,9 @@ function formatConfig(config: OrchestratorConfig, configPath: string): string {
   }
   lines.push(`permissions: ${Object.keys(config.permissionProfiles).sort().join(", ") || "(none)"}`);
   lines.push(`roles: ${Object.keys(config.roles).sort().join(", ") || "(none)"}`);
+  lines.push(`routing preference: ${config.routing.preference.join(" -> ") || "(none)"}`);
+  lines.push(`routing explicit-only: ${config.routing.explicitOnly.join(", ") || "(none)"}`);
+  lines.push(`routing subagent-capable: ${config.routing.capabilities.requiresSubagents.join(", ") || "(none)"}`);
   lines.push(`lease=${config.leaseMinutes}m idle=${config.idleTimeoutMinutes}m checkpoint-warning=${config.checkpointWarningMinutes}m retry=${config.checkpointRetryMinutes}m grace=${config.cleanupGraceMinutes}m heartbeat=${config.heartbeatSeconds}s max-runtime=${config.maxRuntime}`);
   lines.push(`cleanup: startup=${config.cleanupExpiredOnStart} shutdown=${config.cleanupOnShutdown} timer=${config.cleanupTimerEnabled ? `${config.cleanupTimerMinutes}m` : "disabled"}`);
   return lines.join("\n");
@@ -660,19 +678,102 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     return [...result];
   };
 
-  const resolveSpawn = (params: FleetParams, ctx: ExtensionContext): ResolvedSpawn => {
+  const resolveRouting = async (params: FleetParams): Promise<ResolvedRoute> => {
     const role = params.role?.trim() || "worker";
     const preset: RolePreset | undefined = config.roles[role];
-    const harness = params.harness || preset?.harness || config.defaultHarness;
+    const requestedProfileName = params.profile?.trim();
+    const requestedProfile = requestedProfileName ? config.profiles[requestedProfileName] : undefined;
+    if (requestedProfileName && !requestedProfile) throw new Error(`Unknown launch profile: ${requestedProfileName}`);
+    const presetProfile = preset?.profile ? config.profiles[preset.profile] : undefined;
+    const presetHarness = preset?.harness ?? presetProfile?.harness;
+    const modelHarness = !params.harness && !requestedProfile ? inferHarnessFromModel(params.model) : undefined;
+    const explicitHarness = params.harness ?? requestedProfile?.harness ?? modelHarness;
+    const profileOverrides: Partial<Record<Harness, string>> = {};
+    if (requestedProfileName && explicitHarness) profileOverrides[explicitHarness] = requestedProfileName;
+    else if (preset?.profile && presetHarness) profileOverrides[presetHarness] = preset.profile;
+    const availability = detectHarnessAvailability(config, {
+      profileOverrides,
+      supportedEfforts: HARNESS_EFFORTS,
+      resolveCommand: resolveProfileCommand,
+    });
+
+    const piProfileName = profileOverrides.pi ?? config.defaultProfiles.pi;
+    const piProfile = piProfileName ? config.profiles[piProfileName] : undefined;
+    if (piProfileName && piProfile?.harness === "pi" && piProfile.spawnable !== false) {
+      const configuredExecutable = resolveProfileCommand(piProfile.command);
+      const piRuntime = await resolvePiRuntime({
+        profileName: piProfileName,
+        profile: piProfile,
+        configuredExecutable,
+        builtInProfile: DEFAULT_CONFIG.profiles["pi-peer"],
+      });
+      if (piRuntime) {
+        availability.pi = {
+          ...availability.pi,
+          available: true,
+          profile: piProfileName,
+          executable: piRuntime.command,
+          mode: piProfile.mode ?? "persistent",
+          reasons: [piRuntime.source === "manager-runtime"
+            ? `profile '${piProfileName}' is spawnable in ${piProfile.mode ?? "persistent"} mode through verified manager Pi${piRuntime.version ? ` ${piRuntime.version}` : ""} at ${piRuntime.command}`
+            : `profile '${piProfileName}' is spawnable in ${piProfile.mode ?? "persistent"} mode at ${piRuntime.command}`],
+        };
+      }
+    }
+
+    const permissionProfileName = params.permissionProfile?.trim() || preset?.permissionProfile || "builder-restricted";
+    if (!config.permissionProfiles[permissionProfileName]) throw new Error(`Unknown permission profile: ${permissionProfileName}`);
+    const candidateEfforts = Object.fromEntries(HARNESSES.flatMap((harness) => {
+      const presetEffort = !presetHarness || presetHarness === harness ? preset?.effort : undefined;
+      const effort = params.effort ?? presetEffort ?? config.defaultEfforts[harness];
+      return effort ? [[harness, effort]] : [];
+    })) as Partial<Record<Harness, Effort>>;
+    const decision = resolveHarnessRoute({
+      role,
+      defaultHarness: config.defaultHarness,
+      routing: config.routing,
+      availability,
+      presetHarness,
+      ...(explicitHarness ? { explicitHarness } : {}),
+      ...(params.harness
+        ? { explicitSource: "harness" as const }
+        : requestedProfile
+          ? { explicitSource: "profile" as const }
+          : modelHarness
+            ? { explicitSource: "model" as const }
+            : {}),
+      requiresSubagents: params.requiresSubagents,
+      requestedEffort: params.effort,
+      candidateEfforts,
+    });
+    const harness = decision.selected;
+    const profileName = harness
+      ? requestedProfileName
+        ?? (preset?.profile && presetProfile?.harness === harness ? preset.profile : undefined)
+        ?? availability[harness].profile
+        ?? config.defaultProfiles[harness]
+      : undefined;
+    const effectiveEffort = harness ? candidateEfforts[harness] : undefined;
+    return { role, harness, profileName, permissionProfileName, ...(effectiveEffort ? { effectiveEffort } : {}), availability, decision };
+  };
+
+  const resolveSpawn = async (params: FleetParams, ctx: ExtensionContext): Promise<ResolvedSpawn> => {
+    const routed = await resolveRouting(params);
+    const { role, harness, profileName, permissionProfileName } = routed;
+    if (!harness) throw new Error(`${routed.decision.reasons[0]}. Use action=route to inspect exclusions or pass an explicit harness/profile/model.`);
     const task = params.task?.trim();
     if (!task) throw new Error("spawn requires task");
-    const profileName = params.profile || preset?.profile || config.defaultProfiles[harness];
     if (!profileName) throw new Error(`No default profile configured for ${harness}`);
-    const permissionProfileName = params.permissionProfile?.trim() || preset?.permissionProfile || "builder-restricted";
+    const preset: RolePreset | undefined = config.roles[role];
+    const presetProfile = preset?.profile ? config.profiles[preset.profile] : undefined;
+    const presetHarness = preset?.harness ?? presetProfile?.harness;
+    const presetMatchesHarness = !presetHarness || presetHarness === harness;
+    if (presetHarness && !presetMatchesHarness) {
+      routed.decision.reasons.push(`fell back from ${presetHarness} to ${harness}; ignored harness-specific preset model and effort`);
+    }
     const permissionProfile = config.permissionProfiles[permissionProfileName];
-    if (!permissionProfile) throw new Error(`Unknown permission profile: ${permissionProfileName}`);
-    const model = normalizeModelForHarness(harness, params.model?.trim() || preset?.model || config.defaultModels[harness]);
-    const effort = validateEffort(harness, params.effort || preset?.effort || config.defaultEfforts[harness]);
+    const model = normalizeModelForHarness(harness, params.model?.trim() || (presetMatchesHarness ? preset?.model : undefined) || config.defaultModels[harness]);
+    const effort = validateEffort(harness, routed.effectiveEffort);
     const instructions = params.instructions?.trim() || preset?.instructions;
     return {
       harness,
@@ -685,11 +786,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       ...(model ? { model } : {}),
       ...(effort ? { effort } : {}),
       ...(instructions ? { instructions } : {}),
+      routing: routed.decision,
     };
   };
 
-  const spawnWorker = async (params: FleetParams, ctx: ExtensionContext): Promise<WorkerRecord> => {
-    const resolved = resolveSpawn(params, ctx);
+  const spawnWorker = async (params: FleetParams, ctx: ExtensionContext, resolved: ResolvedSpawn): Promise<WorkerRecord> => {
     const { harness, role, task, cwd, profileName, permissionProfileName, permissionProfile, model, effort, instructions } = resolved;
     if (harness === "opencode" && model && effort && effort !== "off") {
       const info = (await enumerateOpenCodeModelInfo()).find((candidate) => candidate.id === model);
@@ -866,15 +967,20 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     }
   };
 
-  const formatCapabilities = (): string => [
-    ...HARNESSES.map((harness) => {
+  const formatCapabilities = async (): Promise<{ text: string; availability: Record<Harness, HarnessAvailability> }> => {
+    const { availability } = await resolveRouting({ action: "route" });
+    const text = [
+      ...HARNESSES.map((harness) => {
       const matching = Object.entries(config.profiles).filter(([, profile]) => profile.harness === harness);
       const profiles = matching.map(([name]) => name);
       const modes = [...new Set(matching.map(([, profile]) => profile.mode ?? "persistent"))];
-      return `${harness}: modes=${modes.join(",") || "(none)"} efforts=${HARNESS_EFFORTS[harness].join(",")} profiles=${profiles.join(",") || "(none)"}`;
-    }),
-    `permissions: ${Object.keys(config.permissionProfiles).sort().join(",") || "(none)"}`,
-  ].join("\n");
+        const detected = availability[harness];
+        return `${harness}: modes=${modes.join(",") || "(none)"} efforts=${HARNESS_EFFORTS[harness].join(",")} profiles=${profiles.join(",") || "(none)"} available=${detected.available} subagents=${detected.supportsSubagents}${detected.available ? "" : ` reason=${detected.reasons.join("; ")}`}`;
+      }),
+      `permissions: ${Object.keys(config.permissionProfiles).sort().join(",") || "(none)"}`,
+    ].join("\n");
+    return { text, availability };
+  };
 
   pi.registerTool({
     name: "agent_fleet",
@@ -887,6 +993,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       "After agent_fleet spawns Pi, Codex, or Claude, send its assignment to the returned intercomTarget with intercom_send; reserve intercom_ask for a question that blocks the manager's next step. Use intercom_send for progress/status checkpoints. Do not call intercom_list merely to rediscover an owned worker. Pi, Codex, and Claude may need a brief registration delay before first delivery; OpenCode receives its initial task at launch.",
       "For sandboxed builder profiles such as codex-safe, create the feature worktree before spawning and pass that worktree as cwd. Do not ask the worker to create a sibling worktree outside its writable cwd.",
       "Use capabilities, profiles, permissions, models, variants, versions, or config before guessing models, permission policy, effort levels, package state, or defaults.",
+      "When spawn omits harness and profile, capability-aware routing chooses an installed eligible harness. Use action=route with the same role, model, effort, and requiresSubagents value to preview the selection. Explicit harness/profile choices always win; explicit Codex/OpenAI or Claude/Anthropic model identifiers select that direct harness; OpenCode is never selected automatically.",
+      "Use a Ralph loop for substantial iterative delegated work that benefits from context resets, not for quick one-shot tasks. After spawning coworkers, arrange a bounded return_on watcher or timed check-in for completion/timeout; Intercom delivery alone does not wake the manager.",
       "Preview update and cleanup before execute=true. Updates preserve detected install sources; never kill sessions the fleet does not own.",
       "Persistent workers expire after an activity-bounded idle budget. Worker messages to the manager or explicit renew extend it; manager heartbeat alone does not. Stop completed workers promptly, retain their record for resume, and use forget with acknowledge=true only after deliberate closure.",
     ],
@@ -902,9 +1010,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       }
 
       if (params.action === "spawn") {
-        const preview = resolveSpawn(params, ctx);
+        const preview = await resolveSpawn(params, ctx);
         onUpdate?.(textResult(`Starting ${preview.harness}/${preview.role} coworker...`));
-        const worker = await spawnWorker(params, ctx);
+        const worker = await spawnWorker(params, ctx, preview);
         await updateStatus(ctx);
         const mode = worker.profile ? config.profiles[worker.profile]?.mode : undefined;
         const next = worker.harness === "opencode"
@@ -912,7 +1020,29 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
             ? "\nThe task initialized this persistent OpenCode session. It remains wakeable through Intercom until stopped."
             : "\nThe task was passed to this one-shot OpenCode run as its initial prompt."
           : `\nNext: send this task directly to '${worker.intercomTarget}' with intercom_send. Reserve intercom_ask for a later question that blocks your own next step. Do not call intercom_list just to rediscover this owned target. If first delivery reports that it is not connected yet, wait briefly and retry:\n${worker.task}`;
-        return textResult(`Started ${formatWorker(worker)}${next}`, { worker });
+        const reliability = "\nFor substantial iterative work, use a bounded Ralph loop; skip Ralph for quick one-shot work. Set a bounded return_on watcher or timed check-in for completion/timeout because Intercom delivery alone will not wake the manager.";
+        return textResult(`Started ${formatWorker(worker)}${preview.routing.automatic ? `\n${preview.routing.reasons[0]}.` : ""}${next}${reliability}`, { worker, routing: preview.routing });
+      }
+
+      if (params.action === "route") {
+        const routed = await resolveRouting(params);
+        const selectedAvailability = routed.harness ? routed.availability[routed.harness] : undefined;
+        const profile = routed.profileName
+          ? `\nProfile: ${routed.profileName} (${selectedAvailability?.mode ?? "persistent"})`
+          : "";
+        const permission = `\nPermission: ${routed.permissionProfileName}`;
+        const effort = `\nEffort: ${routed.effectiveEffort ?? "harness default"}`;
+        const model = params.model?.trim()
+          ? `\nModel: ${params.model.trim()}${routed.decision.explicitSource === "model" ? " (selected the direct harness; use action=models to verify live availability)" : ""}`
+          : "";
+        return textResult(`${formatRoutingDecision(routed.decision)}${profile}${permission}${effort}${model}\nPreview only; no coworker was spawned.`, {
+          routing: routed.decision,
+          availability: routed.availability,
+          profile: routed.profileName,
+          permissionProfile: routed.permissionProfileName,
+          effort: routed.effectiveEffort,
+          model: params.model?.trim(),
+        });
       }
 
       if (params.action === "list") {
@@ -1135,7 +1265,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       }
 
       if (params.action === "capabilities") {
-        return textResult(formatCapabilities(), { efforts: HARNESS_EFFORTS, roles: config.roles, permissionProfiles: config.permissionProfiles });
+        const { text, availability } = await formatCapabilities();
+        return textResult(text, { efforts: HARNESS_EFFORTS, roles: config.roles, routing: config.routing, availability, permissionProfiles: config.permissionProfiles });
       }
 
       if (params.action === "profiles") {
@@ -1266,7 +1397,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       if (!task?.trim()) return;
       const summary = [`id: ${id}`, `role: ${role}`, `harness: ${harness}`, `profile: ${profile}`, `permission: ${permissionProfile}`, `model: ${modelChoice}`, `effort: ${effort ?? "(harness default)"}`, `cwd: ${cwd}`, "", task.trim()].join("\n");
       if (!(await ctx.ui.confirm("Spawn coworker?", summary))) return;
-      const worker = await spawnWorker({ action: "spawn", id, role, harness, profile, permissionProfile, model: modelChoice === "(harness default)" ? undefined : modelChoice, effort, cwd, task: task.trim() }, ctx);
+      const spawnParams: FleetParams = { action: "spawn", id, role, harness, profile, permissionProfile, model: modelChoice === "(harness default)" ? undefined : modelChoice, effort, cwd, task: task.trim() };
+      const worker = await spawnWorker(spawnParams, ctx, await resolveSpawn(spawnParams, ctx));
       const mode = worker.profile ? config.profiles[worker.profile]?.mode : undefined;
       const next = worker.harness === "opencode"
         ? mode === "persistent" ? "The OpenCode session is initialized and remains wakeable through Intercom." : "Task started as the initial OpenCode prompt."
