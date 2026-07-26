@@ -5,6 +5,11 @@ import {
   detectHarnessAvailability,
   formatRoutingDecision,
   inferHarnessFromModel,
+  isSafeModelPattern,
+  modelMatchesPattern,
+  normalizeModelForHarness,
+  roleInstructionsForHarness,
+  roleRequiresSubagents,
   resolveHarnessRoute,
   type HarnessAvailability,
 } from "../src/routing.ts";
@@ -71,7 +76,7 @@ test("subagent-required work excludes Pi and selects direct Codex before Claude"
   assert.match(decision.candidates[0].reasons.join(" "), /nested subagents are required/);
 });
 
-test("OpenCode is never selected automatically but an explicit override always wins", () => {
+test("explicitOnly defaults protect OpenCode, remain config-authoritative, and explicit overrides win", () => {
   const onlyOpenCode = availability({
     pi: { available: false, reasons: ["missing"] },
     codex: { available: false, reasons: ["missing"] },
@@ -98,6 +103,14 @@ test("OpenCode is never selected automatically but an explicit override always w
   assert.equal(explicit.automatic, false);
   assert.equal(explicit.explicitSource, "profile");
   assert.match(explicit.reasons.join(" "), /does not support configured nested subagents/);
+
+  const configuredAutomatic = resolveHarnessRoute({
+    role: "worker",
+    defaultHarness: "pi",
+    routing: { ...DEFAULT_CONFIG.routing, explicitOnly: [] },
+    availability: onlyOpenCode,
+  });
+  assert.equal(configuredAutomatic.selected, "opencode");
 });
 
 test("configured routing preference outranks the legacy default fallback", () => {
@@ -123,6 +136,49 @@ test("explicit model identifiers select direct Codex or Claude harnesses", () =>
   assert.equal(inferHarnessFromModel("anthropic/claude-opus-4-8"), "claude");
   assert.equal(inferHarnessFromModel("opus"), "claude");
   assert.equal(inferHarnessFromModel("google/gemini-3"), undefined);
+});
+
+test("model routing is ordered, config-driven, normalized, and limited to safe patterns", () => {
+  const policy = mergeConfig({
+    routing: {
+      modelRouting: {
+        unmatchedHarness: "opencode",
+        rules: [
+          { harness: "claude", patterns: ["company/exact", "company/*", "unsafe*middle", "*", "two**"] },
+          { harness: "codex", patterns: ["company/special*"] },
+        ],
+        stripPrefixes: { claude: ["company/", "bad*"], opencode: ["generic/"] },
+      },
+    },
+  }).routing.modelRouting;
+  assert.deepEqual(policy.rules, [
+    { harness: "claude", patterns: ["company/exact", "company/*"] },
+    { harness: "codex", patterns: ["company/special*"] },
+  ]);
+  assert.equal(inferHarnessFromModel("company/special-model", policy), "claude");
+  assert.equal(inferHarnessFromModel("generic/model", policy), "opencode");
+  assert.equal(normalizeModelForHarness("claude", "company/Sonnet", policy), "Sonnet");
+  assert.equal(normalizeModelForHarness("opencode", "generic/model", policy), "model");
+  assert.equal(isSafeModelPattern("gpt-*"), true);
+  assert.equal(isSafeModelPattern("gpt-*unsafe"), false);
+  assert.equal(modelMatchesPattern("GPT-5.6", "gpt-*"), true);
+  assert.equal(modelMatchesPattern("gpt-5.6-extra", "gpt-5.6"), false);
+});
+
+test("role requirement defaults and cross-harness instruction fallback honor caller policy", () => {
+  const routing = mergeConfig({
+    routing: {
+      roleRequirements: { builder: { requiresSubagents: true } },
+      fallback: { preserveRoleInstructions: false },
+    },
+  }).routing;
+  assert.equal(roleRequiresSubagents(routing, "builder", undefined), true);
+  assert.equal(roleRequiresSubagents(routing, "builder", false), false);
+  assert.equal(roleRequiresSubagents(routing, "reviewer", undefined), false);
+  const preset = { harness: "claude" as const, instructions: "Review carefully." };
+  assert.equal(roleInstructionsForHarness({ routing, preset, presetHarness: "claude", selectedHarness: "codex" }), undefined);
+  assert.equal(roleInstructionsForHarness({ routing, preset, presetHarness: "claude", selectedHarness: "claude" }), "Review carefully.");
+  assert.equal(roleInstructionsForHarness({ routing, preset, presetHarness: "claude", selectedHarness: "codex", explicitInstructions: "Caller mandate." }), "Caller mandate.");
 });
 
 test("automatic routing filters unsupported explicit effort while explicit harness reports a warning", () => {
@@ -187,4 +243,29 @@ test("availability requires the selected profile and reports mode, effort, and e
   assert.equal(detected.claude.mode, "one-shot");
   assert.deepEqual(detected.claude.supportedEfforts, ["low", "high", "max"]);
   assert.match(detected.claude.reasons[0], /one-shot mode/);
+});
+
+test("availability follows ordered profile fallback while explicit profiles remain pinned", () => {
+  const config = mergeConfig({
+    profiles: {
+      "codex-first": { harness: "codex", command: "missing-codex" },
+      "codex-backup": { harness: "codex", command: "working-codex", mode: "persistent" },
+    },
+    routing: { profilePreferences: { codex: ["codex-first", "codex-backup"] } },
+  });
+  const automatic = detectHarnessAvailability(config, {
+    supportedEfforts: { codex: ["low", "high"] },
+    resolveCommand: (command) => command === "working-codex" ? "/bin/working-codex" : undefined,
+  });
+  assert.equal(automatic.codex.available, true);
+  assert.equal(automatic.codex.profile, "codex-backup");
+  assert.deepEqual(automatic.codex.profileCandidates, ["codex-first", "codex-backup", "codex-safe"]);
+
+  const explicit = detectHarnessAvailability(config, {
+    profileOverrides: { codex: "codex-first" },
+    resolveCommand: () => undefined,
+  });
+  assert.equal(explicit.codex.available, false);
+  assert.equal(explicit.codex.profile, "codex-first");
+  assert.deepEqual(explicit.codex.profileCandidates, ["codex-first"]);
 });

@@ -68,6 +68,12 @@ Prefer the harness that fits the role:
 - Claude Code through `cci` or `ccim`: independent challenger, reviewer, or
   implementation worker
 
+When using `agent_fleet`, inspect `action: "config"` and preview `action: "route"`
+instead of treating this list as a fixed routing policy. Configured harness and
+profile orders, explicit-only exclusions, role requirements, model rules,
+instruction fallback, and supervision recommendations are authoritative. An
+explicit caller harness or profile always wins.
+
 Do not start plain Codex or plain Claude Code and assume that MCP alone gives it
 wakeable worker behavior. Use `coi` for wakeable Codex and `cci`/`ccim` for
 wakeable Claude Code.

@@ -1,6 +1,18 @@
-import type { Effort, Harness, LaunchProfile, OrchestratorConfig, RoutingConfig } from "./types.ts";
+import type { Effort, Harness, LaunchProfile, ModelRoutingConfig, OrchestratorConfig, RolePreset, RoutingConfig } from "./types.ts";
 
 export const ROUTABLE_HARNESSES: Harness[] = ["pi", "codex", "claude", "opencode"];
+
+export const DEFAULT_MODEL_ROUTING: ModelRoutingConfig = {
+  unmatchedHarness: null,
+  rules: [
+    { harness: "codex", patterns: ["codex/*", "openai/*", "codex-*", "gpt-*", "o1*", "o3*", "o4*"] },
+    { harness: "claude", patterns: ["claude/*", "anthropic/*", "claude-*", "opus", "opus-*", "sonnet", "sonnet-*", "haiku", "haiku-*", "fable", "fable-*"] },
+  ],
+  stripPrefixes: {
+    codex: ["codex/", "openai/"],
+    claude: ["claude/", "anthropic/"],
+  },
+};
 
 export interface HarnessAvailability {
   harness: Harness;
@@ -10,6 +22,7 @@ export interface HarnessAvailability {
   mode?: "persistent" | "one-shot";
   supportsSubagents: boolean;
   supportedEfforts?: Effort[];
+  profileCandidates?: string[];
   reasons: string[];
 }
 
@@ -47,7 +60,10 @@ export interface RoutingRequest {
 }
 
 export interface AvailabilityOptions {
+  /** Pinned caller-selected profiles. A pinned profile never falls back. */
   profileOverrides?: Partial<Record<Harness, string>>;
+  /** Profiles to try before the configured harness order, such as a role preset. */
+  preferredProfiles?: Partial<Record<Harness, string[]>>;
   supportedEfforts?: Partial<Record<Harness, Effort[]>>;
   resolveCommand: (command: string) => string | undefined;
 }
@@ -56,7 +72,7 @@ function uniqueHarnesses(items: Array<Harness | undefined>): Harness[] {
   return [...new Set(items.filter((item): item is Harness => Boolean(item)))];
 }
 
-function inspectProfile(
+export function inspectHarnessProfile(
   harness: Harness,
   profileName: string | undefined,
   profile: LaunchProfile | undefined,
@@ -110,11 +126,29 @@ function inspectProfile(
   };
 }
 
+function uniqueStrings(items: Array<string | undefined>): string[] {
+  return [...new Set(items.map((item) => item?.trim()).filter((item): item is string => Boolean(item)))];
+}
+
+/** Return the exact ordered profiles considered for one harness. */
+export function profileCandidatesForHarness(
+  config: OrchestratorConfig,
+  harness: Harness,
+  options: Pick<AvailabilityOptions, "profileOverrides" | "preferredProfiles"> = {},
+): string[] {
+  const pinned = options.profileOverrides?.[harness]?.trim();
+  if (pinned) return [pinned];
+  return uniqueStrings([
+    ...(options.preferredProfiles?.[harness] ?? []),
+    ...(config.routing.profilePreferences[harness] ?? []),
+    config.defaultProfiles[harness],
+  ]);
+}
+
 /**
  * Build a side-effect-free availability snapshot apart from the injected command lookup.
- * Automatic routing intentionally evaluates only the explicit, role-preset, or configured
- * default profile. Other configured profiles remain discoverable through `capabilities` and
- * `profiles` and can be selected explicitly or made the harness default.
+ * Explicit caller profiles stay pinned. Automatic routing tries configured profiles in order
+ * and selects the first spawnable profile whose command resolves.
  */
 export function detectHarnessAvailability(
   config: OrchestratorConfig,
@@ -122,25 +156,110 @@ export function detectHarnessAvailability(
 ): Record<Harness, HarnessAvailability> {
   const supportsSubagents = new Set(config.routing.capabilities.requiresSubagents);
   return Object.fromEntries(ROUTABLE_HARNESSES.map((harness) => {
-    const profileName = options.profileOverrides?.[harness] ?? config.defaultProfiles[harness];
-    return [harness, inspectProfile(
+    const profileCandidates = profileCandidatesForHarness(config, harness, options);
+    const attempts = profileCandidates.map((profileName) => inspectHarnessProfile(
+        harness,
+        profileName,
+        config.profiles[profileName],
+        supportsSubagents.has(harness),
+        options.supportedEfforts?.[harness],
+        options.resolveCommand,
+      ));
+    const availableIndex = attempts.findIndex((attempt) => attempt.available);
+    if (availableIndex >= 0) {
+      const available = attempts[availableIndex];
+      return [harness, {
+        ...available,
+        profileCandidates,
+        reasons: [
+          ...attempts.slice(0, availableIndex).flatMap((attempt) => attempt.reasons.map((reason) => `profile fallback: ${reason}`)),
+          ...available.reasons,
+        ],
+      }];
+    }
+    const shared = {
       harness,
-      profileName,
-      profileName ? config.profiles[profileName] : undefined,
-      supportsSubagents.has(harness),
-      options.supportedEfforts?.[harness],
-      options.resolveCommand,
-    )];
+      supportsSubagents: supportsSubagents.has(harness),
+      ...(options.supportedEfforts?.[harness] ? { supportedEfforts: [...options.supportedEfforts[harness]!] } : {}),
+      profileCandidates,
+    };
+    if (attempts.length === 0) return [harness, { ...shared, available: false, reasons: ["no launch profile is configured"] }];
+    return [harness, {
+      ...shared,
+      available: false,
+      profile: attempts[0].profile,
+      mode: attempts[0].mode,
+      reasons: attempts.flatMap((attempt) => attempt.reasons),
+    }];
   })) as Record<Harness, HarnessAvailability>;
 }
 
-/** Infer the direct harness requested by an explicit provider/model identifier. */
-export function inferHarnessFromModel(model: string | undefined): Harness | undefined {
+/** Patterns are exact or contain one trailing `*` after a non-empty prefix. */
+export function isSafeModelPattern(pattern: string): boolean {
+  const value = pattern.trim();
+  if (!value) return false;
+  const firstWildcard = value.indexOf("*");
+  return firstWildcard < 0 || (firstWildcard === value.length - 1 && firstWildcard > 0);
+}
+
+export function modelMatchesPattern(model: string, pattern: string): boolean {
+  if (!isSafeModelPattern(pattern)) return false;
+  const value = model.trim().toLowerCase();
+  const normalizedPattern = pattern.trim().toLowerCase();
+  return normalizedPattern.endsWith("*")
+    ? value.startsWith(normalizedPattern.slice(0, -1))
+    : value === normalizedPattern;
+}
+
+/** Infer the direct harness requested by any explicit model identifier. */
+export function inferHarnessFromModel(
+  model: string | undefined,
+  policy: ModelRoutingConfig = DEFAULT_MODEL_ROUTING,
+): Harness | undefined {
   const value = model?.trim().toLowerCase();
   if (!value) return undefined;
-  if (/^(?:codex|openai)\//.test(value) || /^(?:codex-|gpt-|o[1-9](?:-|$))/.test(value)) return "codex";
-  if (/^(?:claude|anthropic)\//.test(value) || /^(?:claude-|opus(?:-|$)|sonnet(?:-|$)|haiku(?:-|$)|fable(?:-|$))/.test(value)) return "claude";
-  return undefined;
+  for (const rule of policy.rules) {
+    if (rule.patterns.some((pattern) => modelMatchesPattern(value, pattern))) return rule.harness;
+  }
+  return policy.unmatchedHarness ?? undefined;
+}
+
+/** Remove the first configured literal provider prefix for the selected direct harness. */
+export function normalizeModelForHarness(
+  harness: Harness,
+  model: string | undefined,
+  policy: ModelRoutingConfig = DEFAULT_MODEL_ROUTING,
+): string | undefined {
+  const normalized = model?.trim();
+  if (!normalized) return undefined;
+  const lower = normalized.toLowerCase();
+  for (const prefix of policy.stripPrefixes[harness] ?? []) {
+    if (prefix && lower.startsWith(prefix.toLowerCase())) return normalized.slice(prefix.length);
+  }
+  return normalized;
+}
+
+export function roleRequiresSubagents(
+  routing: RoutingConfig,
+  role: string,
+  callerOverride: boolean | undefined,
+): boolean {
+  return callerOverride ?? routing.roleRequirements[role]?.requiresSubagents ?? false;
+}
+
+export function roleInstructionsForHarness(input: {
+  routing: RoutingConfig;
+  preset?: RolePreset;
+  presetHarness?: Harness;
+  selectedHarness: Harness;
+  explicitInstructions?: string;
+}): string | undefined {
+  const explicit = input.explicitInstructions?.trim();
+  if (explicit) return explicit;
+  const presetInstructions = input.preset?.instructions?.trim();
+  if (!presetInstructions) return undefined;
+  const crossedHarnesses = Boolean(input.presetHarness && input.presetHarness !== input.selectedHarness);
+  return crossedHarnesses && !input.routing.fallback.preserveRoleInstructions ? undefined : presetInstructions;
 }
 
 function effortReason(availability: HarnessAvailability | undefined, effort: Effort | undefined): string | undefined {

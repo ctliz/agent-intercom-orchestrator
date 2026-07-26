@@ -591,16 +591,23 @@ test("route previews automatic selection and explicit profile overrides without 
     await writeFile(join(orchestratorDir, "config.json"), JSON.stringify({
       profiles: {
         "pi-peer": { harness: "pi", command: "/bin/true", mode: "persistent", maxRuntime: "12h" },
+        "codex-missing": { harness: "codex", command: "missing-codex-command-for-profile-fallback", mode: "persistent", maxRuntime: "12h" },
         "codex-safe": { harness: "codex", command: "/bin/true", mode: "persistent", maxRuntime: "12h" },
         "claude-safe": { harness: "claude", command: "missing-claude-command-for-routing-test", mode: "persistent", maxRuntime: "12h" },
+        "claude-minimal": { harness: "claude", command: "missing-claude-minimal-for-routing-test", mode: "persistent", maxRuntime: "12h" },
         "opencode-run": { harness: "opencode", command: "/bin/true", mode: "one-shot", maxRuntime: "2h" },
       },
       roles: {
         fallback: { harness: "claude", profile: "claude-safe", permissionProfile: "trusted", model: "claude/claude-opus-4-8", effort: "max", instructions: "Keep the role instructions." },
       },
       routing: {
-        roles: { fallback: ["claude", "codex", "pi"] },
+        explicitOnly: [],
+        roles: { fallback: ["claude", "codex", "pi"], codexFallback: ["codex", "pi"], nestedDefault: ["pi", "codex"], open: ["opencode", "pi"] },
+        profilePreferences: { codex: ["codex-missing", "codex-safe"] },
+        roleRequirements: { nestedDefault: { requiresSubagents: true } },
+        fallback: { preserveRoleInstructions: false },
       },
+      supervision: { recommendRalphForSubstantialWork: false, recommendReturnOnAfterSpawn: true },
     }));
     const lifecycle = new Map<string, (...args: any[]) => any>();
     const tools = new Map<string, any>();
@@ -630,6 +637,22 @@ test("route previews automatic selection and explicit profile overrides without 
     assert.match(builder.content[0].text, /Recommended harness: codex/);
     assert.equal(builder.details.routing.selected, "codex");
     assert.equal(builder.details.profile, "codex-safe");
+    assert.deepEqual(builder.details.availability.codex.profileCandidates.slice(0, 2), ["codex-safe", "codex-missing"]);
+
+    const profileFallback = await fleet.execute("route-profile-fallback", { action: "route", role: "codexFallback" }, new AbortController().signal, () => {}, ctx);
+    assert.equal(profileFallback.details.routing.selected, "codex");
+    assert.equal(profileFallback.details.profile, "codex-safe");
+    assert.deepEqual(profileFallback.details.availability.codex.profileCandidates.slice(0, 2), ["codex-missing", "codex-safe"]);
+    assert.match(profileFallback.content[0].text, /profile fallback:.*codex-missing/);
+
+    const nestedDefault = await fleet.execute("route-nested-default", { action: "route", role: "nestedDefault" }, new AbortController().signal, () => {}, ctx);
+    assert.equal(nestedDefault.details.routing.requiresSubagents, true);
+    assert.equal(nestedDefault.details.routing.selected, "codex");
+
+    const configuredOpenCode = await fleet.execute("route-open", { action: "route", role: "open" }, new AbortController().signal, () => {}, ctx);
+    assert.equal(configuredOpenCode.details.routing.automatic, true);
+    assert.equal(configuredOpenCode.details.routing.selected, "opencode");
+    assert.equal(configuredOpenCode.details.profile, "opencode-peer");
 
     const nested = await fleet.execute("route-nested", { action: "route", role: "advisor", requiresSubagents: true }, new AbortController().signal, () => {}, ctx);
     assert.match(nested.content[0].text, /Recommended harness: codex/);
@@ -664,7 +687,7 @@ test("route previews automatic selection and explicit profile overrides without 
     }, new AbortController().signal, () => {}, ctx);
     assert.match(automaticSpawn.content[0].text, /Started routed-builder \[codex\/builder\]/);
     assert.match(automaticSpawn.content[0].text, /automatically selected codex/);
-    assert.match(automaticSpawn.content[0].text, /bounded Ralph loop/);
+    assert.doesNotMatch(automaticSpawn.content[0].text, /bounded Ralph loop/);
     assert.match(automaticSpawn.content[0].text, /return_on/);
     assert.equal(automaticSpawn.details.routing.selected, "codex");
     assert.equal(launches, 1);
@@ -675,12 +698,13 @@ test("route previews automatic selection and explicit profile overrides without 
     assert.equal(fallbackSpawn.details.worker.harness, "codex");
     assert.equal(fallbackSpawn.details.worker.model, undefined);
     assert.equal(fallbackSpawn.details.worker.effort, undefined);
-    assert.equal(fallbackSpawn.details.worker.instructions, "Keep the role instructions.");
+    assert.equal(fallbackSpawn.details.worker.instructions, undefined);
     assert.match(fallbackSpawn.details.routing.reasons.join(" "), /ignored harness-specific preset model and effort/);
     assert.equal(launches, 2);
 
-    assert.match(fleet.promptGuidelines.join("\n"), /Ralph loop/);
+    assert.doesNotMatch(fleet.promptGuidelines.join("\n"), /Ralph loop/);
     assert.match(fleet.promptGuidelines.join("\n"), /return_on/);
+    assert.match(fleet.promptGuidelines.join("\n"), /No harness is currently configured as explicit-only/);
 
     await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
   } finally {

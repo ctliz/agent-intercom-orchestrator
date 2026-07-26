@@ -33,6 +33,11 @@ test("agent-intercom-fleet CLI hosts the same agent_fleet tool for non-Pi manage
         "claude-safe": { harness: "claude", command: process.execPath, mode: "persistent" },
         "opencode-peer": { harness: "opencode", command: process.execPath, mode: "persistent" },
       },
+      routing: {
+        explicitOnly: [],
+        roleRequirements: { builder: { requiresSubagents: true } },
+        modelRouting: { unmatchedHarness: "opencode" },
+      },
     }));
     const cli = new URL("../src/agent-fleet-cli.mjs", import.meta.url);
     const { code, stdout, stderr } = await runChild(cli, {
@@ -52,13 +57,26 @@ test("agent-intercom-fleet CLI hosts the same agent_fleet tool for non-Pi manage
     }, JSON.stringify({
       managerSessionId: "opencode-manager-test",
       cwd: process.cwd(),
-      params: { action: "route", role: "builder", requiresSubagents: true },
+      params: { action: "route", role: "builder" },
     }));
     assert.equal(route.code, 0, route.stderr);
     const routeResponse = JSON.parse(route.stdout);
     assert.equal(routeResponse.ok, true);
     assert.equal(routeResponse.result.details.routing.selected, "codex");
+    assert.equal(routeResponse.result.details.routing.requiresSubagents, true);
     assert.match(routeResponse.result.content[0].text, /Preview only; no coworker was spawned/);
+
+    const unmatched = await runChild(cli, {
+      ...process.env, PI_CODING_AGENT_DIR: agentDir, AGENT_INTERCOM_ORCHESTRATOR_DISABLED: "",
+    }, JSON.stringify({
+      managerSessionId: "opencode-manager-test",
+      cwd: process.cwd(),
+      params: { action: "route", model: "custom-provider/custom-model" },
+    }));
+    assert.equal(unmatched.code, 0, unmatched.stderr);
+    const unmatchedResponse = JSON.parse(unmatched.stdout);
+    assert.equal(unmatchedResponse.result.details.routing.selected, "opencode");
+    assert.equal(unmatchedResponse.result.details.routing.explicitSource, "model");
   } finally {
     await rm(agentDir, { recursive: true, force: true });
   }
