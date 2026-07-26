@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { applyPiPermissionArgs } from "./permissions.ts";
-import type { Effort, Harness, LaunchProfile, OrchestratorConfig, PermissionProfile, UnitStatus, WorkerRecord, WorkerState } from "./types.ts";
+export { normalizeModelForHarness } from "./routing.ts";
+import type { Effort, Harness, LaunchProfile, OrchestratorConfig, PermissionProfile, SupervisionConfig, UnitStatus, WorkerRecord, WorkerState } from "./types.ts";
 
 export const EFFORT_LEVELS: Effort[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -88,18 +89,15 @@ export function validateWorkerId(value: string): string {
   return id;
 }
 
-export function normalizeModelForHarness(harness: Harness, model: string | undefined): string | undefined {
-  const normalized = model?.trim();
-  if (!normalized) return undefined;
-  if (harness === "codex") {
-    if (normalized.startsWith("codex/")) return normalized.slice("codex/".length);
-    if (normalized.startsWith("openai/")) return normalized.slice("openai/".length);
-  }
-  if (harness === "claude") {
-    if (normalized.startsWith("claude/")) return normalized.slice("claude/".length);
-    if (normalized.startsWith("anthropic/")) return normalized.slice("anthropic/".length);
-  }
-  return normalized;
+export function supervisionGuidance(supervision: SupervisionConfig): string[] {
+  return [
+    supervision.recommendRalphForSubstantialWork
+      ? "Use a bounded Ralph loop for substantial iterative delegated work that benefits from context resets; skip Ralph for quick one-shot work."
+      : undefined,
+    supervision.recommendReturnOnAfterSpawn
+      ? "After spawning coworkers, arrange a bounded return_on watcher or timed check-in for completion/timeout because Intercom delivery alone does not wake the manager."
+      : undefined,
+  ].filter((line): line is string => Boolean(line));
 }
 
 export function validateEffort(harness: Harness, effort: Effort | undefined): Effort | undefined {

@@ -3,7 +3,8 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { DEFAULT_PERMISSION_PROFILES } from "./permissions.ts";
-import type { Effort, GitPolicy, Harness, LaunchProfile, OrchestratorConfig, PermissionProfile, RolePreset, RoutingConfig, WorkspacePolicy } from "./types.ts";
+import { DEFAULT_MODEL_ROUTING, isSafeModelPattern } from "./routing.ts";
+import type { Effort, GitPolicy, Harness, LaunchProfile, ModelRoutingRule, OrchestratorConfig, PermissionProfile, RolePreset, RoutingConfig, SupervisionConfig, WorkspacePolicy } from "./types.ts";
 
 const HARNESSES: Harness[] = ["pi", "codex", "claude", "opencode"];
 const EFFORTS: Effort[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -134,9 +135,24 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
       challenger: ["pi", "codex", "claude"],
       builder: ["codex", "claude", "pi"],
     },
+    profilePreferences: {
+      pi: ["pi-peer"],
+      codex: ["codex-safe", "codex-minimal"],
+      claude: ["claude-safe", "claude-minimal"],
+      opencode: ["opencode-peer", "opencode-run"],
+    },
+    roleRequirements: {},
+    modelRouting: structuredClone(DEFAULT_MODEL_ROUTING),
+    fallback: {
+      preserveRoleInstructions: true,
+    },
     capabilities: {
       requiresSubagents: ["codex", "claude"],
     },
+  },
+  supervision: {
+    recommendRalphForSubstantialWork: true,
+    recommendReturnOnAfterSpawn: true,
   },
   leaseMinutes: 30,
   heartbeatSeconds: 60,
@@ -263,10 +279,88 @@ function mergeHarnessList(value: unknown, fallback: Harness[]): Harness[] {
   return [...new Set(value.filter(isHarness))];
 }
 
-function mergeRouting(value: unknown, legacyDefaultHarness?: Harness): RoutingConfig {
+function mergeStringList(value: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(value)) return [...fallback];
+  return [...new Set(value
+    .filter((item): item is string => typeof item === "string")
+    .map((item) => item.trim())
+    .filter(Boolean))];
+}
+
+function mergeProfilePreferences(
+  value: unknown,
+  fallback: RoutingConfig["profilePreferences"],
+  defaultProfiles: OrchestratorConfig["defaultProfiles"],
+): RoutingConfig["profilePreferences"] {
+  const input = isRecord(value) ? value : {};
+  const result: RoutingConfig["profilePreferences"] = {};
+  for (const harness of HARNESSES) {
+    const hasExplicitOrder = Object.hasOwn(input, harness) && Array.isArray(input[harness]);
+    const order = mergeStringList(input[harness], fallback[harness] ?? []);
+    result[harness] = hasExplicitOrder
+      ? order
+      : [...new Set([defaultProfiles[harness], ...order].filter((item): item is string => Boolean(item)))];
+  }
+  return result;
+}
+
+function mergeModelRules(value: unknown, fallback: ModelRoutingRule[]): ModelRoutingRule[] {
+  if (!Array.isArray(value)) return structuredClone(fallback);
+  return value.flatMap((candidate): ModelRoutingRule[] => {
+    if (!isRecord(candidate) || !isHarness(candidate.harness) || !Array.isArray(candidate.patterns)) return [];
+    const patterns = [...new Set(candidate.patterns
+      .filter((pattern): pattern is string => typeof pattern === "string")
+      .map((pattern) => pattern.trim())
+      .filter(isSafeModelPattern))];
+    return patterns.length ? [{ harness: candidate.harness, patterns }] : [];
+  });
+}
+
+function mergeModelRouting(value: unknown): RoutingConfig["modelRouting"] {
+  const fallback = DEFAULT_CONFIG.routing.modelRouting;
+  if (!isRecord(value)) return structuredClone(fallback);
+  const stripPrefixes: RoutingConfig["modelRouting"]["stripPrefixes"] = {};
+  const inputPrefixes = isRecord(value.stripPrefixes) ? value.stripPrefixes : {};
+  for (const harness of HARNESSES) {
+    const prefixes = mergeStringList(inputPrefixes[harness], fallback.stripPrefixes[harness] ?? [])
+      .filter((prefix) => !prefix.includes("*"));
+    if (prefixes.length || Object.hasOwn(inputPrefixes, harness) || fallback.stripPrefixes[harness]) {
+      stripPrefixes[harness] = prefixes;
+    }
+  }
+  return {
+    unmatchedHarness: value.unmatchedHarness === null
+      ? null
+      : isHarness(value.unmatchedHarness)
+        ? value.unmatchedHarness
+        : fallback.unmatchedHarness,
+    rules: mergeModelRules(value.rules, fallback.rules),
+    stripPrefixes,
+  };
+}
+
+function mergeSupervision(value: unknown): SupervisionConfig {
+  const fallback = DEFAULT_CONFIG.supervision;
+  if (!isRecord(value)) return structuredClone(fallback);
+  return {
+    recommendRalphForSubstantialWork: typeof value.recommendRalphForSubstantialWork === "boolean"
+      ? value.recommendRalphForSubstantialWork
+      : fallback.recommendRalphForSubstantialWork,
+    recommendReturnOnAfterSpawn: typeof value.recommendReturnOnAfterSpawn === "boolean"
+      ? value.recommendReturnOnAfterSpawn
+      : fallback.recommendReturnOnAfterSpawn,
+  };
+}
+
+function mergeRouting(
+  value: unknown,
+  defaultProfiles: OrchestratorConfig["defaultProfiles"],
+  legacyDefaultHarness?: Harness,
+): RoutingConfig {
   const fallback = DEFAULT_CONFIG.routing;
   if (!isRecord(value)) {
     const routing = structuredClone(fallback);
+    routing.profilePreferences = mergeProfilePreferences(undefined, fallback.profilePreferences, defaultProfiles);
     if (legacyDefaultHarness) {
       routing.preference = [...new Set([legacyDefaultHarness, ...routing.preference])];
     }
@@ -279,11 +373,28 @@ function mergeRouting(value: unknown, legacyDefaultHarness?: Harness): RoutingCo
     }
   }
   const capabilities = isRecord(value.capabilities) ? value.capabilities : {};
+  const roleRequirements = structuredClone(fallback.roleRequirements);
+  if (isRecord(value.roleRequirements)) {
+    for (const [role, requirement] of Object.entries(value.roleRequirements)) {
+      if (!isRecord(requirement)) continue;
+      roleRequirements[role] = {
+        ...(typeof requirement.requiresSubagents === "boolean" ? { requiresSubagents: requirement.requiresSubagents } : {}),
+      };
+    }
+  }
+  const fallbackPolicy = isRecord(value.fallback) ? value.fallback : {};
   return {
     preference: mergeHarnessList(value.preference, fallback.preference),
-    // OpenCode is always explicit-only even if an older/custom file omits it.
-    explicitOnly: [...new Set([...mergeHarnessList(value.explicitOnly, fallback.explicitOnly), "opencode" as const])],
+    explicitOnly: mergeHarnessList(value.explicitOnly, fallback.explicitOnly),
     roles,
+    profilePreferences: mergeProfilePreferences(value.profilePreferences, fallback.profilePreferences, defaultProfiles),
+    roleRequirements,
+    modelRouting: mergeModelRouting(value.modelRouting),
+    fallback: {
+      preserveRoleInstructions: typeof fallbackPolicy.preserveRoleInstructions === "boolean"
+        ? fallbackPolicy.preserveRoleInstructions
+        : fallback.fallback.preserveRoleInstructions,
+    },
     capabilities: {
       requiresSubagents: mergeHarnessList(capabilities.requiresSubagents, fallback.capabilities.requiresSubagents),
     },
@@ -314,6 +425,7 @@ export function mergeConfig(value: unknown): OrchestratorConfig {
     }
   }
   const defaultHarness = isHarness(value.defaultHarness) ? value.defaultHarness : DEFAULT_CONFIG.defaultHarness;
+  const defaultProfiles = mergeHarnessStrings(value.defaultProfiles, DEFAULT_CONFIG.defaultProfiles);
   const idleTimeoutMinutes = positiveNumber(value.idleTimeoutMinutes, DEFAULT_CONFIG.idleTimeoutMinutes);
   const checkpointWarningMinutes = Math.min(
     positiveNumber(value.checkpointWarningMinutes, DEFAULT_CONFIG.checkpointWarningMinutes),
@@ -321,13 +433,14 @@ export function mergeConfig(value: unknown): OrchestratorConfig {
   );
   return {
     defaultHarness,
-    defaultProfiles: mergeHarnessStrings(value.defaultProfiles, DEFAULT_CONFIG.defaultProfiles),
+    defaultProfiles,
     defaultModels: mergeHarnessStrings(value.defaultModels, DEFAULT_CONFIG.defaultModels),
     defaultEfforts: mergeHarnessEfforts(value.defaultEfforts, DEFAULT_CONFIG.defaultEfforts),
     profiles,
     permissionProfiles,
     roles,
-    routing: mergeRouting(value.routing, !isRecord(value.routing) && isHarness(value.defaultHarness) ? defaultHarness : undefined),
+    routing: mergeRouting(value.routing, defaultProfiles, !isRecord(value.routing) && isHarness(value.defaultHarness) ? defaultHarness : undefined),
+    supervision: mergeSupervision(value.supervision),
     leaseMinutes: positiveNumber(value.leaseMinutes, DEFAULT_CONFIG.leaseMinutes),
     heartbeatSeconds: positiveNumber(value.heartbeatSeconds, DEFAULT_CONFIG.heartbeatSeconds),
     maxRuntime: typeof value.maxRuntime === "string" && value.maxRuntime.trim() ? value.maxRuntime : DEFAULT_CONFIG.maxRuntime,
@@ -400,11 +513,63 @@ export async function writeConfigDefaults(path: string, config: OrchestratorConf
     }),
   );
   const hadRoutingObject = isRecord(existing.routing);
+  const existingRouting = hadRoutingObject ? structuredClone(existing.routing as Record<string, unknown>) : {};
   const routingRoles = Object.fromEntries(
     Object.entries(config.routing.roles).filter(([name, preference]) =>
       JSON.stringify(preference) !== JSON.stringify(DEFAULT_CONFIG.routing.roles[name])),
   );
-  const routing = {
+  const existingProfilePreferences = isRecord(existingRouting.profilePreferences)
+    ? structuredClone(existingRouting.profilePreferences)
+    : {};
+  const profilePreferenceDelta = Object.fromEntries(HARNESSES.flatMap((harness) =>
+    Object.hasOwn(existingProfilePreferences, harness)
+      || JSON.stringify(config.routing.profilePreferences[harness] ?? []) !== JSON.stringify(DEFAULT_CONFIG.routing.profilePreferences[harness] ?? [])
+      ? [[harness, config.routing.profilePreferences[harness] ?? []]]
+      : []));
+  for (const harness of HARNESSES) delete existingProfilePreferences[harness];
+  const profilePreferences = { ...existingProfilePreferences, ...profilePreferenceDelta };
+  const modelStripPrefixDelta = Object.fromEntries(HARNESSES.flatMap((harness) =>
+    JSON.stringify(config.routing.modelRouting.stripPrefixes[harness] ?? []) !== JSON.stringify(DEFAULT_CONFIG.routing.modelRouting.stripPrefixes[harness] ?? [])
+      ? [[harness, config.routing.modelRouting.stripPrefixes[harness] ?? []]]
+      : []));
+  const existingModelRouting = isRecord(existingRouting.modelRouting)
+    ? structuredClone(existingRouting.modelRouting)
+    : {};
+  const existingModelStripPrefixes = isRecord(existingModelRouting.stripPrefixes)
+    ? structuredClone(existingModelRouting.stripPrefixes)
+    : {};
+  for (const harness of HARNESSES) delete existingModelStripPrefixes[harness];
+  const modelStripPrefixes = { ...existingModelStripPrefixes, ...modelStripPrefixDelta };
+  delete existingModelRouting.unmatchedHarness;
+  delete existingModelRouting.rules;
+  delete existingModelRouting.stripPrefixes;
+  const modelRouting = {
+    ...existingModelRouting,
+    ...(config.routing.modelRouting.unmatchedHarness !== DEFAULT_CONFIG.routing.modelRouting.unmatchedHarness
+      ? { unmatchedHarness: config.routing.modelRouting.unmatchedHarness }
+      : {}),
+    ...(JSON.stringify(config.routing.modelRouting.rules) !== JSON.stringify(DEFAULT_CONFIG.routing.modelRouting.rules)
+      ? { rules: config.routing.modelRouting.rules }
+      : {}),
+    ...(Object.keys(modelStripPrefixes).length ? { stripPrefixes: modelStripPrefixes } : {}),
+  };
+  const existingFallback = isRecord(existingRouting.fallback) ? structuredClone(existingRouting.fallback) : {};
+  delete existingFallback.preserveRoleInstructions;
+  const fallback = {
+    ...existingFallback,
+    ...(config.routing.fallback.preserveRoleInstructions !== DEFAULT_CONFIG.routing.fallback.preserveRoleInstructions
+      ? { preserveRoleInstructions: config.routing.fallback.preserveRoleInstructions }
+      : {}),
+  };
+  const existingCapabilities = isRecord(existingRouting.capabilities) ? structuredClone(existingRouting.capabilities) : {};
+  delete existingCapabilities.requiresSubagents;
+  const capabilities = {
+    ...existingCapabilities,
+    ...(JSON.stringify(config.routing.capabilities.requiresSubagents) !== JSON.stringify(DEFAULT_CONFIG.routing.capabilities.requiresSubagents)
+      ? { requiresSubagents: config.routing.capabilities.requiresSubagents }
+      : {}),
+  };
+  const routingDelta = {
     ...(JSON.stringify(config.routing.preference) !== JSON.stringify(DEFAULT_CONFIG.routing.preference)
       ? { preference: config.routing.preference }
       : {}),
@@ -412,8 +577,27 @@ export async function writeConfigDefaults(path: string, config: OrchestratorConf
       ? { explicitOnly: config.routing.explicitOnly }
       : {}),
     ...(Object.keys(routingRoles).length ? { roles: routingRoles } : {}),
-    ...(JSON.stringify(config.routing.capabilities.requiresSubagents) !== JSON.stringify(DEFAULT_CONFIG.routing.capabilities.requiresSubagents)
-      ? { capabilities: { requiresSubagents: config.routing.capabilities.requiresSubagents } }
+    ...(Object.keys(profilePreferences).length ? { profilePreferences } : {}),
+    ...(Object.keys(config.routing.roleRequirements).length ? { roleRequirements: config.routing.roleRequirements } : {}),
+    ...(Object.keys(modelRouting).length ? { modelRouting } : {}),
+    ...(Object.keys(fallback).length ? { fallback } : {}),
+    ...(Object.keys(capabilities).length ? { capabilities } : {}),
+  };
+  for (const key of ["preference", "explicitOnly", "roles", "profilePreferences", "roleRequirements", "modelRouting", "fallback", "capabilities"]) {
+    delete existingRouting[key];
+  }
+  const routing = { ...existingRouting, ...routingDelta };
+  const hadSupervisionObject = isRecord(existing.supervision);
+  const existingSupervision = hadSupervisionObject ? structuredClone(existing.supervision as Record<string, unknown>) : {};
+  delete existingSupervision.recommendRalphForSubstantialWork;
+  delete existingSupervision.recommendReturnOnAfterSpawn;
+  const supervision = {
+    ...existingSupervision,
+    ...(config.supervision.recommendRalphForSubstantialWork !== DEFAULT_CONFIG.supervision.recommendRalphForSubstantialWork
+      ? { recommendRalphForSubstantialWork: config.supervision.recommendRalphForSubstantialWork }
+      : {}),
+    ...(config.supervision.recommendReturnOnAfterSpawn !== DEFAULT_CONFIG.supervision.recommendReturnOnAfterSpawn
+      ? { recommendReturnOnAfterSpawn: config.supervision.recommendReturnOnAfterSpawn }
       : {}),
   };
   await writeConfigValue(path, {
@@ -425,6 +609,7 @@ export async function writeConfigDefaults(path: string, config: OrchestratorConf
     permissionProfiles,
     roles,
     routing: Object.keys(routing).length ? routing : hadRoutingObject ? {} : undefined,
+    supervision: Object.keys(supervision).length ? supervision : hadSupervisionObject ? {} : undefined,
     leaseMinutes: config.leaseMinutes,
     heartbeatSeconds: config.heartbeatSeconds,
     maxRuntime: config.maxRuntime,

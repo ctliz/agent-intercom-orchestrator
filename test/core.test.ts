@@ -302,8 +302,17 @@ test("configuration merges profiles, defaults, and role presets without dropping
       preference: ["claude", "pi", "codex", "opencode", "invalid", "claude"],
       explicitOnly: [],
       roles: { auditor: ["claude", "pi"] },
+      profilePreferences: { codex: ["codex-minimal", "codex-safe"] },
+      roleRequirements: { auditor: { requiresSubagents: true } },
+      modelRouting: {
+        unmatchedHarness: "opencode",
+        rules: [{ harness: "claude", patterns: ["internal/*", "invalid*middle"] }],
+        stripPrefixes: { claude: ["internal/", "unsafe*"] },
+      },
+      fallback: { preserveRoleInstructions: false },
       capabilities: { requiresSubagents: ["claude"] },
     },
+    supervision: { recommendRalphForSubstantialWork: false, recommendReturnOnAfterSpawn: true },
     defaultModels: { pi: "claude/claude-sonnet-5" },
     defaultEfforts: { pi: "max" },
     permissionProfiles: {
@@ -329,9 +338,17 @@ test("configuration merges profiles, defaults, and role presets without dropping
   assert.equal(config.cleanupTimerMinutes, 10);
   assert.equal(config.cleanupTimerEnabled, false);
   assert.deepEqual(config.routing.preference, ["claude", "pi", "codex", "opencode"]);
-  assert.deepEqual(config.routing.explicitOnly, ["opencode"]);
+  assert.deepEqual(config.routing.explicitOnly, []);
   assert.deepEqual(config.routing.roles.auditor, ["claude", "pi"]);
+  assert.deepEqual(config.routing.profilePreferences.codex, ["codex-minimal", "codex-safe"]);
+  assert.equal(config.routing.roleRequirements.auditor.requiresSubagents, true);
+  assert.equal(config.routing.modelRouting.unmatchedHarness, "opencode");
+  assert.deepEqual(config.routing.modelRouting.rules, [{ harness: "claude", patterns: ["internal/*"] }]);
+  assert.deepEqual(config.routing.modelRouting.stripPrefixes.claude, ["internal/"]);
+  assert.equal(config.routing.fallback.preserveRoleInstructions, false);
   assert.deepEqual(config.routing.capabilities.requiresSubagents, ["claude"]);
+  assert.equal(config.supervision.recommendRalphForSubstantialWork, false);
+  assert.equal(config.supervision.recommendReturnOnAfterSpawn, true);
   assert.equal(config.defaultModels.pi, "claude/claude-sonnet-5");
   assert.equal(config.defaultEfforts.pi, "max");
   assert.equal(config.roles.auditor.harness, "pi");
@@ -343,6 +360,19 @@ test("configuration merges profiles, defaults, and role presets without dropping
   assert.ok(config.profiles["pi-peer"]);
   assert.ok(config.profiles["codex-safe"]);
   assert.equal(config.profiles["codex-yolo"].command, "/usr/local/bin/coi-yolo");
+});
+
+test("legacy default profiles seed fallback order unless a new order is explicit", () => {
+  const migrated = mergeConfig({
+    defaultProfiles: { codex: "codex-custom" },
+    profiles: { "codex-custom": { harness: "codex", command: "/bin/codex-custom" } },
+  });
+  assert.deepEqual(migrated.routing.profilePreferences.codex, ["codex-custom", "codex-safe", "codex-minimal"]);
+  const explicit = mergeConfig({
+    defaultProfiles: { codex: "codex-custom" },
+    routing: { profilePreferences: { codex: ["codex-minimal"] } },
+  });
+  assert.deepEqual(explicit.routing.profilePreferences.codex, ["codex-minimal"]);
 });
 
 test("OpenCode verbose model parsing exposes model-specific variants", () => {
@@ -407,13 +437,23 @@ test("default configuration writes preserve custom profiles without serializing 
       profiles: { custom: { harness: "pi", command: "/custom/pi", args: ["--mode", "rpc"] } },
       permissionProfiles: { custom: { workspace: "read-only", git: "read-only", piTools: ["read"] } },
       roles: { custom: { harness: "pi", profile: "custom", permissionProfile: "custom", instructions: "Stay custom." } },
+      routing: { futurePolicy: { keep: true } },
+      supervision: { futureGuidance: "keep" },
     }));
     const draft = await readConfig(path);
     draft.defaultModels.pi = "codex/gpt-5.6-sol";
     draft.routing.preference = ["codex", "claude", "pi", "opencode"];
     draft.routing.explicitOnly = ["opencode", "claude"];
     draft.routing.roles.custom = ["codex", "claude"];
+    draft.routing.profilePreferences.codex = ["codex-minimal", "codex-safe"];
+    draft.routing.roleRequirements.custom = { requiresSubagents: true };
+    draft.routing.modelRouting.unmatchedHarness = "opencode";
+    draft.routing.modelRouting.rules = [{ harness: "pi", patterns: ["google/*"] }];
+    draft.routing.modelRouting.stripPrefixes.pi = ["google/"];
+    draft.routing.fallback.preserveRoleInstructions = false;
     draft.routing.capabilities.requiresSubagents = ["codex"];
+    draft.supervision.recommendRalphForSubstantialWork = false;
+    draft.supervision.recommendReturnOnAfterSpawn = false;
     await writeConfigDefaults(path, draft);
     const raw = JSON.parse(await readFile(path, "utf8"));
     assert.equal(raw.defaultModels.pi, "codex/gpt-5.6-sol");
@@ -427,8 +467,22 @@ test("default configuration writes preserve custom profiles without serializing 
     assert.deepEqual(raw.routing.preference, ["codex", "claude", "pi", "opencode"]);
     assert.deepEqual(raw.routing.explicitOnly, ["opencode", "claude"]);
     assert.deepEqual(raw.routing.roles.custom, ["codex", "claude"]);
+    assert.deepEqual(raw.routing.profilePreferences.codex, ["codex-minimal", "codex-safe"]);
+    assert.deepEqual(raw.routing.roleRequirements.custom, { requiresSubagents: true });
+    assert.equal(raw.routing.modelRouting.unmatchedHarness, "opencode");
+    assert.deepEqual(raw.routing.modelRouting.rules, [{ harness: "pi", patterns: ["google/*"] }]);
+    assert.deepEqual(raw.routing.modelRouting.stripPrefixes.pi, ["google/"]);
+    assert.equal(raw.routing.fallback.preserveRoleInstructions, false);
     assert.deepEqual(raw.routing.capabilities.requiresSubagents, ["codex"]);
     assert.equal(raw.routing.roles.advisor, undefined);
+    assert.deepEqual(raw.routing.futurePolicy, { keep: true });
+    assert.equal(raw.supervision.recommendRalphForSubstantialWork, false);
+    assert.equal(raw.supervision.recommendReturnOnAfterSpawn, false);
+    assert.equal(raw.supervision.futureGuidance, "keep");
+    const loaded = await readConfig(path);
+    assert.deepEqual(loaded.routing.modelRouting.rules, draft.routing.modelRouting.rules);
+    assert.deepEqual(loaded.routing.profilePreferences.codex, draft.routing.profilePreferences.codex);
+    assert.equal(loaded.supervision.recommendReturnOnAfterSpawn, false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

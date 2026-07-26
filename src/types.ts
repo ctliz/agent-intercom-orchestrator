@@ -47,17 +47,50 @@ export interface RolePreset {
   instructions?: string;
 }
 
+export interface ModelRoutingRule {
+  harness: Harness;
+  /** Exact model identifiers or prefix patterns ending in one `*`. */
+  patterns: string[];
+}
+
+export interface ModelRoutingConfig {
+  /** Direct harness used when an explicit model does not match any configured rule; null preserves normal role routing. */
+  unmatchedHarness: Harness | null;
+  /** Ordered rules; the first matching pattern wins. */
+  rules: ModelRoutingRule[];
+  /** Literal provider prefixes removed before invoking a direct harness CLI. */
+  stripPrefixes: Partial<Record<Harness, string[]>>;
+}
+
+export interface RoleRequirement {
+  requiresSubagents?: boolean;
+}
+
 export interface RoutingConfig {
   /** Base automatic-routing order after role and legacy default preferences. */
   preference: Harness[];
-  /** Harnesses that may only be selected by an explicit harness/profile override. */
+  /** Harnesses that may only be selected by an explicit harness/profile/model override. */
   explicitOnly: Harness[];
   /** Per-role automatic-routing preferences. */
   roles: Record<string, Harness[]>;
+  /** Ordered spawnable-profile preferences for each harness. */
+  profilePreferences: Partial<Record<Harness, string[]>>;
+  /** Default capability requirements applied when the caller does not specify them. */
+  roleRequirements: Record<string, RoleRequirement>;
+  modelRouting: ModelRoutingConfig;
+  fallback: {
+    /** Keep portable role instructions when automatic routing changes harnesses. */
+    preserveRoleInstructions: boolean;
+  };
   capabilities: {
     /** Harnesses able to delegate work to nested subagents. */
     requiresSubagents: Harness[];
   };
+}
+
+export interface SupervisionConfig {
+  recommendRalphForSubstantialWork: boolean;
+  recommendReturnOnAfterSpawn: boolean;
 }
 
 export interface OrchestratorConfig {
@@ -69,6 +102,7 @@ export interface OrchestratorConfig {
   permissionProfiles: Record<string, PermissionProfile>;
   roles: Record<string, RolePreset>;
   routing: RoutingConfig;
+  supervision: SupervisionConfig;
   leaseMinutes: number;
   heartbeatSeconds: number;
   maxRuntime: string;

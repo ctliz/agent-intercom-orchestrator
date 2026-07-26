@@ -28,9 +28,40 @@
       "challenger": ["pi", "codex", "claude"],
       "builder": ["codex", "claude", "pi"]
     },
+    "profilePreferences": {
+      "pi": ["pi-peer"],
+      "codex": ["codex-safe", "codex-minimal"],
+      "claude": ["claude-safe", "claude-minimal"],
+      "opencode": ["opencode-peer", "opencode-run"]
+    },
+    "roleRequirements": {},
+    "modelRouting": {
+      "unmatchedHarness": "pi",
+      "rules": [
+        {
+          "harness": "codex",
+          "patterns": ["codex/*", "openai/*", "codex-*", "gpt-*", "o1", "o1-*", "o2", "o2-*", "o3", "o3-*", "o4", "o4-*", "o5", "o5-*", "o6", "o6-*", "o7", "o7-*", "o8", "o8-*", "o9", "o9-*"]
+        },
+        {
+          "harness": "claude",
+          "patterns": ["claude/*", "anthropic/*", "claude-*", "opus", "opus-*", "sonnet", "sonnet-*", "haiku", "haiku-*", "fable", "fable-*"]
+        }
+      ],
+      "stripPrefixes": {
+        "codex": ["codex/", "openai/"],
+        "claude": ["claude/", "anthropic/"]
+      }
+    },
+    "fallback": {
+      "preserveRoleInstructions": true
+    },
     "capabilities": {
       "requiresSubagents": ["codex", "claude"]
     }
+  },
+  "supervision": {
+    "recommendRalphForSubstantialWork": true,
+    "recommendReturnOnAfterSpawn": true
   },
   "leaseMinutes": 30,
   "idleTimeoutMinutes": 60,
