@@ -47,6 +47,19 @@ export interface RolePreset {
   instructions?: string;
 }
 
+export interface RoutingConfig {
+  /** Base automatic-routing order after role and legacy default preferences. */
+  preference: Harness[];
+  /** Harnesses that may only be selected by an explicit harness/profile override. */
+  explicitOnly: Harness[];
+  /** Per-role automatic-routing preferences. */
+  roles: Record<string, Harness[]>;
+  capabilities: {
+    /** Harnesses able to delegate work to nested subagents. */
+    requiresSubagents: Harness[];
+  };
+}
+
 export interface OrchestratorConfig {
   defaultHarness: Harness;
   defaultProfiles: Partial<Record<Harness, string>>;
@@ -55,6 +68,7 @@ export interface OrchestratorConfig {
   profiles: Record<string, LaunchProfile>;
   permissionProfiles: Record<string, PermissionProfile>;
   roles: Record<string, RolePreset>;
+  routing: RoutingConfig;
   leaseMinutes: number;
   heartbeatSeconds: number;
   maxRuntime: string;

@@ -91,8 +91,14 @@ export function validateWorkerId(value: string): string {
 export function normalizeModelForHarness(harness: Harness, model: string | undefined): string | undefined {
   const normalized = model?.trim();
   if (!normalized) return undefined;
-  if (harness === "codex" && normalized.startsWith("codex/")) return normalized.slice("codex/".length);
-  if (harness === "claude" && normalized.startsWith("claude/")) return normalized.slice("claude/".length);
+  if (harness === "codex") {
+    if (normalized.startsWith("codex/")) return normalized.slice("codex/".length);
+    if (normalized.startsWith("openai/")) return normalized.slice("openai/".length);
+  }
+  if (harness === "claude") {
+    if (normalized.startsWith("claude/")) return normalized.slice("claude/".length);
+    if (normalized.startsWith("anthropic/")) return normalized.slice("anthropic/".length);
+  }
   return normalized;
 }
 

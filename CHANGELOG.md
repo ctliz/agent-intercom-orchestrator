@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Add capability-aware automatic harness routing for omitted-harness spawns, with pure explainable ranking, selected-profile executable or verified Pi runtime checks, persistence mode and effort reporting, direct Codex/Claude selection for implementation and nested-agent work, Pi advisory/research/review preference, mandatory explicit-only OpenCode, and a non-spawning `route` preview action.
+- Preserve explicit harness/profile/permission choices, route explicit Codex/OpenAI and Claude/Anthropic model identifiers to their direct harnesses, migrate legacy `defaultHarness` preference safely, prevent harness-specific role model/effort leakage during availability fallback, and add typed merge-safe `routing` configuration plus Agent Skill guidance for “orc work”, bounded Ralph loops, and `return_on` check-ins.
+- Update the locked Pi development dependency family from 0.80.6 to 0.82.1 as a complete dependency-tree upgrade.
 - Launch workers using the manager's verified concrete Pi runtime when the built-in `pi-peer` profile is unchanged, avoiding unpinned `npx` cold bootstraps and version drift while preserving custom profile commands.
 - Report that same verified manager Pi command, package version, and runtime source through `agent_fleet` `versions`, without invoking a working-directory-sensitive Pi wrapper; preserve configured commands for custom and fallback profiles.
 - Replace manager-heartbeat lease extension with activity-gated renewal: only manager-received worker Intercom traffic or explicit `renew` extends a worker, and renewal is capped at the configured idle deadline.

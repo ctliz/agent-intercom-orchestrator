@@ -580,3 +580,112 @@ test("extension registers discovery tools and interactive configuration commands
     await rm(agentDir, { recursive: true, force: true });
   }
 });
+
+test("route previews automatic selection and explicit profile overrides without spawning", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-route-test-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    const orchestratorDir = join(agentDir, "intercom", "orchestrator");
+    await mkdir(orchestratorDir, { recursive: true });
+    await writeFile(join(orchestratorDir, "config.json"), JSON.stringify({
+      profiles: {
+        "pi-peer": { harness: "pi", command: "/bin/true", mode: "persistent", maxRuntime: "12h" },
+        "codex-safe": { harness: "codex", command: "/bin/true", mode: "persistent", maxRuntime: "12h" },
+        "claude-safe": { harness: "claude", command: "missing-claude-command-for-routing-test", mode: "persistent", maxRuntime: "12h" },
+        "opencode-run": { harness: "opencode", command: "/bin/true", mode: "one-shot", maxRuntime: "2h" },
+      },
+      roles: {
+        fallback: { harness: "claude", profile: "claude-safe", permissionProfile: "trusted", model: "claude/claude-opus-4-8", effort: "max", instructions: "Keep the role instructions." },
+      },
+      routing: {
+        roles: { fallback: ["claude", "codex", "pi"] },
+      },
+    }));
+    const lifecycle = new Map<string, (...args: any[]) => any>();
+    const tools = new Map<string, any>();
+    let launches = 0;
+    const pi: any = {
+      on(name: string, handler: (...args: any[]) => any) { lifecycle.set(name, handler); },
+      events: { on() { return () => {}; }, emit() {} },
+      registerTool(tool: any) { tools.set(tool.name, tool); },
+      registerCommand() {},
+      async exec(command: string) {
+        if (command === "systemd-run") launches += 1;
+        return commandResult();
+      },
+    };
+    const ctx: any = {
+      cwd: "/tmp", mode: "rpc", hasUI: false,
+      sessionManager: { getSessionId: () => "route-manager", getSessionFile: () => undefined },
+      ui: { setStatus() {}, notify() {} },
+    };
+    const extensionUrl = new URL(`../src/index.ts?route=${Date.now()}`, import.meta.url);
+    const { default: extension } = await import(extensionUrl.href);
+    extension(pi);
+    await lifecycle.get("session_start")?.({}, ctx);
+    const fleet = tools.get("agent_fleet");
+
+    const builder = await fleet.execute("route-builder", { action: "route", role: "builder" }, new AbortController().signal, () => {}, ctx);
+    assert.match(builder.content[0].text, /Recommended harness: codex/);
+    assert.equal(builder.details.routing.selected, "codex");
+    assert.equal(builder.details.profile, "codex-safe");
+
+    const nested = await fleet.execute("route-nested", { action: "route", role: "advisor", requiresSubagents: true }, new AbortController().signal, () => {}, ctx);
+    assert.match(nested.content[0].text, /Recommended harness: codex/);
+    assert.match(nested.content[0].text, /pi \[excluded\].*nested subagents are required/);
+
+    const explicit = await fleet.execute("route-explicit", { action: "route", profile: "opencode-run" }, new AbortController().signal, () => {}, ctx);
+    assert.match(explicit.content[0].text, /Explicit harness: opencode/);
+    assert.equal(explicit.details.routing.explicitSource, "profile");
+
+    const directModel = await fleet.execute("route-model", { action: "route", model: "claude/claude-opus-4-8" }, new AbortController().signal, () => {}, ctx);
+    assert.match(directModel.content[0].text, /Explicit harness: claude/);
+    assert.equal(directModel.details.routing.explicitSource, "model");
+    assert.match(directModel.content[0].text, /use action=models to verify live availability/);
+
+    const explicitHarness = await fleet.execute("route-harness", { action: "route", harness: "pi", requiresSubagents: true }, new AbortController().signal, () => {}, ctx);
+    assert.match(explicitHarness.content[0].text, /Explicit harness: pi/);
+    assert.match(explicitHarness.content[0].text, /capability warning.*does not support configured nested subagents/);
+    assert.equal(explicitHarness.details.routing.explicitSource, "harness");
+
+    const none = await fleet.execute("route-none", { action: "route", role: "builder", requiresSubagents: true, effort: "minimal" }, new AbortController().signal, () => {}, ctx);
+    assert.match(none.content[0].text, /Recommended harness: none/);
+    assert.equal(none.details.routing.selected, undefined);
+    assert.equal(none.details.routing.candidates.length, 4);
+    await assert.rejects(
+      fleet.execute("spawn-none", { action: "spawn", id: "no-route", role: "builder", requiresSubagents: true, effort: "minimal", task: "Cannot route." }, new AbortController().signal, () => {}, ctx),
+      /Use action=route to inspect exclusions/,
+    );
+    assert.equal(launches, 0);
+
+    const automaticSpawn = await fleet.execute("spawn-builder", {
+      action: "spawn", id: "routed-builder", role: "builder", task: "Implement the route.", cwd: "/tmp", permissionProfile: "trusted",
+    }, new AbortController().signal, () => {}, ctx);
+    assert.match(automaticSpawn.content[0].text, /Started routed-builder \[codex\/builder\]/);
+    assert.match(automaticSpawn.content[0].text, /automatically selected codex/);
+    assert.match(automaticSpawn.content[0].text, /bounded Ralph loop/);
+    assert.match(automaticSpawn.content[0].text, /return_on/);
+    assert.equal(automaticSpawn.details.routing.selected, "codex");
+    assert.equal(launches, 1);
+
+    const fallbackSpawn = await fleet.execute("spawn-fallback", {
+      action: "spawn", id: "fallback-worker", role: "fallback", task: "Fall through safely.", cwd: "/tmp",
+    }, new AbortController().signal, () => {}, ctx);
+    assert.equal(fallbackSpawn.details.worker.harness, "codex");
+    assert.equal(fallbackSpawn.details.worker.model, undefined);
+    assert.equal(fallbackSpawn.details.worker.effort, undefined);
+    assert.equal(fallbackSpawn.details.worker.instructions, "Keep the role instructions.");
+    assert.match(fallbackSpawn.details.routing.reasons.join(" "), /ignored harness-specific preset model and effort/);
+    assert.equal(launches, 2);
+
+    assert.match(fleet.promptGuidelines.join("\n"), /Ralph loop/);
+    assert.match(fleet.promptGuidelines.join("\n"), /return_on/);
+
+    await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});

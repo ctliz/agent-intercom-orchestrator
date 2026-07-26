@@ -24,6 +24,16 @@ async function runChild(script: URL, env: NodeJS.ProcessEnv, input?: string): Pr
 test("agent-intercom-fleet CLI hosts the same agent_fleet tool for non-Pi managers", async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-fleet-cli-"));
   try {
+    const orchestratorDir = join(agentDir, "intercom", "orchestrator");
+    await mkdir(orchestratorDir, { recursive: true });
+    await writeFile(join(orchestratorDir, "config.json"), JSON.stringify({
+      profiles: {
+        "pi-peer": { harness: "pi", command: process.execPath, mode: "persistent" },
+        "codex-safe": { harness: "codex", command: process.execPath, mode: "persistent" },
+        "claude-safe": { harness: "claude", command: process.execPath, mode: "persistent" },
+        "opencode-peer": { harness: "opencode", command: process.execPath, mode: "persistent" },
+      },
+    }));
     const cli = new URL("../src/agent-fleet-cli.mjs", import.meta.url);
     const { code, stdout, stderr } = await runChild(cli, {
       ...process.env, PI_CODING_AGENT_DIR: agentDir, AGENT_INTERCOM_ORCHESTRATOR_DISABLED: "",
@@ -36,6 +46,19 @@ test("agent-intercom-fleet CLI hosts the same agent_fleet tool for non-Pi manage
     const response = JSON.parse(stdout);
     assert.equal(response.ok, true);
     assert.match(response.result.content[0].text, /opencode: modes=persistent,one-shot/);
+
+    const route = await runChild(cli, {
+      ...process.env, PI_CODING_AGENT_DIR: agentDir, AGENT_INTERCOM_ORCHESTRATOR_DISABLED: "",
+    }, JSON.stringify({
+      managerSessionId: "opencode-manager-test",
+      cwd: process.cwd(),
+      params: { action: "route", role: "builder", requiresSubagents: true },
+    }));
+    assert.equal(route.code, 0, route.stderr);
+    const routeResponse = JSON.parse(route.stdout);
+    assert.equal(routeResponse.ok, true);
+    assert.equal(routeResponse.result.details.routing.selected, "codex");
+    assert.match(routeResponse.result.content[0].text, /Preview only; no coworker was spawned/);
   } finally {
     await rm(agentDir, { recursive: true, force: true });
   }

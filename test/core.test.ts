@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { DEFAULT_CONFIG, mergeConfig, readConfig, writeConfig, writeConfigDefaults } from "../src/config.ts";
+import { DEFAULT_CONFIG, mergeConfig, readConfig, resolveProfileCommand, writeConfig, writeConfigDefaults } from "../src/config.ts";
 import { parseOpenCodeModelsVerbose, parsePiModels, recordIntercomWorkerActivity, removeWorkerRuntimeAndRecord, renewObservedWorkerLeases, reserveWorkerRecord, workersAttachedToManager } from "../src/index.ts";
 import { workerRuntimeRoot } from "../src/runtime.ts";
 import { WorkerStore } from "../src/store.ts";
@@ -276,6 +276,19 @@ test("expired cleanup snapshot is fenced by renewal or adoption activity", () =>
   assert.ok(worker.checkpointDeadlineAt! > expectedDeadline);
 });
 
+test("profile command resolution verifies absolute and PATH executables", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-intercom-command-test-"));
+  try {
+    const nonExecutable = join(dir, "not-executable");
+    await writeFile(nonExecutable, "#!/bin/sh\n");
+    assert.equal(resolveProfileCommand("/bin/true"), "/bin/true");
+    assert.equal(resolveProfileCommand(nonExecutable), undefined);
+    assert.equal(resolveProfileCommand("missing-command", dir), undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("configuration merges profiles, defaults, and role presets without dropping built-ins", () => {
   const config = mergeConfig({
     leaseMinutes: 5,
@@ -285,6 +298,12 @@ test("configuration merges profiles, defaults, and role presets without dropping
     cleanupGraceMinutes: 20,
     cleanupTimerMinutes: 10,
     cleanupTimerEnabled: false,
+    routing: {
+      preference: ["claude", "pi", "codex", "opencode", "invalid", "claude"],
+      explicitOnly: [],
+      roles: { auditor: ["claude", "pi"] },
+      capabilities: { requiresSubagents: ["claude"] },
+    },
     defaultModels: { pi: "claude/claude-sonnet-5" },
     defaultEfforts: { pi: "max" },
     permissionProfiles: {
@@ -309,6 +328,10 @@ test("configuration merges profiles, defaults, and role presets without dropping
   assert.equal(config.cleanupGraceMinutes, 20);
   assert.equal(config.cleanupTimerMinutes, 10);
   assert.equal(config.cleanupTimerEnabled, false);
+  assert.deepEqual(config.routing.preference, ["claude", "pi", "codex", "opencode"]);
+  assert.deepEqual(config.routing.explicitOnly, ["opencode"]);
+  assert.deepEqual(config.routing.roles.auditor, ["claude", "pi"]);
+  assert.deepEqual(config.routing.capabilities.requiresSubagents, ["claude"]);
   assert.equal(config.defaultModels.pi, "claude/claude-sonnet-5");
   assert.equal(config.defaultEfforts.pi, "max");
   assert.equal(config.roles.auditor.harness, "pi");
@@ -347,7 +370,9 @@ test("Pi model table parsing returns provider-qualified model ids", () => {
 test("model identifiers are normalized for external harness CLIs", () => {
   assert.equal(normalizeModelForHarness("pi", "claude/claude-opus-4-8"), "claude/claude-opus-4-8");
   assert.equal(normalizeModelForHarness("codex", "codex/gpt-5.6-sol"), "gpt-5.6-sol");
+  assert.equal(normalizeModelForHarness("codex", "openai/gpt-5.4"), "gpt-5.4");
   assert.equal(normalizeModelForHarness("claude", "claude/claude-opus-4-8"), "claude-opus-4-8");
+  assert.equal(normalizeModelForHarness("claude", "anthropic/claude-fable-5"), "claude-fable-5");
   assert.equal(normalizeModelForHarness("opencode", "anthropic/claude-fable-5"), "anthropic/claude-fable-5");
 });
 
@@ -385,6 +410,10 @@ test("default configuration writes preserve custom profiles without serializing 
     }));
     const draft = await readConfig(path);
     draft.defaultModels.pi = "codex/gpt-5.6-sol";
+    draft.routing.preference = ["codex", "claude", "pi", "opencode"];
+    draft.routing.explicitOnly = ["opencode", "claude"];
+    draft.routing.roles.custom = ["codex", "claude"];
+    draft.routing.capabilities.requiresSubagents = ["codex"];
     await writeConfigDefaults(path, draft);
     const raw = JSON.parse(await readFile(path, "utf8"));
     assert.equal(raw.defaultModels.pi, "codex/gpt-5.6-sol");
@@ -395,6 +424,28 @@ test("default configuration writes preserve custom profiles without serializing 
     assert.equal(raw.defaultProfiles.pi, undefined);
     assert.equal(raw.roles.advisor, undefined);
     assert.equal(raw.roles.custom.instructions, "Stay custom.");
+    assert.deepEqual(raw.routing.preference, ["codex", "claude", "pi", "opencode"]);
+    assert.deepEqual(raw.routing.explicitOnly, ["opencode", "claude"]);
+    assert.deepEqual(raw.routing.roles.custom, ["codex", "claude"]);
+    assert.deepEqual(raw.routing.capabilities.requiresSubagents, ["codex"]);
+    assert.equal(raw.routing.roles.advisor, undefined);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("default writes preserve an explicit default-valued routing object as authoritative", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "agent-intercom-routing-presence-test-"));
+  try {
+    const path = join(dir, "config.json");
+    await writeFile(path, JSON.stringify({ defaultHarness: "claude", routing: {} }));
+    const before = await readConfig(path);
+    assert.equal(before.routing.preference[0], "pi");
+    await writeConfigDefaults(path, before);
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    assert.deepEqual(raw.routing, {});
+    const after = await readConfig(path);
+    assert.equal(after.routing.preference[0], "pi");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

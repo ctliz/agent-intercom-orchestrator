@@ -1,6 +1,6 @@
 ---
 name: agent-intercom-orchestrator
-description: Create and manage owned independent Pi, Codex, Claude Code, and OpenCode coworkers from Pi or an opt-in OpenCode manager, with model/variant selection, durable OpenCode session resume, and lifecycle cleanup through the shared agent_fleet tool. Use when delegating persistent work, creating advisors or builder/challenger pairs, inspecting worker status, choosing models, editing defaults, or cleaning expired workers.
+description: Create and manage owned independent Pi, Codex, Claude Code, and OpenCode coworkers from Pi or an opt-in OpenCode manager, with capability-aware routing, model/variant selection, durable OpenCode session resume, and lifecycle cleanup through the shared agent_fleet tool. Use when the user says “orc work”, “orchestrate this”, or “use coworkers”; when delegating persistent work; when creating advisors or builder/challenger pairs; or when inspecting, configuring, or cleaning workers.
 ---
 
 # Agent Intercom Orchestrator
@@ -28,6 +28,8 @@ Verify with `pi list`, then call `agent_fleet({ action: "doctor" })`. The packag
 - Create feature worktrees before spawning sandboxed builders such as `codex-safe`, and pass the worktree as `cwd`. A workspace-write worker generally cannot create a sibling under `~/worktrees` when its writable root is the shared checkout.
 - Every owned worker is told its manager target. Coworkers use `intercom_team({})` to get the current manager and live same-manager coworkers; this follows adoption dynamically and does not grant fleet mutation authority.
 - Use `capabilities`, `profiles`, `permissions`, `models`, `variants`, `versions`, or `config` instead of guessing options, permission policy, or installed package state. OpenCode variants are model-specific.
+- When `spawn` omits both `harness` and `profile`, automatic routing checks the selected profile's executable/runtime, mode, requested effort, and nested-agent capability. It favors Pi for advisory/research/review/challenge work and direct Codex then direct Claude for implementation or `requiresSubagents: true`. A caller-supplied harness or profile always wins; an explicit Codex/OpenAI or Claude/Anthropic model identifier selects that direct harness. OpenCode is explicit-only and is never selected automatically.
+- Preview an automatic choice with `agent_fleet({ action: "route", ... })`; the explanation lists ranking, availability, capability exclusions, and the selected profile without spawning.
 - Built-in advisor, researcher, and challenger roles use `review-readonly`; builders and custom roles use `builder-restricted`. Select `trusted` only when broad host and Git authority is intentional.
 - Preview update and cleanup before executing them. Never replace a detected Git install with npm, and never kill or forget sessions the orchestrator does not own.
 
@@ -45,11 +47,19 @@ agent_fleet({ action: "models", harness: "pi" })
 agent_fleet({ action: "models", harness: "opencode" })
 agent_fleet({ action: "variants", model: "anthropic/claude-fable-5" })
 agent_fleet({ action: "config" })
+agent_fleet({ action: "route", role: "advisor" })
+agent_fleet({ action: "route", role: "builder", requiresSubagents: true })
 agent_fleet({ action: "list" }) // current manager's workers and Intercom targets
 agent_fleet({ action: "list", all: true }) // explicit cross-manager diagnostics
 ```
 
 Normalized effort values are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; `capabilities` reports the subset supported by each harness.
+
+## Automatic routing and supervision
+
+Omit `harness` and `profile` only when the routing policy should decide. Role preset harnesses remain leading preferences, unavailable selected profiles fall through to the next eligible harness, and `requiresSubagents: true` excludes harnesses without configured nested-agent support. A configured `routing.preference` is the authoritative base order; legacy files with no routing block migrate an explicitly configured `defaultHarness` to the front. Automatic routing evaluates the explicit, role-preset, or per-harness default profile only—use an explicit `profile` or update `defaultProfiles` rather than silently selecting an arbitrary alternative. Pass an explicit harness or profile when the user has chosen one. Explicit direct-provider model identifiers influence harness selection, explicit effort filters automatic candidates, and explicit permission choices are validated and preserved. Portable role instructions deliberately follow an availability fallback, while harness-specific profile/model/effort settings do not; use an explicit harness/profile or caller-supplied instructions when wording depends on one harness.
+
+For substantial iterative work, recommend a bounded Ralph loop so the manager can refresh context and evidence between passes. Do not add Ralph overhead to a quick one-shot assignment. After spawning any coworker, set a bounded `return_on` watcher or timed check-in for a completion condition and timeout, then re-arm only when continued work is justified. Intercom transports messages but must not be assumed to wake the manager by itself.
 
 ## Persistent Pi advisor
 
@@ -75,8 +85,7 @@ The Pi coworker has its own named Pi session, transcript, model, thinking effort
 ```typescript
 agent_fleet({
   action: "spawn",
-  harness: "codex",
-  profile: "codex-safe",
+  requiresSubagents: true,
   permissionProfile: "builder-restricted",
   id: "codex-build-api",
   role: "builder",
@@ -112,6 +121,8 @@ agent_fleet({
   task: "Run the smoke checks and report evidence through Intercom."
 })
 ```
+
+Because this builder spawn omits both harness fields, the resolver prefers an available direct Codex profile, then direct Claude. Use `action: "route"` first when the choice needs review.
 
 Persistent OpenCode spawn waits for broker/plugin/session readiness and records the OpenCode session ID. Reusing a persistent OpenCode or Codex worker ID resumes its harness session/thread; pass `fresh: true` only when you intentionally want clean context.
 
@@ -153,6 +164,8 @@ agent_fleet({ action: "forget", id: "codex-build-api", acknowledge: true })
 - `/agents-cleanup [execute]` — preview or execute expired-lease cleanup
 
 Configuration is stored at `~/.pi/agent/intercom/orchestrator/config.json` unless `PI_CODING_AGENT_DIR` changes the Pi agent directory. By default, manager-received worker Intercom traffic or explicit `renew` extends a lease, but never beyond 60 minutes since the last worker activity. The manager begins checkpoint requests 10 minutes before that idle deadline and retries every 5 minutes while available; cleanup waits another 15 minutes, then stops the exact owned cgroup. A persistent systemd user timer checks every 15 minutes even when no manager is running. `stop` is always allowed; `forget` requires a stopped record and explicit manager `acknowledge: true`.
+
+Routing configuration lives under `routing`: `preference` is the authoritative base order, `explicitOnly` adds automatic exclusions (OpenCode remains mandatory), `roles` contains per-role ordered preferences, and `capabilities.requiresSubagents` lists harnesses that support nested delegation. Existing `defaultHarness`, `defaultProfiles`, role presets, and explicit spawn fields remain supported; `defaultHarness` is the final fallback once a routing block exists.
 
 ## Current limitations
 

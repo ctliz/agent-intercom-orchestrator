@@ -27,6 +27,7 @@ import {
 test("built-in roles choose conservative permission profiles", () => {
   assert.equal(DEFAULT_CONFIG.roles.advisor.permissionProfile, "review-readonly");
   assert.equal(DEFAULT_CONFIG.roles.researcher.permissionProfile, "review-readonly");
+  assert.equal(DEFAULT_CONFIG.roles.reviewer.permissionProfile, "review-readonly");
   assert.equal(DEFAULT_CONFIG.roles.challenger.permissionProfile, "review-readonly");
   assert.equal(DEFAULT_CONFIG.roles.builder.permissionProfile, "builder-restricted");
 });

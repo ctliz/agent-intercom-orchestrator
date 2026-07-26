@@ -18,6 +18,20 @@
     "claude": "high",
     "opencode": "high"
   },
+  "routing": {
+    "preference": ["pi", "codex", "claude", "opencode"],
+    "explicitOnly": ["opencode"],
+    "roles": {
+      "advisor": ["pi", "codex", "claude"],
+      "researcher": ["pi", "codex", "claude"],
+      "reviewer": ["pi", "codex", "claude"],
+      "challenger": ["pi", "codex", "claude"],
+      "builder": ["codex", "claude", "pi"]
+    },
+    "capabilities": {
+      "requiresSubagents": ["codex", "claude"]
+    }
+  },
   "leaseMinutes": 30,
   "idleTimeoutMinutes": 60,
   "checkpointWarningMinutes": 10,
