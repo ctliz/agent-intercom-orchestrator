@@ -27,6 +27,15 @@ export interface HarnessVersion {
   harness: "pi" | "codex" | "claude" | "opencode";
   version?: string;
   command?: string;
+  args?: string[];
+  source?: "manager-runtime" | "profile";
+}
+
+export interface HarnessRuntime {
+  command: string;
+  args?: string[];
+  source?: "manager-runtime" | "profile";
+  version?: string;
 }
 
 const ADAPTERS: Array<{ id: AdapterId; packageName: string; repo: string; binary?: "coi" | "cci" }> = [
@@ -220,16 +229,28 @@ export function formatUpdatePlan(adapters: AdapterVersion[]): string {
   return lines.join("\n");
 }
 
-export function detectHarnessVersions(commandPaths: Partial<Record<"pi" | "codex" | "claude" | "opencode", string>>): HarnessVersion[] {
+export function detectHarnessVersions(commandPaths: Partial<Record<"pi" | "codex" | "claude" | "opencode", string | HarnessRuntime>>): HarnessVersion[] {
   return (["pi", "codex", "claude", "opencode"] as const).map((harness) => {
-    const command = commandPaths[harness];
-    if (!command) return { harness };
-    const result = spawnSync(command, ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 });
-    const version = result.status === 0 ? result.stdout.trim().split(/\r?\n/, 1)[0] : undefined;
-    return { harness, command, version };
+    const runtime = commandPaths[harness];
+    if (!runtime) return { harness };
+    const command = typeof runtime === "string" ? runtime : runtime.command;
+    const args = typeof runtime === "string" ? undefined : runtime.args;
+    const source = typeof runtime === "string" ? undefined : runtime.source;
+    let version = typeof runtime === "string" ? undefined : runtime.version;
+    if (!version) {
+      const result = spawnSync(command, [...(args ?? []), "--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5000 });
+      version = result.status === 0 ? result.stdout.trim().split(/\r?\n/, 1)[0] : undefined;
+    }
+    return { harness, command, ...(args ? { args } : {}), ...(source ? { source } : {}), ...(version ? { version } : {}) };
   });
 }
 
 export function formatHarnessVersions(harnesses: HarnessVersion[]): string {
-  return ["Harness CLIs:", ...harnesses.map((entry) => `- ${entry.harness}: ${entry.version ?? "not detected"}${entry.command ? ` (${entry.command})` : ""}`)].join("\n");
+  return ["Harness CLIs:", ...harnesses.map((entry) => {
+    if (entry.source) {
+      const command = entry.command ? [entry.command, ...(entry.args ?? [])].map(shellQuote).join(" ") : "not detected";
+      return `- ${entry.harness}: version=${entry.version ?? "not detected"} command=${command} source=${entry.source}`;
+    }
+    return `- ${entry.harness}: ${entry.version ?? "not detected"}${entry.command ? ` (${entry.command})` : ""}`;
+  })].join("\n");
 }

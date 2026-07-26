@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { formatAdapterVersions, formatUpdatePlan, inspectAdapterFamily } from "../src/updates.ts";
+import { DEFAULT_CONFIG } from "../src/config.ts";
+import { resolvePiRuntime } from "../src/pi-runtime.ts";
+import { detectHarnessVersions, formatAdapterVersions, formatHarnessVersions, formatUpdatePlan, inspectAdapterFamily } from "../src/updates.ts";
 
 async function packageRoot(root: string, name: string, version = "0.9.3"): Promise<void> {
   await mkdir(root, { recursive: true });
@@ -50,6 +52,84 @@ test("pinned Pi package sources are reported instead of silently replaced", asyn
     const pi = adapters.find((entry) => entry.id === "pi")!;
     assert.equal(pi.update, undefined);
     assert.match(pi.blockedReason ?? "", /pinned/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("harness diagnostics use the verified manager Pi version without invoking its wrapper", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-intercom-manager-version-"));
+  try {
+    const managerMarker = join(root, "manager-invoked");
+    const wrapperMarker = join(root, "wrapper-invoked");
+    const managerEntry = join(root, "pi package", "dist", "cli.js");
+    const managerExecutable = join(root, "node");
+    const wrapper = join(root, "pi");
+    await mkdir(join(root, "pi package", "dist"), { recursive: true });
+    await writeFile(join(root, "pi package", "package.json"), JSON.stringify({
+      name: "@earendil-works/pi-coding-agent",
+      version: "1.2.3",
+      bin: { pi: "dist/cli.js" },
+    }));
+    await writeFile(managerEntry, "// manager Pi entry\n");
+    await writeFile(managerExecutable, `#!/bin/sh\nprintf invoked > '${managerMarker}'\nexit 1\n`);
+    await writeFile(wrapper, `#!/bin/sh\nprintf invoked > '${wrapperMarker}'\nexit 1\n`);
+    await Promise.all([chmod(managerExecutable, 0o755), chmod(wrapper, 0o755)]);
+
+    const profile = structuredClone(DEFAULT_CONFIG.profiles["pi-peer"]);
+    const runtime = await resolvePiRuntime({
+      profileName: "pi-peer",
+      profile,
+      configuredExecutable: wrapper,
+      builtInProfile: profile,
+      managerEntry,
+      managerExecutable,
+    });
+
+    const harnesses = detectHarnessVersions({ pi: runtime });
+    assert.deepEqual(harnesses[0], {
+      harness: "pi",
+      command: managerExecutable,
+      args: [managerEntry],
+      source: "manager-runtime",
+      version: "1.2.3",
+    });
+    await Promise.all([
+      assert.rejects(access(managerMarker), { code: "ENOENT" }),
+      assert.rejects(access(wrapperMarker), { code: "ENOENT" }),
+    ]);
+    assert.ok(formatHarnessVersions(harnesses).includes(
+      `- pi: version=1.2.3 command=${managerExecutable} '${managerEntry}' source=manager-runtime`,
+    ));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("custom default Pi runtime diagnostics preserve the profile command fallback", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-intercom-profile-version-"));
+  try {
+    const wrapper = join(root, "custom-pi");
+    await writeFile(wrapper, "#!/bin/sh\nprintf 'custom-pi 4.5.6\\n'\n");
+    await chmod(wrapper, 0o755);
+
+    const builtIn = structuredClone(DEFAULT_CONFIG.profiles["pi-peer"]);
+    const profile = { ...builtIn, command: wrapper };
+    const runtime = await resolvePiRuntime({
+      profileName: "custom-pi",
+      profile,
+      configuredExecutable: wrapper,
+      builtInProfile: builtIn,
+    });
+    const pi = detectHarnessVersions({ pi: runtime })[0];
+    assert.deepEqual(pi, {
+      harness: "pi",
+      command: wrapper,
+      args: [],
+      source: "profile",
+      version: "custom-pi 4.5.6",
+    });
+    assert.match(formatHarnessVersions([pi]), /version=custom-pi 4\.5\.6 .* source=profile/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
