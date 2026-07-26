@@ -42,7 +42,7 @@ agent_fleet({ action: "update" }) // preview exact source-aware commands
 agent_fleet({ action: "update", execute: true }) // apply recognized safe updates
 ```
 
-`versions` reports all five Agent Intercom packages plus detected Pi, Codex, Claude, and OpenCode CLI versions. Dirty or pinned Git sources are reported rather than overwritten. After updating, restart affected coworkers and run `/reload` in Pi.
+`versions` reports all five Agent Intercom packages plus detected Pi, Codex, Claude, and OpenCode CLI versions. For the unchanged built-in `pi-peer` profile, its Pi line identifies the verified manager runtime's exact command, package version, and `manager-runtime` source instead of invoking a working-directory-sensitive wrapper; custom and fallback profiles report their configured command with source `profile`. Dirty or pinned Git sources are reported rather than overwritten. After updating, restart affected coworkers and run `/reload` in Pi.
 
 For a one-run checkout test without installing:
 

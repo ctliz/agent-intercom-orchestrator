@@ -447,12 +447,24 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     },
   });
 
-  const harnessVersions = () => detectHarnessVersions({
-    pi: resolveProfileCommand("pi"),
-    codex: resolveProfileCommand("codex"),
-    claude: resolveProfileCommand("claude"),
-    opencode: resolveProfileCommand("opencode"),
-  });
+  const harnessVersions = async () => {
+    const piProfileName = config.defaultProfiles.pi;
+    const piProfile = piProfileName ? config.profiles[piProfileName] : undefined;
+    const piRuntime = piProfileName && piProfile?.harness === "pi"
+      ? await resolvePiRuntime({
+        profileName: piProfileName,
+        profile: piProfile,
+        configuredExecutable: resolveProfileCommand(piProfile.command),
+        builtInProfile: DEFAULT_CONFIG.profiles["pi-peer"],
+      })
+      : undefined;
+    return detectHarnessVersions({
+      pi: piRuntime,
+      codex: resolveProfileCommand("codex"),
+      claude: resolveProfileCommand("claude"),
+      opencode: resolveProfileCommand("opencode"),
+    });
+  };
 
   const updateStatus = async (ctx = currentCtx) => {
     if (!ctx) return;
@@ -945,7 +957,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
 
       if (params.action === "versions") {
         const adapters = await inspectVersions();
-        const harnesses = harnessVersions();
+        const harnesses = await harnessVersions();
         return textResult(`${formatAdapterVersions(adapters)}\n\n${formatHarnessVersions(harnesses)}`, { adapters, harnesses });
       }
 
