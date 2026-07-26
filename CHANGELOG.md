@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Launch workers using the manager's verified concrete Pi runtime when the built-in `pi-peer` profile is unchanged, avoiding unpinned `npx` cold bootstraps and version drift while preserving custom profile commands.
 - Replace manager-heartbeat lease extension with activity-gated renewal: only manager-received worker Intercom traffic or explicit `renew` extends a worker, and renewal is capped at the configured idle deadline.
 - Request and retry checkpoints before idle expiry, preserve a grace/adoption window, and install a persistent systemd user timer that stops only exact expired owned cgroups even when no manager is running.
 - Preserve stopped worker records with stop/dirty-state evidence and require explicit manager `acknowledge: true` before `forget` removes a record.
