@@ -518,13 +518,14 @@ export async function writeConfigDefaults(path: string, config: OrchestratorConf
     Object.entries(config.routing.roles).filter(([name, preference]) =>
       JSON.stringify(preference) !== JSON.stringify(DEFAULT_CONFIG.routing.roles[name])),
   );
-  const profilePreferenceDelta = Object.fromEntries(HARNESSES.flatMap((harness) =>
-    JSON.stringify(config.routing.profilePreferences[harness] ?? []) !== JSON.stringify(DEFAULT_CONFIG.routing.profilePreferences[harness] ?? [])
-      ? [[harness, config.routing.profilePreferences[harness] ?? []]]
-      : []));
   const existingProfilePreferences = isRecord(existingRouting.profilePreferences)
     ? structuredClone(existingRouting.profilePreferences)
     : {};
+  const profilePreferenceDelta = Object.fromEntries(HARNESSES.flatMap((harness) =>
+    Object.hasOwn(existingProfilePreferences, harness)
+      || JSON.stringify(config.routing.profilePreferences[harness] ?? []) !== JSON.stringify(DEFAULT_CONFIG.routing.profilePreferences[harness] ?? [])
+      ? [[harness, config.routing.profilePreferences[harness] ?? []]]
+      : []));
   for (const harness of HARNESSES) delete existingProfilePreferences[harness];
   const profilePreferences = { ...existingProfilePreferences, ...profilePreferenceDelta };
   const modelStripPrefixDelta = Object.fromEntries(HARNESSES.flatMap((harness) =>

@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { mergeConfig, readConfig, writeConfig, writeConfigDefaults } from "../src/config.ts";
+import { DEFAULT_CONFIG, mergeConfig, readConfig, writeConfig, writeConfigDefaults } from "../src/config.ts";
 
 test("policy config merges partial values without dropping typed defaults", () => {
   assert.equal(mergeConfig({}).routing.modelRouting.unmatchedHarness, null);
@@ -96,6 +96,25 @@ test("default-policy writes preserve unknown config and round-trip policy deltas
     assert.deepEqual(roundTrip.routing.profilePreferences, config.routing.profilePreferences);
     assert.deepEqual(roundTrip.routing.roleRequirements, config.routing.roleRequirements);
     assert.deepEqual(roundTrip.supervision, config.supervision);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("default writes preserve an explicit default-valued profile order with a custom legacy default", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "orchestrator-policy-explicit-profile-order-"));
+  const path = join(directory, "config.json");
+  try {
+    await writeFile(path, JSON.stringify({
+      defaultProfiles: { codex: "team-codex" },
+      routing: { profilePreferences: { codex: DEFAULT_CONFIG.routing.profilePreferences.codex } },
+    }));
+    const before = await readConfig(path);
+    assert.deepEqual(before.routing.profilePreferences.codex, ["codex-safe", "codex-minimal"]);
+    await writeConfigDefaults(path, before);
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    assert.deepEqual(raw.routing.profilePreferences.codex, ["codex-safe", "codex-minimal"]);
+    assert.deepEqual((await readConfig(path)).routing.profilePreferences.codex, before.routing.profilePreferences.codex);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
