@@ -603,7 +603,7 @@ test("route previews automatic selection and explicit profile overrides without 
       routing: {
         explicitOnly: [],
         roles: { fallback: ["claude", "codex", "pi"], codexFallback: ["codex", "pi"], nestedDefault: ["pi", "codex"], open: ["opencode", "pi"] },
-        profilePreferences: { codex: ["codex-missing", "codex-safe"] },
+        profilePreferences: { codex: ["codex-missing", "codex-safe"], opencode: ["opencode-run"] },
         roleRequirements: { nestedDefault: { requiresSubagents: true } },
         fallback: { preserveRoleInstructions: false },
       },
@@ -652,7 +652,7 @@ test("route previews automatic selection and explicit profile overrides without 
     const configuredOpenCode = await fleet.execute("route-open", { action: "route", role: "open" }, new AbortController().signal, () => {}, ctx);
     assert.equal(configuredOpenCode.details.routing.automatic, true);
     assert.equal(configuredOpenCode.details.routing.selected, "opencode");
-    assert.equal(configuredOpenCode.details.profile, "opencode-peer");
+    assert.equal(configuredOpenCode.details.profile, "opencode-run");
 
     const nested = await fleet.execute("route-nested", { action: "route", role: "advisor", requiresSubagents: true }, new AbortController().signal, () => {}, ctx);
     assert.match(nested.content[0].text, /Recommended harness: codex/);
