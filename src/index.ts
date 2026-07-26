@@ -74,16 +74,17 @@ const INTERCOM_LIFECYCLE_SEND_EVENT = "agent-intercom:lifecycle-send";
 const AgentFleetParams = Type.Object({
   action: StringEnum(ACTIONS),
   id: Type.Optional(Type.String({ description: "Stable worker id" })),
-  harness: Type.Optional(StringEnum(HARNESSES)),
+  harness: Type.Optional(StringEnum(["auto", "pi", "codex", "claude", "opencode"] as const, { description: "Use 'auto' unless the caller explicitly selected a harness" })),
   role: Type.Optional(Type.String({ description: "Worker role or configured role preset, for example advisor or challenger" })),
   task: Type.Optional(Type.String({ description: "Assignment or standing mandate for the worker" })),
   cwd: Type.Optional(Type.String({ description: "Worker working directory" })),
   profile: Type.Optional(Type.String({ description: "Configured launch profile" })),
   permissionProfile: Type.Optional(Type.String({ description: "Configured permission profile, for example review-readonly or builder-restricted" })),
   model: Type.Optional(Type.String({ description: "Harness model name or provider/model identifier" })),
-  effort: Type.Optional(StringEnum(EFFORTS)),
+  effort: Type.Optional(StringEnum(["auto", "off", "minimal", "low", "medium", "high", "xhigh", "max"] as const, { description: "Use 'auto' unless the caller explicitly selected an effort" })),
   instructions: Type.Optional(Type.String({ description: "Additional standing instructions for the coworker" })),
-  requiresSubagents: Type.Optional(Type.Boolean({ description: "Require a harness capable of delegating to nested subagents during automatic routing" })),
+  subagents: Type.Optional(StringEnum(["auto", "required", "not-required"] as const, { description: "Use 'auto' unless the caller explicitly requires or forbids nested-subagent capability" })),
+  requiresSubagents: Type.Optional(Type.Boolean({ description: "Legacy nested-subagent override; prefer subagents=auto|required|not-required" })),
   fresh: Type.Optional(Type.Boolean({ description: "Start a fresh persistent harness session instead of resuming state for this worker id" })),
   all: Type.Optional(Type.Boolean({ description: "Include workers owned by other manager sessions for list/status diagnostics" })),
   execute: Type.Optional(Type.Boolean({ description: "Actually execute cleanup or updates; false previews them" })),
@@ -94,15 +95,16 @@ const AgentFleetParams = Type.Object({
 type FleetParams = {
   action: typeof ACTIONS[number] | "_heartbeat";
   id?: string;
-  harness?: Harness;
+  harness?: Harness | "auto";
   role?: string;
   task?: string;
   cwd?: string;
   profile?: string;
   permissionProfile?: string;
   model?: string;
-  effort?: Effort;
+  effort?: Effort | "auto";
   instructions?: string;
+  subagents?: "auto" | "required" | "not-required";
   requiresSubagents?: boolean;
   fresh?: boolean;
   all?: boolean;
@@ -443,7 +445,7 @@ function fleetPromptGuidelines(config: OrchestratorConfig): string[] {
     "After agent_fleet spawns Pi, Codex, or Claude, send its assignment to the returned intercomTarget with intercom_send; reserve intercom_ask for a question that blocks the manager's next step. Use intercom_send for progress/status checkpoints. Do not call intercom_list merely to rediscover an owned worker. Pi, Codex, and Claude may need a brief registration delay before first delivery; OpenCode receives its initial task at launch.",
     "For sandboxed builder profiles such as codex-safe, create the feature worktree before spawning and pass that worktree as cwd. Do not ask the worker to create a sibling worktree outside its writable cwd.",
     "Use capabilities, profiles, permissions, models, variants, versions, or config before guessing models, permission policy, effort levels, package state, or defaults.",
-    `When spawn omits harness and profile, capability-aware routing chooses an installed eligible harness. Use action=route with the same role, model, effort, and requiresSubagents value to preview the selection. Explicit harness/profile choices always win; explicit model identifiers use the configured model-routing rules and unmatched-model harness.${explicitOnly}`,
+    `When the caller did not explicitly choose routing fields, pass harness=auto, effort=auto, and subagents=auto (or omit them when the client preserves optional fields); never invent pi/off/false placeholders. Capability-aware routing then chooses an installed eligible harness. Use action=route with the same explicit constraints to preview the selection. Explicit harness/profile choices always win; explicit model identifiers use the configured model-routing rules and unmatched-model harness.${explicitOnly}`,
     ...supervisionGuidance(config.supervision),
     "Preview update and cleanup before execute=true. Updates preserve detected install sources; never kill sessions the fleet does not own.",
     "Persistent workers expire after an activity-bounded idle budget. Worker messages to the manager or explicit renew extend it; manager heartbeat alone does not. Stop completed workers promptly, retain their record for resume, and use forget with acknowledge=true only after deliberate closure.",
@@ -708,17 +710,26 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   };
 
   const resolveRouting = async (params: FleetParams): Promise<ResolvedRoute> => {
+    const callerHarness = params.harness === "auto" ? undefined : params.harness;
+    const callerEffort = params.effort === "auto" ? undefined : params.effort;
+    const callerRequiresSubagents = params.subagents === "required"
+      ? true
+      : params.subagents === "not-required"
+        ? false
+        : params.subagents === "auto"
+          ? undefined
+          : params.requiresSubagents;
     const role = params.role?.trim() || "worker";
     const preset: RolePreset | undefined = config.roles[role];
-    const requestedProfileName = params.profile?.trim();
+    const requestedProfileName = params.profile?.trim() || undefined;
     const requestedProfile = requestedProfileName ? config.profiles[requestedProfileName] : undefined;
     if (requestedProfileName && !requestedProfile) throw new Error(`Unknown launch profile: ${requestedProfileName}`);
     const presetProfile = preset?.profile ? config.profiles[preset.profile] : undefined;
     const presetHarness = preset?.harness ?? presetProfile?.harness;
-    const modelHarness = !params.harness && !requestedProfile
+    const modelHarness = !callerHarness && !requestedProfile
       ? inferHarnessFromModel(params.model, config.routing.modelRouting)
       : undefined;
-    const explicitHarness = params.harness ?? requestedProfile?.harness ?? modelHarness;
+    const explicitHarness = callerHarness ?? requestedProfile?.harness ?? modelHarness;
     const profileOverrides: Partial<Record<Harness, string>> = {};
     if (requestedProfileName && explicitHarness) profileOverrides[explicitHarness] = requestedProfileName;
     const preferredProfiles: Partial<Record<Harness, string[]>> = {};
@@ -772,10 +783,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     if (!config.permissionProfiles[permissionProfileName]) throw new Error(`Unknown permission profile: ${permissionProfileName}`);
     const candidateEfforts = Object.fromEntries(HARNESSES.flatMap((harness) => {
       const presetEffort = !presetHarness || presetHarness === harness ? preset?.effort : undefined;
-      const effort = params.effort ?? presetEffort ?? config.defaultEfforts[harness];
+      const effort = callerEffort ?? presetEffort ?? config.defaultEfforts[harness];
       return effort ? [[harness, effort]] : [];
     })) as Partial<Record<Harness, Effort>>;
-    const requiresSubagents = roleRequiresSubagents(config.routing, role, params.requiresSubagents);
+    const requiresSubagents = roleRequiresSubagents(config.routing, role, callerRequiresSubagents);
     const decision = resolveHarnessRoute({
       role,
       defaultHarness: config.defaultHarness,
@@ -783,7 +794,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       availability,
       presetHarness,
       ...(explicitHarness ? { explicitHarness } : {}),
-      ...(params.harness
+      ...(callerHarness
         ? { explicitSource: "harness" as const }
         : requestedProfile
           ? { explicitSource: "profile" as const }
@@ -791,7 +802,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
             ? { explicitSource: "model" as const }
             : {}),
       requiresSubagents,
-      requestedEffort: params.effort,
+      requestedEffort: callerEffort,
       candidateEfforts,
     });
     const harness = decision.selected;
@@ -1320,7 +1331,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       }
 
       if (params.action === "profiles") {
-        const profiles = Object.entries(config.profiles).filter(([, profile]) => !params.harness || profile.harness === params.harness);
+        const harness = params.harness === "auto" ? undefined : params.harness;
+        const profiles = Object.entries(config.profiles).filter(([, profile]) => !harness || profile.harness === harness);
         const text = profiles.length === 0 ? "No matching profiles." : profiles.map(([name, profile]) => `${name} [${profile.harness}/${profile.mode ?? "persistent"}] ${profile.description ?? profile.command}`).join("\n");
         return textResult(text, { profiles: Object.fromEntries(profiles) });
       }
@@ -1334,7 +1346,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       }
 
       if (params.action === "models") {
-        const harness = params.harness || config.defaultHarness;
+        const harness = params.harness && params.harness !== "auto" ? params.harness : config.defaultHarness;
         if (harness === "opencode") {
           const info = await enumerateOpenCodeModelInfo();
           const text = info.length

@@ -633,7 +633,10 @@ test("route previews automatic selection and explicit profile overrides without 
     await lifecycle.get("session_start")?.({}, ctx);
     const fleet = tools.get("agent_fleet");
 
-    const builder = await fleet.execute("route-builder", { action: "route", role: "builder" }, new AbortController().signal, () => {}, ctx);
+    const builder = await fleet.execute("route-builder", {
+      action: "route", role: "builder", harness: "auto", profile: "", model: "", effort: "auto",
+      subagents: "auto", requiresSubagents: false, permissionProfile: "", instructions: "",
+    }, new AbortController().signal, () => {}, ctx);
     assert.match(builder.content[0].text, /Recommended harness: codex/);
     assert.equal(builder.details.routing.selected, "codex");
     assert.equal(builder.details.profile, "codex-safe");
@@ -645,9 +648,18 @@ test("route previews automatic selection and explicit profile overrides without 
     assert.deepEqual(profileFallback.details.availability.codex.profileCandidates.slice(0, 2), ["codex-missing", "codex-safe"]);
     assert.match(profileFallback.content[0].text, /profile fallback:.*codex-missing/);
 
-    const nestedDefault = await fleet.execute("route-nested-default", { action: "route", role: "nestedDefault" }, new AbortController().signal, () => {}, ctx);
+    const nestedDefault = await fleet.execute("route-nested-default", {
+      action: "route", role: "nestedDefault", harness: "auto", effort: "auto",
+      subagents: "auto", requiresSubagents: false,
+    }, new AbortController().signal, () => {}, ctx);
     assert.equal(nestedDefault.details.routing.requiresSubagents, true);
     assert.equal(nestedDefault.details.routing.selected, "codex");
+
+    const nestedDisabled = await fleet.execute("route-nested-disabled", {
+      action: "route", role: "nestedDefault", harness: "auto", effort: "auto", subagents: "not-required",
+    }, new AbortController().signal, () => {}, ctx);
+    assert.equal(nestedDisabled.details.routing.requiresSubagents, false);
+    assert.equal(nestedDisabled.details.routing.selected, "pi");
 
     const configuredOpenCode = await fleet.execute("route-open", { action: "route", role: "open" }, new AbortController().signal, () => {}, ctx);
     assert.equal(configuredOpenCode.details.routing.automatic, true);
