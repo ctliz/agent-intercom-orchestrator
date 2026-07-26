@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { DEFAULT_CONFIG } from "../src/config.ts";
+import { resolvePiRuntime } from "../src/pi-runtime.ts";
 import { supportsHardenedUserUnits } from "./systemd-support.ts";
 import {
   applyPiPermissionArgs,
@@ -783,6 +784,47 @@ test("Tea guard is executable and explicitly included in package files", () => {
   assert.notEqual(statSync(guard).mode & 0o111, 0);
   const packageJson = JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"));
   assert.ok(packageJson.files.includes("src/guard-bin/tea"));
+});
+
+test("hardened systemd profile can read and execute the verified manager Pi runtime", async (t) => {
+  if (!supportsHardenedUserUnits()) {
+    t.skip("systemd 257+ hardened user namespaces are unavailable");
+    return;
+  }
+  const root = mkdtempSync(join(homedir(), ".agent-intercom-pi-runtime-test-"));
+  const packageRoot = join(root, "node_modules", "@earendil-works", "pi-coding-agent");
+  const entry = join(packageRoot, "dist", "cli.js");
+  try {
+    mkdirSync(join(packageRoot, "dist"), { recursive: true });
+    writeFileSync(join(packageRoot, "package.json"), JSON.stringify({
+      name: "@earendil-works/pi-coding-agent",
+      version: "1.2.3",
+      bin: { pi: "dist/cli.js" },
+    }));
+    writeFileSync(entry, "process.stdout.write('manager-pi-runtime-ok\\n')\n");
+    const profile = structuredClone(DEFAULT_CONFIG.profiles["pi-peer"]);
+    const runtime = await resolvePiRuntime({
+      profileName: "pi-peer",
+      profile,
+      builtInProfile: profile,
+      managerEntry: entry,
+      managerExecutable: process.execPath,
+    });
+    assert.equal(runtime?.source, "manager-runtime");
+
+    const reviewer = DEFAULT_CONFIG.permissionProfiles["review-readonly"];
+    assert.ok(reviewer);
+    const properties = buildPermissionUnitProperties(reviewer, process.cwd());
+    const result = spawnSync("systemd-run", [
+      "--user", "--wait", "--pipe",
+      ...properties.map((property) => `--property=${property}`),
+      runtime!.command, ...runtime!.args,
+    ], { encoding: "utf8", timeout: 15_000 });
+    assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+    assert.match(result.stdout, /manager-pi-runtime-ok/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("hardened systemd profile masks project-local package-manager credentials", (t) => {

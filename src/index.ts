@@ -7,9 +7,10 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { readConfig, resolveProfileCommand, writeConfigDefaults } from "./config.ts";
+import { DEFAULT_CONFIG, readConfig, resolveProfileCommand, writeConfigDefaults } from "./config.ts";
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
 import { buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy } from "./permissions.ts";
+import { resolvePiRuntime } from "./pi-runtime.ts";
 import { prepareWorkerRuntime, workerRuntimeRoot, workerSocketRuntimeRoot } from "./runtime.ts";
 import { WorkerStore } from "./store.ts";
 import { getUnitStatus, launchUnit, listWorkerUnits, makeUnitName, parseDurationToSeconds, readUnitLogs, readUnitProcessTree, stopUnit, systemdAvailable } from "./systemd.ts";
@@ -766,7 +767,16 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         }
         permissionEnvironment.PATH = `${GIT_GUARD_BIN}:${profile.env?.PATH || process.env.PATH || ""}`;
       }
-      const executable = resolveProfileCommand(profile.command);
+      const configuredExecutable = resolveProfileCommand(profile.command);
+      const piRuntime = harness === "pi"
+        ? await resolvePiRuntime({
+          profileName,
+          profile,
+          configuredExecutable,
+          builtInProfile: DEFAULT_CONFIG.profiles["pi-peer"],
+        })
+        : undefined;
+      const executable = piRuntime?.command ?? configuredExecutable;
       if (!executable) throw new Error(`Launch command not found or not executable: ${profile.command}`);
       const wrappedLauncher = harness === "pi"
         ? PI_PEER_LAUNCHER
@@ -774,7 +784,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           ? OPENCODE_PEER_LAUNCHER
           : undefined;
       let launchCommand = wrappedLauncher ? process.execPath : executable;
-      let args = wrappedLauncher ? [wrappedLauncher, "--", executable, ...harnessArgs] : harnessArgs;
+      let args = wrappedLauncher
+        ? [wrappedLauncher, "--", executable, ...(piRuntime?.args ?? []), ...harnessArgs]
+        : harnessArgs;
       const unitEnvironment: Record<string, string> = {
         ...permissionEnvironment,
         ...(runtime?.environment ?? {}),
