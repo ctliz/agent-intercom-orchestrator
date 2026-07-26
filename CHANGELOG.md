@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Add capability-aware automatic harness routing for omitted-harness spawns, with pure explainable ranking, ordered spawnable-profile fallback including verified Pi runtime support, persistence mode and effort reporting, per-role capability defaults, and a non-spawning `route` preview action.
+- Add capability-aware automatic harness routing for omitted-harness spawns, with pure explainable ranking, ordered spawnable-profile fallback including verified Pi runtime support, persistence mode and effort reporting, per-role capability defaults, and a non-spawning `route` preview action. Add strict-schema-safe `auto` sentinels for harness, effort, and nested-subagent constraints so generated placeholder values cannot silently become explicit overrides.
 - Add typed merge-safe policy for ordered explicit-model routing, safe exact/trailing-`*` patterns, optional unmatched-model harness fallback, direct-CLI prefix stripping, config-authoritative `explicitOnly`, portable role-instruction fallback, and independently configurable Ralph/`return_on` guidance. Preserve explicit caller harness/profile/permission/instruction precedence, migrate legacy default harness/profile preferences, and keep security and lifecycle contracts unchanged.
 - Update the locked Pi development dependency family from 0.80.6 to 0.82.1 as a complete dependency-tree upgrade.
 - Launch workers using the manager's verified concrete Pi runtime when the built-in `pi-peer` profile is unchanged, avoiding unpinned `npx` cold bootstraps and version drift while preserving custom profile commands.

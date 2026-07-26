@@ -464,12 +464,14 @@ This prevents:
 
 Install the orchestrator package in the manager Pi, then use `agent_fleet`. It creates a durable ownership record and launches the complete harness process tree inside a transient systemd user service. Do not use tmux when `agent_fleet` can own the lifecycle.
 
-If the user asks for “orc work”, “orchestrate this”, or to “use coworkers”, treat that as an Agent Intercom Orchestrator request. You can omit both `harness` and `profile` to use capability-aware routing, or preview it without spawning:
+If the user asks for “orc work”, “orchestrate this”, or to “use coworkers”, treat that as an Agent Intercom Orchestrator request. Use capability-aware routing by omitting routing constraints when the client preserves optional fields. Strict-schema tool clients should explicitly send the `auto` sentinels so generated first-enum/boolean placeholders cannot become accidental overrides:
 
 ```typescript
-agent_fleet({ action: "route", role: "advisor" })
-agent_fleet({ action: "route", role: "builder", requiresSubagents: true })
+agent_fleet({ action: "route", role: "advisor", harness: "auto", effort: "auto", subagents: "auto" })
+agent_fleet({ action: "route", role: "builder", harness: "auto", effort: "auto", subagents: "required" })
 ```
+
+The legacy boolean `requiresSubagents` remains accepted for existing callers; `subagents` is preferred because it distinguishes an explicit `not-required` override from a strict client's generated `false` placeholder.
 
 The resolver checks ordered profiles, executable or verified Pi runtime availability, persistence mode, requested effort, and nested-agent capability. It favors Pi for advisory/research/review/challenge work and direct Codex then direct Claude for implementation or nested-agent work. Explicit harness/profile choices always win, and an explicit caller profile stays pinned. `routing.profilePreferences` provides ordered automatic fallback within a harness; legacy `defaultProfiles` remain compatibility fallbacks. `routing.roleRequirements` supplies capability defaults only when the caller omits them.
 

@@ -28,7 +28,7 @@ Verify with `pi list`, then call `agent_fleet({ action: "doctor" })`. The packag
 - Create feature worktrees before spawning sandboxed builders such as `codex-safe`, and pass the worktree as `cwd`. A workspace-write worker generally cannot create a sibling under `~/worktrees` when its writable root is the shared checkout.
 - Every owned worker is told its manager target. Coworkers use `intercom_team({})` to get the current manager and live same-manager coworkers; this follows adoption dynamically and does not grant fleet mutation authority.
 - Use `capabilities`, `profiles`, `permissions`, `models`, `variants`, `versions`, or `config` instead of guessing options, permission policy, or installed package state. OpenCode variants are model-specific.
-- When `spawn` omits both `harness` and `profile`, automatic routing checks configured ordered profiles, executable/runtime availability, effort, and capability requirements. Caller harness/profile choices always win. Explicit models use the configured ordered model rules and unmatched-model harness. Treat `explicitOnly`, profile order, role requirements, instruction fallback, and supervision recommendations as configuration—inspect them instead of assuming the defaults.
+- When the caller did not explicitly choose routing constraints, send `harness: "auto"`, `effort: "auto"`, and `subagents: "auto"` (or omit them when the client preserves optional fields). Automatic routing checks configured ordered profiles, executable/runtime availability, effort, and capability requirements. Never invent `pi`, `off`, or `false` placeholders; explicit caller harness/profile choices always win. Explicit models use the configured ordered model rules and unmatched-model harness. Treat `explicitOnly`, profile order, role requirements, instruction fallback, and supervision recommendations as configuration—inspect them instead of assuming the defaults.
 - Preview an automatic choice with `agent_fleet({ action: "route", ... })`; the explanation lists ranking, availability, capability exclusions, and the selected profile without spawning.
 - Built-in advisor, researcher, and challenger roles use `review-readonly`; builders and custom roles use `builder-restricted`. Select `trusted` only when broad host and Git authority is intentional.
 - Preview update and cleanup before executing them. Never replace a detected Git install with npm, and never kill or forget sessions the orchestrator does not own.
@@ -124,7 +124,7 @@ agent_fleet({
 })
 ```
 
-Because this builder spawn omits both harness fields, the resolver prefers an available direct Codex profile, then direct Claude. Use `action: "route"` first when the choice needs review.
+Because this builder spawn uses automatic routing rather than an explicit harness, the resolver prefers an available direct Codex profile, then direct Claude. Use `action: "route"` first when the choice needs review.
 
 Persistent OpenCode spawn waits for broker/plugin/session readiness and records the OpenCode session ID. Reusing a persistent OpenCode or Codex worker ID resumes its harness session/thread; pass `fresh: true` only when you intentionally want clean context.
 
