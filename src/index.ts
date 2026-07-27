@@ -11,7 +11,7 @@ import { DEFAULT_CONFIG, readConfig, resolveProfileCommand, writeConfigDefaults 
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
 import { buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy } from "./permissions.ts";
 import { resolvePiRuntime } from "./pi-runtime.ts";
-import { hasWorkerRuntimeCaches, prepareWorkerRuntime, pruneWorkerRuntimeCaches, workerRuntimeRoot, workerSocketRuntimeRoot } from "./runtime.ts";
+import { hasWorkerRuntimeCaches, listOrphanWorkerRuntimeIds, prepareWorkerRuntime, pruneWorkerRuntimeCaches, removeOrphanWorkerRuntime, workerRuntimeRoot, workerSocketRuntimeRoot } from "./runtime.ts";
 import { detectHarnessAvailability, formatRoutingDecision, inferHarnessFromModel, normalizeModelForHarness, roleInstructionsForHarness, roleRequiresSubagents, resolveHarnessRoute, type HarnessAvailability, type RoutingDecision } from "./routing.ts";
 import { WorkerStore } from "./store.ts";
 import { getUnitStatus, launchUnit, listWorkerUnits, makeUnitName, parseDurationToSeconds, readUnitLogs, readUnitProcessTree, stopUnit, systemdAvailable } from "./systemd.ts";
@@ -116,6 +116,10 @@ type FleetParams = {
   acknowledge?: boolean;
   lines?: number;
 };
+
+type CleanupCandidate =
+  | { kind: "stop" | "prune" | "cache"; worker: WorkerRecord; reason: string }
+  | { kind: "orphan"; workerId: string; reason: string };
 
 type ResolvedSpawn = {
   harness: Harness;
@@ -688,9 +692,13 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         .filter(({ hasCaches }) => hasCaches)
         .map(({ worker }) => ({ worker, reason: "disposable runtime caches retained", kind: "cache" as const }))
       : [];
-    const candidates = [...liveCandidates, ...pruneCandidates, ...cacheCandidates];
+    const orphanCandidates: Array<Extract<CleanupCandidate, { kind: "orphan" }>> = (await listOrphanWorkerRuntimeIds(
+      agentDir,
+      new Set(migrated.workers.map((worker) => worker.id)),
+    )).map((workerId) => ({ workerId, reason: "private runtime has no worker record", kind: "orphan" }));
+    const candidates: CleanupCandidate[] = [...liveCandidates, ...pruneCandidates, ...cacheCandidates, ...orphanCandidates];
     if (!execute) return candidates;
-    const handled: typeof candidates = [];
+    const handled: CleanupCandidate[] = [];
     for (const candidate of liveCandidates) {
       try {
         await stopWorker(candidate.worker, {
@@ -707,6 +715,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     }
     for (const candidate of cacheCandidates) {
       await pruneWorkerRuntimeCaches(candidate.worker.id, agentDir);
+      handled.push(candidate);
+    }
+    for (const candidate of orphanCandidates) {
+      await removeOrphanWorkerRuntime(candidate.workerId, agentDir);
       handled.push(candidate);
     }
     return handled;
@@ -1205,10 +1217,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
 
       if (params.action === "cleanup") {
         const candidates = await cleanupExpired(Boolean(params.execute));
-        if (candidates.length === 0) return textResult("No live workers need stopping, no terminal worker retention has expired, and no disposable runtime caches remain.", { candidates: [] });
-        const lines = candidates.map(({ worker, reason, kind }) => `${worker.id} [${kind}]: ${reason}`);
+        if (candidates.length === 0) return textResult("No live workers need stopping, no terminal worker retention has expired, no disposable runtime caches remain, and no orphan runtimes exist.", { candidates: [] });
+        const lines = candidates.map((candidate) => `${candidate.kind === "orphan" ? candidate.workerId : candidate.worker.id} [${candidate.kind}]: ${candidate.reason}`);
         return textResult(
-          `${params.execute ? "Cleaned" : "Cleanup preview"}:\n${lines.join("\n")}${params.execute ? "" : "\nRun cleanup with execute=true to stop expired live workers, prune retention-expired terminal workers, and remove disposable caches from retained runtimes."}`,
+          `${params.execute ? "Cleaned" : "Cleanup preview"}:\n${lines.join("\n")}${params.execute ? "" : "\nRun cleanup with execute=true to stop expired live workers, prune retention-expired terminal workers, remove disposable caches, and delete orphan runtimes."}`,
           { candidates },
         );
       }
@@ -1682,10 +1694,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       const execute = args.trim() === "execute" || args.trim() === "--execute";
       const candidates = await cleanupExpired(false);
       if (candidates.length === 0) {
-        ctx.ui.notify("No live workers need stopping, no terminal worker retention has expired, and no disposable runtime caches remain.", "info");
+        ctx.ui.notify("No live workers need stopping, no terminal worker retention has expired, no disposable runtime caches remain, and no orphan runtimes exist.", "info");
         return;
       }
-      const summary = candidates.map(({ worker, reason, kind }) => `${worker.id} [${kind}]: ${reason}`).join("\n");
+      const summary = candidates.map((candidate) => `${candidate.kind === "orphan" ? candidate.workerId : candidate.worker.id} [${candidate.kind}]: ${candidate.reason}`).join("\n");
       if (!execute) {
         if (ctx.hasUI) await ctx.ui.editor("Cleanup preview", `${summary}\n\nRun /agents-cleanup execute to apply cleanup.`);
         return;
