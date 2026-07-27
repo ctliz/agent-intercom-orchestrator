@@ -195,12 +195,25 @@ test("sandbox supervisor proxies a private short broker socket and hides shared 
       const fs = require("node:fs");
       const net = require("node:net");
       const path = require("node:path");
+      const { spawnSync } = require("node:child_process");
       if (fs.existsSync(${JSON.stringify(sharedSecret)})) process.exit(4);
       if (fs.existsSync(${JSON.stringify(legacySecret)})) process.exit(5);
-      const supervisorRoot = path.join("/proc", process.env.AGENT_INTERCOM_SANDBOX_SUPERVISOR_PID, "root", ${JSON.stringify(sharedSecret)});
+      const supervisorPid = process.env.AGENT_INTERCOM_SANDBOX_SUPERVISOR_PID;
+      const supervisorRoot = path.join("/proc", supervisorPid, "root", ${JSON.stringify(sharedSecret)});
       if (fs.existsSync(supervisorRoot)) process.exit(6);
+      if (fs.existsSync(path.join("/proc", supervisorPid))) process.exit(7);
       for (const pid of fs.readdirSync("/proc").filter((entry) => /^\\d+$/.test(entry))) {
-        if (fs.existsSync(path.join("/proc", pid, "root", ${JSON.stringify(sharedSecret)}))) process.exit(7);
+        if (fs.existsSync(path.join("/proc", pid, "root", ${JSON.stringify(sharedSecret)}))) process.exit(8);
+      }
+      const nested = spawnSync("/usr/bin/bwrap", [
+        "--unshare-user", "--unshare-pid", "--tmpfs", "/", "--dev", "/dev",
+        "--ro-bind", "/bin", "/bin", "--ro-bind", "/usr", "/usr",
+        "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
+        "--proc", "/proc", "/bin/true",
+      ], { encoding: "utf8" });
+      if (nested.status !== 0) {
+        console.error(nested.stderr);
+        process.exit(9);
       }
       const socket = net.createConnection(path.join(process.env.PI_CODING_AGENT_DIR, "intercom", "broker.sock"));
       socket.on("connect", () => socket.write("proxy-proof"));

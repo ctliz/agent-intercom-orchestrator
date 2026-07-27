@@ -58,7 +58,10 @@ server.listen(targetSocket, () => {
     ? [
         "--bind", "/", "/",
         "--dev-bind", "/dev", "/dev",
-        "--tmpfs", `/proc/${process.pid}`, "--die-with-parent",
+        // Keep the supervisor outside the harness PID namespace instead of
+        // masking /proc/<pid>. A locked procfs submount makes a nested bwrap
+        // --proc mount fail with EPERM and Linux logs "Mount too revealing".
+        "--unshare-pid", "--proc", "/proc", "--die-with-parent",
         ...maskPaths.flatMap((path) => ["--tmpfs", path]),
         "--", command, ...args,
       ]
