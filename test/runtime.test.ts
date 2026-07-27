@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
-import { prepareWorkerRuntime } from "../src/runtime.ts";
+import { prepareWorkerRuntime, pruneWorkerRuntimeCaches } from "../src/runtime.ts";
 import { supportsUserMountNamespaces } from "./systemd-support.ts";
 
 test("clean environment launcher drops unrelated manager secrets", () => {
@@ -97,6 +97,26 @@ test("worker runtime creates absent Claude and OpenCode homes before launch", as
     assert.equal(opencode.environment.XDG_DATA_HOME, join(opencode.workerRoot, "home", ".local", "share"));
     await writeFile(join(opencode.root, "home", ".local", "share", "opencode", "runtime-proof"), "ok\n");
     await assert.rejects(access(join(opencode.root, "home", ".config", "opencode", "plugins")));
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("retained worker cache pruning removes disposable caches without deleting harness state", async () => {
+  const home = await mkdtemp(join(tmpdir(), "agent-intercom-runtime-prune-"));
+  const agentDir = join(home, ".pi", "agent");
+  try {
+    const runtime = await prepareWorkerRuntime("opencode", "cache-worker", agentDir, { homeDir: home, runtimeDir: join(home, "run") });
+    const persistentHome = join(runtime.root, "home");
+    await mkdir(join(persistentHome, ".cache", "npm", "_npx"), { recursive: true });
+    await mkdir(join(persistentHome, ".cache", "pip"), { recursive: true });
+    await writeFile(join(persistentHome, ".cache", "npm", "_npx", "large-binary"), "cache\n");
+    await writeFile(join(persistentHome, ".cache", "pip", "wheel"), "cache\n");
+    await writeFile(join(persistentHome, ".local", "share", "opencode", "session-state"), "keep\n");
+    await pruneWorkerRuntimeCaches("cache-worker", agentDir);
+    await assert.rejects(access(join(persistentHome, ".cache", "npm")));
+    await assert.rejects(access(join(persistentHome, ".cache", "pip")));
+    assert.equal(await readFile(join(persistentHome, ".local", "share", "opencode", "session-state"), "utf8"), "keep\n");
   } finally {
     await rm(home, { recursive: true, force: true });
   }

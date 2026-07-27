@@ -445,11 +445,11 @@ agent_fleet({ action: "adopt", id: "architecture-advisor" })
 
 Stop and renew refuse live workers owned by another manager session until this handoff occurs. `adopt` is an explicit transfer and does not try to prove that the previous manager is offline, so coordinate it rather than using it to steal a coworker from another live manager.
 
-The Pi footer, `/agents`, and `agent_fleet({ action: "list" })` are scoped by `managerSessionId`, following the same parent-session idea used by `pi-subagents`: each manager sees only coworkers it spawned or adopted. Use `/agents all` or `agent_fleet({ action: "list", all: true })` when you intentionally need the global owned-worker inventory.
+The Pi footer, `/agents`, and `agent_fleet({ action: "list" })` are scoped by `managerSessionId`, following the same parent-session idea used by `pi-subagents`: each manager sees only coworkers it spawned or adopted. The default list includes live workers plus recently terminal workers and reports how many older records are hidden. Use `agent_fleet({ action: "history" })` for the full retained history of the current manager, or `/agents all` and `agent_fleet({ action: "list", all: true })` when you intentionally need the global owned-worker inventory.
 
 Leases are activity-bounded rather than manager-heartbeat-bounded. A manager-received worker Intercom message or explicit `renew` extends the lease, capped at the configured idle deadline; process existence, broker acknowledgements, and messages sent by the manager do not count. The manager requests a commit/checkpoint/handoff before the deadline, cleanup preserves a grace period for recovery or adoption, and a persistent systemd user timer stops only the exact expired owned cgroup even when no manager session is running. Startup cleanup and `/agents-cleanup` use the same race-safe deadline check. Completed one-shot units are retired automatically after reconciliation so their retained exit status does not accumulate in systemd.
 
-Stopping preserves the worker record and supported harness session state for resume. `stop` is always available and records best-effort dirty-worktree evidence for writable workers; it never refuses the safety operation because of Git state. `forget` is a distinct terminal action and requires a stopped worker plus explicit manager `acknowledge: true`.
+Stopping preserves the worker record and supported harness session state for resume. It also removes disposable per-worker npm, pip, uv, and pnpm caches by default, avoiding retention of downloaded tool binaries while leaving transcripts and harness state intact. `stop` is always available and records best-effort dirty-worktree evidence for writable workers; it never refuses the safety operation because of Git state. The cleanup timer prunes clean terminal records after the configured retention period (7 days by default) and dirty records after a longer period (30 days by default). `forget` is a distinct single-worker terminal action. `prune` bulk-removes terminal history in the current manager scope. Both explicit deletion actions require manager `acknowledge: true`.
 
 This prevents:
 
@@ -796,6 +796,9 @@ For an orchestrator-owned worker, inspect and stop the exact cgroup:
 ```typescript
 agent_fleet({ action: "status", id: "opencode-visual-review" }) // includes the live cgroup process tree
 agent_fleet({ action: "stop", id: "opencode-visual-review" })
+agent_fleet({ action: "history" })
+agent_fleet({ action: "cleanup", execute: false }) // includes retention-expired terminal records
+agent_fleet({ action: "prune", acknowledge: true }) // bulk-delete current manager's terminal history
 agent_fleet({ action: "forget", id: "opencode-visual-review", acknowledge: true })
 ```
 

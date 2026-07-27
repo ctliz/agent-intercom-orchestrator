@@ -11,7 +11,7 @@ import { DEFAULT_CONFIG, readConfig, resolveProfileCommand, writeConfigDefaults 
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
 import { buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy } from "./permissions.ts";
 import { resolvePiRuntime } from "./pi-runtime.ts";
-import { prepareWorkerRuntime, workerRuntimeRoot, workerSocketRuntimeRoot } from "./runtime.ts";
+import { hasWorkerRuntimeCaches, prepareWorkerRuntime, pruneWorkerRuntimeCaches, workerRuntimeRoot, workerSocketRuntimeRoot } from "./runtime.ts";
 import { detectHarnessAvailability, formatRoutingDecision, inferHarnessFromModel, normalizeModelForHarness, roleInstructionsForHarness, roleRequiresSubagents, resolveHarnessRoute, type HarnessAvailability, type RoutingDecision } from "./routing.ts";
 import { WorkerStore } from "./store.ts";
 import { getUnitStatus, launchUnit, listWorkerUnits, makeUnitName, parseDurationToSeconds, readUnitLogs, readUnitProcessTree, stopUnit, systemdAvailable } from "./systemd.ts";
@@ -27,9 +27,11 @@ import {
   HARNESS_EFFORTS,
   initializeWorkerLifecycle,
   isLiveState,
+  isRecentTerminalWorker,
   newRunId,
   recordWorkerActivity,
   stateFromUnit,
+  stoppedWorkerRetentionReason,
   supervisionGuidance,
   validateEffort,
   validateWorkerId,
@@ -40,9 +42,11 @@ const ACTIONS = [
   "spawn",
   "route",
   "list",
+  "history",
   "status",
   "stop",
   "cleanup",
+  "prune",
   "doctor",
   "versions",
   "update",
@@ -88,7 +92,7 @@ const AgentFleetParams = Type.Object({
   fresh: Type.Optional(Type.Boolean({ description: "Start a fresh persistent harness session instead of resuming state for this worker id" })),
   all: Type.Optional(Type.Boolean({ description: "Include workers owned by other manager sessions for list/status diagnostics" })),
   execute: Type.Optional(Type.Boolean({ description: "Actually execute cleanup or updates; false previews them" })),
-  acknowledge: Type.Optional(Type.Boolean({ description: "Manager acknowledgment required before deleting a stopped worker record" })),
+  acknowledge: Type.Optional(Type.Boolean({ description: "Manager acknowledgment required before deleting stopped worker records" })),
   lines: Type.Optional(Type.Number({ description: "Journal lines for logs (1-500)" })),
 });
 
@@ -264,8 +268,11 @@ function formatWorker(worker: WorkerRecord): string {
   return `${worker.id} [${worker.harness}/${worker.role}] ${worker.state}${model}${effort}${permission}${externalSession}${target}${unit} lease=${formatTime(worker.leaseExpiresAt)}${idle}${checkpoint}${stopped}${error}`;
 }
 
-function formatWorkers(workers: WorkerRecord[]): string {
-  return workers.length === 0 ? "No managed workers." : workers.map(formatWorker).join("\n");
+function formatWorkers(workers: WorkerRecord[], hiddenHistory = 0): string {
+  const historyHint = hiddenHistory > 0
+    ? `\n${hiddenHistory} older terminal worker${hiddenHistory === 1 ? " is" : "s are"} hidden; use action=history to inspect retained history.`
+    : "";
+  return `${workers.length === 0 ? "No managed workers." : workers.map(formatWorker).join("\n")}${historyHint}`;
 }
 
 export function workersAttachedToManager(workers: WorkerRecord[], sessionId: string): WorkerRecord[] {
@@ -432,7 +439,8 @@ function formatConfig(config: OrchestratorConfig, configPath: string): string {
   lines.push(`routing preserve role instructions on fallback: ${config.routing.fallback.preserveRoleInstructions}`);
   lines.push(`supervision: ralph=${config.supervision.recommendRalphForSubstantialWork} return_on=${config.supervision.recommendReturnOnAfterSpawn}`);
   lines.push(`lease=${config.leaseMinutes}m idle=${config.idleTimeoutMinutes}m checkpoint-warning=${config.checkpointWarningMinutes}m retry=${config.checkpointRetryMinutes}m grace=${config.cleanupGraceMinutes}m heartbeat=${config.heartbeatSeconds}s max-runtime=${config.maxRuntime}`);
-  lines.push(`cleanup: startup=${config.cleanupExpiredOnStart} shutdown=${config.cleanupOnShutdown} timer=${config.cleanupTimerEnabled ? `${config.cleanupTimerMinutes}m` : "disabled"}`);
+  lines.push(`cleanup: startup=${config.cleanupExpiredOnStart} shutdown=${config.cleanupOnShutdown} timer=${config.cleanupTimerEnabled ? `${config.cleanupTimerMinutes}m` : "disabled"} prune-stopped=${config.pruneStoppedWorkersOnCleanup}`);
+  lines.push(`history: recent=${config.recentStoppedWorkerHours}h retention=${config.stoppedWorkerRetentionDays}d dirty-retention=${config.dirtyStoppedWorkerRetentionDays}d prune-caches-on-stop=${config.pruneRuntimeCachesOnStop}`);
   return lines.join("\n");
 }
 
@@ -448,7 +456,7 @@ function fleetPromptGuidelines(config: OrchestratorConfig): string[] {
     `When the caller did not explicitly choose routing fields, pass harness=auto, effort=auto, and subagents=auto (or omit them when the client preserves optional fields); never invent pi/off/false placeholders. Capability-aware routing then chooses an installed eligible harness. Use action=route with the same explicit constraints to preview the selection. Explicit harness/profile choices always win; explicit model identifiers use the configured model-routing rules and unmatched-model harness.${explicitOnly}`,
     ...supervisionGuidance(config.supervision),
     "Preview update and cleanup before execute=true. Updates preserve detected install sources; never kill sessions the fleet does not own.",
-    "Persistent workers expire after an activity-bounded idle budget. Worker messages to the manager or explicit renew extend it; manager heartbeat alone does not. Stop completed workers promptly, retain their record for resume, and use forget with acknowledge=true only after deliberate closure.",
+    "Persistent workers expire after an activity-bounded idle budget. Worker messages to the manager or explicit renew extend it; manager heartbeat alone does not. Default list output hides older terminal history; use history when needed. Stop completed workers promptly, rely on configured retention cleanup, and use forget or bulk prune with acknowledge=true only after deliberate closure.",
   ];
 }
 
@@ -626,7 +634,36 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     });
     await updateStatus();
     if (stopError) throw stopError;
+    if (config.pruneRuntimeCachesOnStop) {
+      await pruneWorkerRuntimeCaches(finalWorker.id, agentDir).catch(() => {});
+    }
     return finalWorker;
+  };
+
+  const pruneTerminalWorker = async (target: WorkerRecord, expectedReason?: string, now = Date.now()): Promise<boolean> => {
+    const worker = await store.mutate((state) => {
+      const current = state.workers.find((candidate) => candidate.id === target.id && candidate.runId === target.runId);
+      if (!current || isLiveState(current.state)) return undefined;
+      if (expectedReason && stoppedWorkerRetentionReason(current, config, now) !== expectedReason) return undefined;
+      current.state = "stopping";
+      current.updatedAt = Date.now();
+      return structuredClone(current);
+    });
+    if (!worker) return false;
+    try {
+      if (worker.unit) await stopUnit(runner, worker.unit);
+      await removeWorkerRuntimeAndRecord(store, worker, agentDir);
+      return true;
+    } catch (error) {
+      await store.mutate((state) => {
+        const current = state.workers.find((candidate) => candidate.id === worker.id && candidate.runId === worker.runId);
+        if (!current) return;
+        current.state = "failed";
+        current.updatedAt = Date.now();
+        current.lastError = error instanceof Error ? error.message : String(error);
+      });
+      throw error;
+    }
   };
 
   const cleanupExpired = async (execute: boolean, now = Date.now()) => {
@@ -635,23 +672,44 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       for (const worker of state.workers) initializeWorkerLifecycle(worker, config, now);
     });
     const migrated = await store.read();
-    const candidates = migrated.workers
-      .map((worker) => ({ worker, reason: cleanupReason(worker, now) }))
-      .filter((item): item is { worker: WorkerRecord; reason: string } => Boolean(item.reason));
+    const liveCandidates = migrated.workers
+      .map((worker) => ({ worker, reason: cleanupReason(worker, now), kind: "stop" as const }))
+      .filter((item): item is { worker: WorkerRecord; reason: string; kind: "stop" } => Boolean(item.reason));
+    const pruneCandidates = config.pruneStoppedWorkersOnCleanup
+      ? migrated.workers
+        .map((worker) => ({ worker, reason: stoppedWorkerRetentionReason(worker, config, now), kind: "prune" as const }))
+        .filter((item): item is { worker: WorkerRecord; reason: string; kind: "prune" } => Boolean(item.reason))
+      : [];
+    const prunedRuns = new Set(pruneCandidates.map(({ worker }) => `${worker.id}\u0000${worker.runId}`));
+    const cacheCandidates = config.pruneRuntimeCachesOnStop
+      ? (await Promise.all(migrated.workers
+        .filter((worker) => !isLiveState(worker.state) && !prunedRuns.has(`${worker.id}\u0000${worker.runId}`))
+        .map(async (worker) => ({ worker, hasCaches: await hasWorkerRuntimeCaches(worker.id, agentDir) }))))
+        .filter(({ hasCaches }) => hasCaches)
+        .map(({ worker }) => ({ worker, reason: "disposable runtime caches retained", kind: "cache" as const }))
+      : [];
+    const candidates = [...liveCandidates, ...pruneCandidates, ...cacheCandidates];
     if (!execute) return candidates;
-    const stopped: typeof candidates = [];
-    for (const candidate of candidates) {
+    const handled: typeof candidates = [];
+    for (const candidate of liveCandidates) {
       try {
         await stopWorker(candidate.worker, {
           reason: "idle-grace-expired",
           expectedCheckpointDeadlineAt: candidate.worker.checkpointDeadlineAt,
         });
-        stopped.push(candidate);
+        handled.push(candidate);
       } catch (error) {
         if (!/lifecycle changed|renewed before expired cleanup/.test(error instanceof Error ? error.message : String(error))) throw error;
       }
     }
-    return stopped;
+    for (const candidate of pruneCandidates) {
+      if (await pruneTerminalWorker(candidate.worker, candidate.reason, now)) handled.push(candidate);
+    }
+    for (const candidate of cacheCandidates) {
+      await pruneWorkerRuntimeCaches(candidate.worker.id, agentDir);
+      handled.push(candidate);
+    }
+    return handled;
   };
 
   const runLifecycleHeartbeat = async (ctx: ExtensionContext) => {
@@ -1106,12 +1164,21 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         });
       }
 
-      if (params.action === "list") {
+      if (params.action === "list" || params.action === "history") {
         const reconciled = await reconcile();
-        const workers = params.all
+        const scoped = params.all
           ? reconciled
           : workersAttachedToManager(reconciled, managerSessionId(ctx));
-        return textResult(formatWorkers(workers), { workers, scope: params.all ? "all" : "manager" });
+        const workers = params.action === "history" || params.all
+          ? scoped
+          : scoped.filter((worker) => isLiveState(worker.state) || isRecentTerminalWorker(worker, config));
+        const hiddenHistory = scoped.length - workers.length;
+        return textResult(formatWorkers(workers, hiddenHistory), {
+          workers,
+          hiddenHistory,
+          scope: params.all ? "all" : "manager",
+          view: params.action,
+        });
       }
 
       if (params.action === "status") {
@@ -1138,11 +1205,34 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
 
       if (params.action === "cleanup") {
         const candidates = await cleanupExpired(Boolean(params.execute));
-        if (candidates.length === 0) return textResult("No owned workers have expired leases.", { candidates: [] });
-        const lines = candidates.map(({ worker, reason }) => `${worker.id}: ${reason}`);
+        if (candidates.length === 0) return textResult("No live workers need stopping, no terminal worker retention has expired, and no disposable runtime caches remain.", { candidates: [] });
+        const lines = candidates.map(({ worker, reason, kind }) => `${worker.id} [${kind}]: ${reason}`);
         return textResult(
-          `${params.execute ? "Cleaned" : "Cleanup preview"}:\n${lines.join("\n")}${params.execute ? "" : "\nRun cleanup with execute=true to stop these owned workers."}`,
+          `${params.execute ? "Cleaned" : "Cleanup preview"}:\n${lines.join("\n")}${params.execute ? "" : "\nRun cleanup with execute=true to stop expired live workers, prune retention-expired terminal workers, and remove disposable caches from retained runtimes."}`,
           { candidates },
+        );
+      }
+
+      if (params.action === "prune") {
+        if (params.acknowledge !== true) {
+          throw new Error("Refusing bulk prune without acknowledge=true; this deletes retained harness session state");
+        }
+        const reconciled = await reconcile();
+        const scoped = params.all
+          ? reconciled
+          : workersAttachedToManager(reconciled, managerSessionId(ctx));
+        const selected = params.id
+          ? extractWorkers({ version: 1, workers: scoped }, params.id)
+          : scoped;
+        const candidates = selected.filter((worker) => !isLiveState(worker.state));
+        const pruned: string[] = [];
+        for (const worker of candidates) {
+          if (await pruneTerminalWorker(worker)) pruned.push(worker.id);
+        }
+        await updateStatus(ctx);
+        return textResult(
+          pruned.length ? `Pruned ${pruned.length} terminal worker record${pruned.length === 1 ? "" : "s"}:\n${pruned.join("\n")}` : "No terminal workers were eligible for pruning.",
+          { pruned, scope: params.all ? "all" : "manager" },
         );
       }
 
@@ -1384,15 +1474,20 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("agents", {
-    description: "Show coworkers attached to this Pi session; use /agents all for every managed worker",
+    description: "Show live/recent coworkers; use /agents history for retained history or /agents all for every managed worker",
     handler: async (args, ctx) => {
       if (!config) await loadConfig();
       const workers = await reconcile();
-      const visible = args.trim().toLowerCase() === "all"
+      const view = args.trim().toLowerCase();
+      const scoped = view === "all"
         ? workers
         : workersAttachedToManager(workers, managerSessionId(ctx));
-      const text = formatWorkers(visible);
-      if (ctx.hasUI) await ctx.ui.editor(args.trim().toLowerCase() === "all" ? "All managed coworkers" : "Coworkers attached to this Pi", text);
+      const visible = view === "all" || view === "history"
+        ? scoped
+        : scoped.filter((worker) => isLiveState(worker.state) || isRecentTerminalWorker(worker, config));
+      const text = formatWorkers(visible, scoped.length - visible.length);
+      const title = view === "all" ? "All managed coworkers" : view === "history" ? "Retained coworker history" : "Coworkers attached to this Pi";
+      if (ctx.hasUI) await ctx.ui.editor(title, text);
       else ctx.ui.notify(text, "info");
     },
   });
@@ -1513,6 +1608,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           const cleanupGrace = await ctx.ui.input("Cleanup grace minutes after idle deadline", String(draft.cleanupGraceMinutes));
           const cleanupTimerChoice = await ctx.ui.select("Enable managerless cleanup timer?", preferredFirst(["yes", "no"], draft.cleanupTimerEnabled ? "yes" : "no"));
           const cleanupTimer = await ctx.ui.input("Managerless cleanup timer minutes", String(draft.cleanupTimerMinutes));
+          const recentStoppedHours = await ctx.ui.input("Hours of terminal history shown by default", String(draft.recentStoppedWorkerHours));
+          const stoppedRetentionDays = await ctx.ui.input("Clean terminal worker retention days", String(draft.stoppedWorkerRetentionDays));
+          const dirtyRetentionDays = await ctx.ui.input("Dirty terminal worker retention days", String(draft.dirtyStoppedWorkerRetentionDays));
+          const pruneStoppedChoice = await ctx.ui.select("Prune retention-expired terminal workers during cleanup?", preferredFirst(["yes", "no"], draft.pruneStoppedWorkersOnCleanup ? "yes" : "no"));
+          const pruneCachesChoice = await ctx.ui.select("Remove disposable package caches from stopped runtimes?", preferredFirst(["yes", "no"], draft.pruneRuntimeCachesOnStop ? "yes" : "no"));
           const heartbeatSeconds = await ctx.ui.input("Heartbeat seconds", String(draft.heartbeatSeconds));
           const maxRuntime = await ctx.ui.input("Maximum runtime (systemd duration)", draft.maxRuntime);
           const cleanupChoice = await ctx.ui.select("Cleanup live owned workers on manager shutdown?", preferredFirst(["yes", "no"], draft.cleanupOnShutdown ? "yes" : "no"));
@@ -1524,6 +1624,13 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           if (cleanupTimerChoice === "yes") draft.cleanupTimerEnabled = true;
           if (cleanupTimerChoice === "no") draft.cleanupTimerEnabled = false;
           if (cleanupTimer && Number(cleanupTimer) > 0) draft.cleanupTimerMinutes = Number(cleanupTimer);
+          if (recentStoppedHours && Number(recentStoppedHours) > 0) draft.recentStoppedWorkerHours = Number(recentStoppedHours);
+          if (stoppedRetentionDays && Number(stoppedRetentionDays) > 0) draft.stoppedWorkerRetentionDays = Number(stoppedRetentionDays);
+          if (dirtyRetentionDays && Number(dirtyRetentionDays) > 0) draft.dirtyStoppedWorkerRetentionDays = Number(dirtyRetentionDays);
+          if (pruneStoppedChoice === "yes") draft.pruneStoppedWorkersOnCleanup = true;
+          if (pruneStoppedChoice === "no") draft.pruneStoppedWorkersOnCleanup = false;
+          if (pruneCachesChoice === "yes") draft.pruneRuntimeCachesOnStop = true;
+          if (pruneCachesChoice === "no") draft.pruneRuntimeCachesOnStop = false;
           if (heartbeatSeconds && Number(heartbeatSeconds) > 0) draft.heartbeatSeconds = Number(heartbeatSeconds);
           if (maxRuntime?.trim()) {
             try {
@@ -1569,23 +1676,23 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("agents-cleanup", {
-    description: "Preview or execute cleanup of owned workers with expired leases",
+    description: "Preview or execute live-worker, retained-history, and runtime-cache cleanup",
     handler: async (args, ctx) => {
       if (!config) await loadConfig();
       const execute = args.trim() === "execute" || args.trim() === "--execute";
       const candidates = await cleanupExpired(false);
       if (candidates.length === 0) {
-        ctx.ui.notify("No owned workers have expired leases.", "info");
+        ctx.ui.notify("No live workers need stopping, no terminal worker retention has expired, and no disposable runtime caches remain.", "info");
         return;
       }
-      const summary = candidates.map(({ worker, reason }) => `${worker.id}: ${reason}`).join("\n");
+      const summary = candidates.map(({ worker, reason, kind }) => `${worker.id} [${kind}]: ${reason}`).join("\n");
       if (!execute) {
-        if (ctx.hasUI) await ctx.ui.editor("Cleanup preview", `${summary}\n\nRun /agents-cleanup execute to stop them.`);
+        if (ctx.hasUI) await ctx.ui.editor("Cleanup preview", `${summary}\n\nRun /agents-cleanup execute to apply cleanup.`);
         return;
       }
-      if (ctx.hasUI && !(await ctx.ui.confirm("Stop expired workers?", summary))) return;
-      await cleanupExpired(true);
-      ctx.ui.notify(`Stopped ${candidates.length} expired worker${candidates.length === 1 ? "" : "s"}.`, "info");
+      if (ctx.hasUI && !(await ctx.ui.confirm("Apply worker cleanup?", summary))) return;
+      const handled = await cleanupExpired(true);
+      ctx.ui.notify(`Applied ${handled.length} cleanup action${handled.length === 1 ? "" : "s"}.`, "info");
     },
   });
 

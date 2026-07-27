@@ -22,9 +22,27 @@ import {
   recordWorkerActivity,
   workerIdleDeadline,
   stateFromUnit,
+  stoppedWorkerRetentionReason,
+  isRecentTerminalWorker,
   validateEffort,
   validateWorkerId,
 } from "../src/workers.ts";
+
+test("terminal worker visibility and retention distinguish clean and dirty records", () => {
+  const now = Date.UTC(2026, 6, 27);
+  const base: WorkerRecord = {
+    id: "retained", runId: "run-retained", harness: "codex", backend: "systemd", role: "builder", task: "test", cwd: "/tmp",
+    state: "stopped", owned: true, managerSessionId: "manager", createdAt: now, updatedAt: now, stoppedAt: now,
+    leaseExpiresAt: now,
+  };
+  assert.equal(isRecentTerminalWorker(base, DEFAULT_CONFIG, now + 5 * 60 * 60_000), true);
+  assert.equal(isRecentTerminalWorker(base, DEFAULT_CONFIG, now + 7 * 60 * 60_000), false);
+  assert.equal(stoppedWorkerRetentionReason(base, DEFAULT_CONFIG, now + 6 * 24 * 60 * 60_000), undefined);
+  assert.match(stoppedWorkerRetentionReason(base, DEFAULT_CONFIG, now + 8 * 24 * 60 * 60_000) ?? "", /stopped worker retention expired/);
+  const dirty = { ...base, dirtyAtStop: true };
+  assert.equal(stoppedWorkerRetentionReason(dirty, DEFAULT_CONFIG, now + 8 * 24 * 60 * 60_000), undefined);
+  assert.match(stoppedWorkerRetentionReason(dirty, DEFAULT_CONFIG, now + 31 * 24 * 60 * 60_000) ?? "", /dirty stopped worker retention expired/);
+});
 
 test("unit names are bounded and sanitized", () => {
   assert.equal(sanitizeUnitPart("Codex Build/API !!"), "codex-build-api");

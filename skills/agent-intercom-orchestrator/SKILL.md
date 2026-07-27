@@ -49,7 +49,8 @@ agent_fleet({ action: "variants", model: "anthropic/claude-fable-5" })
 agent_fleet({ action: "config" })
 agent_fleet({ action: "route", role: "advisor" })
 agent_fleet({ action: "route", role: "builder", requiresSubagents: true })
-agent_fleet({ action: "list" }) // current manager's workers and Intercom targets
+agent_fleet({ action: "list" }) // current manager's live and recently terminal workers
+agent_fleet({ action: "history" }) // current manager's complete retained history
 agent_fleet({ action: "list", all: true }) // explicit cross-manager diagnostics
 ```
 
@@ -152,20 +153,23 @@ agent_fleet({ action: "logs", id: "codex-build-api", lines: 100 })
 agent_fleet({ action: "renew", id: "codex-build-api" })
 agent_fleet({ action: "adopt", id: "codex-build-api" }) // after an intentional manager restart
 agent_fleet({ action: "stop", id: "codex-build-api" })
-agent_fleet({ action: "cleanup", execute: false })
+agent_fleet({ action: "cleanup", execute: false }) // expired live workers plus retention-expired terminal records
 agent_fleet({ action: "cleanup", execute: true })
+agent_fleet({ action: "prune", acknowledge: true }) // bulk-delete this manager's terminal history
 agent_fleet({ action: "forget", id: "codex-build-api", acknowledge: true })
 ```
 
 ## Pi commands
 
-- `/agents` — inspect managed coworkers
+- `/agents` — inspect live and recently terminal coworkers
+- `/agents history` — inspect complete retained history for this manager
+- `/agents all` — inspect the explicit cross-manager inventory
 - `/agents-new` — interactive role, harness, launch profile, permission profile, model, effort, cwd, id, and task wizard
 - `/agents-config` — edit per-harness defaults, lifecycle settings, and role presets
 - `/agents-models [pi|codex|claude|opencode]` — browse available models
-- `/agents-cleanup [execute]` — preview or execute expired-lease cleanup
+- `/agents-cleanup [execute]` — preview or execute expired-live-worker, retained-history, and disposable-cache cleanup
 
-Configuration is stored at `~/.pi/agent/intercom/orchestrator/config.json` unless `PI_CODING_AGENT_DIR` changes the Pi agent directory. By default, manager-received worker Intercom traffic or explicit `renew` extends a lease, but never beyond 60 minutes since the last worker activity. The manager begins checkpoint requests 10 minutes before that idle deadline and retries every 5 minutes while available; cleanup waits another 15 minutes, then stops the exact owned cgroup. A persistent systemd user timer checks every 15 minutes even when no manager is running. `stop` is always allowed; `forget` requires a stopped record and explicit manager `acknowledge: true`.
+Configuration is stored at `~/.pi/agent/intercom/orchestrator/config.json` unless `PI_CODING_AGENT_DIR` changes the Pi agent directory. By default, manager-received worker Intercom traffic or explicit `renew` extends a lease, but never beyond 60 minutes since the last worker activity. The manager begins checkpoint requests 10 minutes before that idle deadline and retries every 5 minutes while available; cleanup waits another 15 minutes, then stops the exact owned cgroup. A persistent systemd user timer checks every 15 minutes even when no manager is running. Default `list` output includes 6 hours of terminal history; `history` exposes all retained records. Cleanup prunes clean terminal records after 7 days and dirty records after 30 days, and successful stops discard disposable package caches while retaining harness session state. Configure this with `recentStoppedWorkerHours`, `stoppedWorkerRetentionDays`, `dirtyStoppedWorkerRetentionDays`, `pruneStoppedWorkersOnCleanup`, and `pruneRuntimeCachesOnStop`. `stop` is always allowed; `forget` and bulk `prune` require explicit `acknowledge: true`.
 
 Routing configuration lives under `routing`: `preference` and `roles` order harnesses, `explicitOnly` controls automatic exclusions, `profilePreferences` orders launch-profile fallback, `roleRequirements` supplies capability defaults, `modelRouting` controls model inference and normalization (including an optional unmatched-model harness), `fallback` controls portable role instructions, and `capabilities` describes actual harness support. Existing defaults, role presets, and explicit spawn fields remain supported. Ralph and `return_on` recommendations live under top-level `supervision`.
 
