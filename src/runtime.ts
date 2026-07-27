@@ -64,6 +64,34 @@ export function workerSocketRuntimeRoot(_workerId: string, runtimeDir = process.
   return join(runtimeDir, "agent-intercom-worker");
 }
 
+const DISPOSABLE_RUNTIME_CACHE_PATHS = [
+  ["home", ".cache", "npm"],
+  ["home", ".cache", "node-gyp"],
+  ["home", ".cache", "pip"],
+  ["home", ".cache", "uv"],
+  ["home", ".cache", "pnpm"],
+  ["home", ".local", "share", "pnpm", "store"],
+] as const;
+
+export async function hasWorkerRuntimeCaches(workerId: string, agentDir: string): Promise<boolean> {
+  const root = workerRuntimeRoot(workerId, agentDir);
+  const checks = await Promise.all(DISPOSABLE_RUNTIME_CACHE_PATHS.map(async (parts) => {
+    try {
+      await access(join(root, ...parts));
+      return true;
+    } catch {
+      return false;
+    }
+  }));
+  return checks.some(Boolean);
+}
+
+export async function pruneWorkerRuntimeCaches(workerId: string, agentDir: string): Promise<void> {
+  const root = workerRuntimeRoot(workerId, agentDir);
+  await Promise.all(DISPOSABLE_RUNTIME_CACHE_PATHS.map((parts) =>
+    rm(join(root, ...parts), { recursive: true, force: true })));
+}
+
 export async function prepareWorkerRuntime(
   harness: Harness,
   workerId: string,

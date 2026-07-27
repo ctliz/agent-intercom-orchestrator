@@ -166,6 +166,11 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
   cleanupTimerEnabled: true,
   cleanupExpiredOnStart: true,
   cleanupOnShutdown: true,
+  recentStoppedWorkerHours: 6,
+  stoppedWorkerRetentionDays: 7,
+  dirtyStoppedWorkerRetentionDays: 30,
+  pruneStoppedWorkersOnCleanup: true,
+  pruneRuntimeCachesOnStop: true,
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -456,6 +461,13 @@ export function mergeConfig(value: unknown): OrchestratorConfig {
       typeof value.cleanupExpiredOnStart === "boolean" ? value.cleanupExpiredOnStart : DEFAULT_CONFIG.cleanupExpiredOnStart,
     cleanupOnShutdown:
       typeof value.cleanupOnShutdown === "boolean" ? value.cleanupOnShutdown : DEFAULT_CONFIG.cleanupOnShutdown,
+    recentStoppedWorkerHours: positiveNumber(value.recentStoppedWorkerHours, DEFAULT_CONFIG.recentStoppedWorkerHours),
+    stoppedWorkerRetentionDays: positiveNumber(value.stoppedWorkerRetentionDays, DEFAULT_CONFIG.stoppedWorkerRetentionDays),
+    dirtyStoppedWorkerRetentionDays: positiveNumber(value.dirtyStoppedWorkerRetentionDays, DEFAULT_CONFIG.dirtyStoppedWorkerRetentionDays),
+    pruneStoppedWorkersOnCleanup:
+      typeof value.pruneStoppedWorkersOnCleanup === "boolean" ? value.pruneStoppedWorkersOnCleanup : DEFAULT_CONFIG.pruneStoppedWorkersOnCleanup,
+    pruneRuntimeCachesOnStop:
+      typeof value.pruneRuntimeCachesOnStop === "boolean" ? value.pruneRuntimeCachesOnStop : DEFAULT_CONFIG.pruneRuntimeCachesOnStop,
   };
 }
 
@@ -622,6 +634,11 @@ export async function writeConfigDefaults(path: string, config: OrchestratorConf
     cleanupTimerEnabled: config.cleanupTimerEnabled,
     cleanupExpiredOnStart: config.cleanupExpiredOnStart,
     cleanupOnShutdown: config.cleanupOnShutdown,
+    recentStoppedWorkerHours: config.recentStoppedWorkerHours,
+    stoppedWorkerRetentionDays: config.stoppedWorkerRetentionDays,
+    dirtyStoppedWorkerRetentionDays: config.dirtyStoppedWorkerRetentionDays,
+    pruneStoppedWorkersOnCleanup: config.pruneStoppedWorkersOnCleanup,
+    pruneRuntimeCachesOnStop: config.pruneRuntimeCachesOnStop,
   });
 }
 

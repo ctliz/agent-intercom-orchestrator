@@ -115,6 +115,11 @@ export interface OrchestratorConfig {
   cleanupTimerEnabled: boolean;
   cleanupExpiredOnStart: boolean;
   cleanupOnShutdown: boolean;
+  recentStoppedWorkerHours: number;
+  stoppedWorkerRetentionDays: number;
+  dirtyStoppedWorkerRetentionDays: number;
+  pruneStoppedWorkersOnCleanup: boolean;
+  pruneRuntimeCachesOnStop: boolean;
 }
 
 export interface WorkerRecord {

@@ -75,6 +75,11 @@
   "cleanupTimerMinutes": 15,
   "cleanupExpiredOnStart": true,
   "cleanupOnShutdown": true,
+  "recentStoppedWorkerHours": 6,
+  "stoppedWorkerRetentionDays": 7,
+  "dirtyStoppedWorkerRetentionDays": 30,
+  "pruneStoppedWorkersOnCleanup": true,
+  "pruneRuntimeCachesOnStop": true,
   "profiles": {
     "pi-peer": {
       "harness": "pi",

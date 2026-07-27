@@ -164,7 +164,7 @@ test("managerless cleanup wrapper executes exact fleet cleanup against the confi
     assert.equal(code, 0, stderr);
     const response = JSON.parse(stdout);
     assert.equal(response.ok, true);
-    assert.match(response.result.content[0].text, /No owned workers have expired/);
+    assert.match(response.result.content[0].text, /No live workers need stopping, no terminal worker retention has expired, and no disposable runtime caches remain/);
   } finally {
     await rm(agentDir, { recursive: true, force: true });
   }

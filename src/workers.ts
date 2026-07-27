@@ -264,6 +264,25 @@ export function isLiveState(state: WorkerState): boolean {
   return state === "provisioning" || state === "running" || state === "idle" || state === "needs_attention" || state === "stopping";
 }
 
+export function terminalWorkerTimestamp(worker: WorkerRecord): number {
+  return worker.stoppedAt ?? worker.updatedAt ?? worker.createdAt;
+}
+
+export function isRecentTerminalWorker(worker: WorkerRecord, config: OrchestratorConfig, now = Date.now()): boolean {
+  return !isLiveState(worker.state)
+    && terminalWorkerTimestamp(worker) > now - config.recentStoppedWorkerHours * 60 * 60_000;
+}
+
+export function stoppedWorkerRetentionReason(worker: WorkerRecord, config: OrchestratorConfig, now = Date.now()): string | undefined {
+  if (!worker.owned || isLiveState(worker.state)) return undefined;
+  const retentionDays = worker.dirtyAtStop
+    ? config.dirtyStoppedWorkerRetentionDays
+    : config.stoppedWorkerRetentionDays;
+  const retainedUntil = terminalWorkerTimestamp(worker) + retentionDays * 24 * 60 * 60_000;
+  if (retainedUntil > now) return undefined;
+  return `${worker.dirtyAtStop ? "dirty " : ""}${worker.state} worker retention expired ${Math.ceil((now - retainedUntil) / 1000)}s ago`;
+}
+
 export function cleanupReason(worker: WorkerRecord, now = Date.now()): string | undefined {
   if (!worker.owned || !isLiveState(worker.state)) return undefined;
   if (worker.checkpointDeadlineAt !== undefined && worker.checkpointDeadlineAt <= now) {

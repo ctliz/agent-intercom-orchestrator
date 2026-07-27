@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Bound retained worker history: default `list` now shows live and recently terminal workers with an older-history count, while `history` exposes the full manager-scoped record set. Cleanup now previews and prunes retention-expired terminal workers after 7 days, extends dirty-worker retention to 30 days, removes disposable per-worker package caches on stop, and provides an acknowledged manager-scoped `prune` action for bulk deletion.
 - Add capability-aware automatic harness routing for omitted-harness spawns, with pure explainable ranking, ordered spawnable-profile fallback including verified Pi runtime support, persistence mode and effort reporting, per-role capability defaults, and a non-spawning `route` preview action. Add strict-schema-safe `auto` sentinels for harness, effort, and nested-subagent constraints so generated placeholder values cannot silently become explicit overrides.
 - Add typed merge-safe policy for ordered explicit-model routing, safe exact/trailing-`*` patterns, optional unmatched-model harness fallback, direct-CLI prefix stripping, config-authoritative `explicitOnly`, portable role-instruction fallback, and independently configurable Ralph/`return_on` guidance. Preserve explicit caller harness/profile/permission/instruction precedence, migrate legacy default harness/profile preferences, and keep security and lifecycle contracts unchanged.
 - Update the locked Pi development dependency family from 0.80.6 to 0.82.1 as a complete dependency-tree upgrade.

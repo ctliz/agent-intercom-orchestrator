@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -383,12 +383,15 @@ test("agent_fleet list and unqualified status default to the current manager's w
       managerSessionId: owner,
       intercomTarget: `${id}-target`,
       createdAt: 1,
-      updatedAt: 1,
+      updatedAt: Date.now(),
+      stoppedAt: Date.now(),
       leaseExpiresAt: Date.now() + 60_000,
     });
+    const oldStoppedAt = Date.now() - 7 * 60 * 60_000;
+    const oldMine = { ...worker("old-mine", "manager-a"), updatedAt: oldStoppedAt, stoppedAt: oldStoppedAt };
     await writeFile(join(orchestratorDir, "workers.json"), JSON.stringify({
       version: 1,
-      workers: [worker("mine", "manager-a"), worker("theirs", "manager-b")],
+      workers: [worker("mine", "manager-a"), worker("theirs", "manager-b"), oldMine],
     }));
 
     const lifecycle = new Map<string, (...args: any[]) => any>();
@@ -418,23 +421,139 @@ test("agent_fleet list and unqualified status default to the current manager's w
     const ownList = await fleet.execute("list-own", { action: "list" }, new AbortController().signal, () => {}, ctx);
     assert.deepEqual(ownList.details.workers.map((record: any) => record.id), ["mine"]);
     assert.match(ownList.content[0].text, /target=mine-target/);
+    assert.match(ownList.content[0].text, /1 older terminal worker is hidden/);
     assert.doesNotMatch(ownList.content[0].text, /theirs/);
+    assert.doesNotMatch(ownList.content[0].text, /old-mine \[/);
+
+    const ownHistory = await fleet.execute("history-own", { action: "history" }, new AbortController().signal, () => {}, ctx);
+    assert.deepEqual(ownHistory.details.workers.map((record: any) => record.id), ["mine", "old-mine"]);
 
     const allList = await fleet.execute("list-all", { action: "list", all: true }, new AbortController().signal, () => {}, ctx);
-    assert.deepEqual(allList.details.workers.map((record: any) => record.id), ["mine", "theirs"]);
+    assert.deepEqual(allList.details.workers.map((record: any) => record.id), ["mine", "theirs", "old-mine"]);
 
     const ownStatus = await fleet.execute("status-own", { action: "status" }, new AbortController().signal, () => {}, ctx);
-    assert.deepEqual(ownStatus.details.workers.map((record: any) => record.id), ["mine"]);
+    assert.deepEqual(ownStatus.details.workers.map((record: any) => record.id), ["mine", "old-mine"]);
     await assert.rejects(
       fleet.execute("status-hidden", { action: "status", id: "theirs" }, new AbortController().signal, () => {}, ctx),
       /Unknown managed worker: theirs/,
     );
 
     const allStatus = await fleet.execute("status-all", { action: "status", all: true }, new AbortController().signal, () => {}, ctx);
-    assert.deepEqual(allStatus.details.workers.map((record: any) => record.id), ["mine", "theirs"]);
+    assert.deepEqual(allStatus.details.workers.map((record: any) => record.id), ["mine", "theirs", "old-mine"]);
     const otherStatus = await fleet.execute("status-other", { action: "status", id: "theirs", all: true }, new AbortController().signal, () => {}, ctx);
     assert.deepEqual(otherStatus.details.workers.map((record: any) => record.id), ["theirs"]);
 
+    await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("cleanup prunes retention-expired terminal workers and preserves recent history", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-retention-cleanup-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    const orchestratorDir = join(agentDir, "intercom", "orchestrator");
+    await mkdir(orchestratorDir, { recursive: true });
+    await writeFile(join(orchestratorDir, "config.json"), JSON.stringify({
+      cleanupExpiredOnStart: false,
+      cleanupOnShutdown: false,
+      stoppedWorkerRetentionDays: 1,
+      dirtyStoppedWorkerRetentionDays: 3,
+      pruneStoppedWorkersOnCleanup: true,
+    }));
+    const now = Date.now();
+    const worker = (id: string, stoppedAt: number, dirtyAtStop = false) => ({
+      id, runId: `run-${id}`, harness: "pi", role: "advisor", task: "review", cwd: "/tmp",
+      state: "stopped", owned: true, managerSessionId: "manager-a", stopReason: "manager-requested",
+      dirtyAtStop, stoppedAt, createdAt: stoppedAt, updatedAt: stoppedAt, leaseExpiresAt: stoppedAt,
+    });
+    await writeFile(join(orchestratorDir, "workers.json"), JSON.stringify({ version: 1, workers: [
+      worker("expired-clean", now - 2 * 24 * 60 * 60_000),
+      worker("retained-recent", now - 2 * 60 * 60_000),
+      worker("retained-dirty", now - 2 * 24 * 60 * 60_000, true),
+    ] }));
+    for (const id of ["expired-clean", "retained-recent", "retained-dirty"]) {
+      const root = join(orchestratorDir, "worker-runtime", id);
+      await mkdir(root, { recursive: true });
+      await writeFile(join(root, "state"), "retained\n");
+    }
+    const retainedCache = join(orchestratorDir, "worker-runtime", "retained-recent", "home", ".cache", "npm", "_npx");
+    await mkdir(retainedCache, { recursive: true });
+    await writeFile(join(retainedCache, "downloaded-tool"), "cache\n");
+
+    const lifecycle = new Map<string, (...args: any[]) => any>();
+    const tools = new Map<string, any>();
+    const pi: any = {
+      on(name: string, handler: (...args: any[]) => any) { lifecycle.set(name, handler); },
+      events: { on() { return () => {}; }, emit() {} },
+      registerTool(tool: any) { tools.set(tool.name, tool); },
+      registerCommand() {},
+      async exec() { return commandResult(); },
+    };
+    const ctx: any = {
+      cwd: "/tmp", mode: "rpc", hasUI: false,
+      sessionManager: { getSessionId: () => "manager-a", getSessionFile: () => undefined },
+      ui: { setStatus() {}, notify() {} },
+    };
+    const extensionUrl = new URL(`../src/index.ts?retention-cleanup=${Date.now()}`, import.meta.url);
+    const { default: extension } = await import(extensionUrl.href);
+    extension(pi);
+    await lifecycle.get("session_start")?.({}, ctx);
+    const fleet = tools.get("agent_fleet");
+    const preview = await fleet.execute("cleanup-preview", { action: "cleanup" }, new AbortController().signal, () => {}, ctx);
+    assert.deepEqual(preview.details.candidates.map((candidate: any) => [candidate.worker.id, candidate.kind]), [
+      ["expired-clean", "prune"],
+      ["retained-recent", "cache"],
+    ]);
+    await fleet.execute("cleanup-execute", { action: "cleanup", execute: true }, new AbortController().signal, () => {}, ctx);
+    const saved = JSON.parse(await readFile(join(orchestratorDir, "workers.json"), "utf8"));
+    assert.deepEqual(saved.workers.map((record: any) => record.id), ["retained-recent", "retained-dirty"]);
+    await assert.rejects(access(join(orchestratorDir, "worker-runtime", "expired-clean")));
+    await assert.rejects(access(join(orchestratorDir, "worker-runtime", "retained-recent", "home", ".cache", "npm")));
+    assert.equal(await readFile(join(orchestratorDir, "worker-runtime", "retained-recent", "state"), "utf8"), "retained\n");
+    assert.equal(await readFile(join(orchestratorDir, "worker-runtime", "retained-dirty", "state"), "utf8"), "retained\n");
+    await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("bulk prune requires acknowledgment and remains manager scoped", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-bulk-prune-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    const orchestratorDir = join(agentDir, "intercom", "orchestrator");
+    await mkdir(orchestratorDir, { recursive: true });
+    await writeFile(join(orchestratorDir, "config.json"), JSON.stringify({ cleanupExpiredOnStart: false, cleanupOnShutdown: false }));
+    const record = (id: string, owner: string) => ({
+      id, runId: `run-${id}`, harness: "pi", role: "advisor", task: "review", cwd: "/tmp", state: "stopped",
+      owned: true, managerSessionId: owner, stoppedAt: Date.now(), createdAt: 1, updatedAt: Date.now(), leaseExpiresAt: 1,
+    });
+    await writeFile(join(orchestratorDir, "workers.json"), JSON.stringify({ version: 1, workers: [record("mine", "manager-a"), record("theirs", "manager-b")] }));
+    const lifecycle = new Map<string, (...args: any[]) => any>();
+    const tools = new Map<string, any>();
+    const pi: any = {
+      on(name: string, handler: (...args: any[]) => any) { lifecycle.set(name, handler); },
+      events: { on() { return () => {}; }, emit() {} }, registerTool(tool: any) { tools.set(tool.name, tool); }, registerCommand() {},
+      async exec() { return commandResult(); },
+    };
+    const ctx: any = { cwd: "/tmp", mode: "rpc", hasUI: false, sessionManager: { getSessionId: () => "manager-a", getSessionFile: () => undefined }, ui: { setStatus() {}, notify() {} } };
+    const { default: extension } = await import(new URL(`../src/index.ts?bulk-prune=${Date.now()}`, import.meta.url).href);
+    extension(pi);
+    await lifecycle.get("session_start")?.({}, ctx);
+    const fleet = tools.get("agent_fleet");
+    await assert.rejects(fleet.execute("prune-refused", { action: "prune" }, new AbortController().signal, () => {}, ctx), /acknowledge=true/);
+    const result = await fleet.execute("prune-owned", { action: "prune", acknowledge: true }, new AbortController().signal, () => {}, ctx);
+    assert.deepEqual(result.details.pruned, ["mine"]);
+    const saved = JSON.parse(await readFile(join(orchestratorDir, "workers.json"), "utf8"));
+    assert.deepEqual(saved.workers.map((worker: any) => worker.id), ["theirs"]);
     await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
