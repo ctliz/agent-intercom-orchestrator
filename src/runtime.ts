@@ -1,4 +1,4 @@
-import { access, copyFile, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import type { Harness } from "./types.ts";
@@ -72,6 +72,24 @@ const DISPOSABLE_RUNTIME_CACHE_PATHS = [
   ["home", ".cache", "pnpm"],
   ["home", ".local", "share", "pnpm", "store"],
 ] as const;
+
+export async function listOrphanWorkerRuntimeIds(agentDir: string, knownWorkerIds: Set<string>): Promise<string[]> {
+  const root = join(agentDir, "intercom", "orchestrator", "worker-runtime");
+  try {
+    const entries = await readdir(root, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isDirectory() && !knownWorkerIds.has(entry.name))
+      .map((entry) => entry.name)
+      .sort();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+export async function removeOrphanWorkerRuntime(workerId: string, agentDir: string): Promise<void> {
+  await rm(workerRuntimeRoot(workerId, agentDir), { recursive: true, force: true });
+}
 
 export async function hasWorkerRuntimeCaches(workerId: string, agentDir: string): Promise<boolean> {
   const root = workerRuntimeRoot(workerId, agentDir);

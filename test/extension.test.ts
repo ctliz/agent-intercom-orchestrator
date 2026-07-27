@@ -484,6 +484,9 @@ test("cleanup prunes retention-expired terminal workers and preserves recent his
     const retainedCache = join(orchestratorDir, "worker-runtime", "retained-recent", "home", ".cache", "npm", "_npx");
     await mkdir(retainedCache, { recursive: true });
     await writeFile(join(retainedCache, "downloaded-tool"), "cache\n");
+    const orphanRuntime = join(orchestratorDir, "worker-runtime", "orphaned-run");
+    await mkdir(orphanRuntime, { recursive: true });
+    await writeFile(join(orphanRuntime, "state"), "orphan\n");
 
     const lifecycle = new Map<string, (...args: any[]) => any>();
     const tools = new Map<string, any>();
@@ -505,14 +508,16 @@ test("cleanup prunes retention-expired terminal workers and preserves recent his
     await lifecycle.get("session_start")?.({}, ctx);
     const fleet = tools.get("agent_fleet");
     const preview = await fleet.execute("cleanup-preview", { action: "cleanup" }, new AbortController().signal, () => {}, ctx);
-    assert.deepEqual(preview.details.candidates.map((candidate: any) => [candidate.worker.id, candidate.kind]), [
+    assert.deepEqual(preview.details.candidates.map((candidate: any) => [candidate.kind === "orphan" ? candidate.workerId : candidate.worker.id, candidate.kind]), [
       ["expired-clean", "prune"],
       ["retained-recent", "cache"],
+      ["orphaned-run", "orphan"],
     ]);
     await fleet.execute("cleanup-execute", { action: "cleanup", execute: true }, new AbortController().signal, () => {}, ctx);
     const saved = JSON.parse(await readFile(join(orchestratorDir, "workers.json"), "utf8"));
     assert.deepEqual(saved.workers.map((record: any) => record.id), ["retained-recent", "retained-dirty"]);
     await assert.rejects(access(join(orchestratorDir, "worker-runtime", "expired-clean")));
+    await assert.rejects(access(join(orchestratorDir, "worker-runtime", "orphaned-run")));
     await assert.rejects(access(join(orchestratorDir, "worker-runtime", "retained-recent", "home", ".cache", "npm")));
     assert.equal(await readFile(join(orchestratorDir, "worker-runtime", "retained-recent", "state"), "utf8"), "retained\n");
     assert.equal(await readFile(join(orchestratorDir, "worker-runtime", "retained-dirty", "state"), "utf8"), "retained\n");
