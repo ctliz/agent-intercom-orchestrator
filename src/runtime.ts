@@ -114,7 +114,7 @@ export async function prepareWorkerRuntime(
   harness: Harness,
   workerId: string,
   agentDir: string,
-  options: { homeDir?: string; runtimeDir?: string } = {},
+  options: { homeDir?: string; runtimeDir?: string; profileName?: string } = {},
 ): Promise<WorkerRuntime> {
   const sourceHome = options.homeDir ?? homedir();
   const root = workerRuntimeRoot(workerId, agentDir);
@@ -199,8 +199,9 @@ export async function prepareWorkerRuntime(
   }
 
   if (harness === "codex") {
-    const source = join(sourceHome, ".codex");
-    const target = join(home, ".codex");
+    const codexDirectory = options.profileName === "codex-minimal" ? ".codex-i-m" : ".codex";
+    const source = join(sourceHome, codexDirectory);
+    const target = join(home, codexDirectory);
     await mkdir(toPersistent(target), { recursive: true, mode: 0o700 });
     for (const file of ["auth.json", "config.toml", "cliproxy.config.toml", "installation_id", "AGENTS.md", "RTK.md", "models_cache.json"]) {
       await copyOptional(join(source, file), toPersistent(join(target, file)));

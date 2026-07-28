@@ -48,10 +48,12 @@ test("worker runtime pre-creates isolated Codex state and seeds config without e
   const agentDir = join(home, ".pi", "agent");
   try {
     await mkdir(join(home, ".codex", "skills"), { recursive: true });
+    await mkdir(join(home, ".codex-i-m"), { recursive: true });
     await mkdir(join(agentDir, "intercom", "inbox"), { recursive: true });
     await writeFile(join(home, ".codex", "auth.json"), "source-auth\n");
     await writeFile(join(home, ".codex", "config.toml"), "source-config\n");
     await writeFile(join(home, ".codex", "skills", "example.md"), "skill\n");
+    await writeFile(join(home, ".codex-i-m", "config.toml"), "minimal-config\n");
 
     const runtime = await prepareWorkerRuntime("codex", "worker-one", agentDir, { homeDir: home, runtimeDir: join(home, "run") });
     const codexHome = runtime.environment.CODEX_HOME;
@@ -69,6 +71,11 @@ test("worker runtime pre-creates isolated Codex state and seeds config without e
     assert.equal(runtime.environment.AGENT_INTERCOM_BROKER_SOURCE, join(agentDir, "intercom", "broker.sock"));
     assert.ok(runtime.extraArgs.includes(`mcp_servers.codex-intercom.env.PI_CODING_AGENT_DIR=${JSON.stringify(runtime.environment.PI_CODING_AGENT_DIR)}`));
     assert.ok(runtime.extraArgs.includes(join(runtime.workerRoot, "coi-state.json")));
+
+    const minimal = await prepareWorkerRuntime("codex", "worker-minimal", agentDir, { homeDir: home, runtimeDir: join(home, "run"), profileName: "codex-minimal" });
+    assert.equal(minimal.environment.CODEX_HOME, join(minimal.workerRoot, "home", ".codex-i-m"));
+    assert.equal(await readFile(join(minimal.root, "home", ".codex-i-m", "config.toml"), "utf8"), "minimal-config\n");
+    await assert.rejects(access(join(minimal.root, "home", ".codex", "auth.json")));
   } finally {
     await rm(home, { recursive: true, force: true });
   }

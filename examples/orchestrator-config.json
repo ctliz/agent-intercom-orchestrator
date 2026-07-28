@@ -116,6 +116,13 @@
       "mode": "persistent",
       "maxRuntime": "12h"
     },
+    "claude-trusted": {
+      "harness": "claude",
+      "command": "cci",
+      "args": [],
+      "mode": "persistent",
+      "maxRuntime": "12h"
+    },
     "opencode-peer": {
       "harness": "opencode",
       "command": "opencode",

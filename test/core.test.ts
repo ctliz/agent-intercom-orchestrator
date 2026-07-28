@@ -61,12 +61,16 @@ test("harness launch args include identity or the initial task", () => {
   const pi = DEFAULT_CONFIG.profiles["pi-peer"];
   const codex = DEFAULT_CONFIG.profiles["codex-safe"];
   const claude = DEFAULT_CONFIG.profiles["claude-safe"];
+  const minimalClaude = DEFAULT_CONFIG.profiles["claude-minimal"];
+  const trustedClaude = DEFAULT_CONFIG.profiles["claude-trusted"];
   const opencode = DEFAULT_CONFIG.profiles["opencode-run"];
-  assert.ok(pi && codex && claude && opencode);
+  assert.ok(pi && codex && claude && minimalClaude && trustedClaude && opencode);
   const managerTarget = "manager-a";
   const piArgs = buildWorkerArgs({ harness: "pi", profile: pi, workerId: "advisor-a", cwd: "/repo", role: "advisor", task: "Review", model: "codex/gpt-5.6-sol", effort: "high", managerTarget, permissionProfile: DEFAULT_CONFIG.permissionProfiles["review-readonly"] });
   const codexArgs = buildWorkerArgs({ harness: "codex", profile: codex, workerId: "worker-a", cwd: "/repo", role: "builder", task: "Build", model: "gpt-5.6-sol", effort: "high", managerTarget });
-  const claudeArgs = buildWorkerArgs({ harness: "claude", profile: claude, workerId: "worker-b", cwd: "/repo", role: "challenger", task: "Challenge", model: "opus", effort: "max", managerTarget });
+  const claudeArgs = buildWorkerArgs({ harness: "claude", profile: claude, profileName: "claude-safe", workerId: "worker-b", cwd: "/repo", role: "challenger", task: "Challenge", model: "opus", effort: "max", managerTarget });
+  const minimalClaudeArgs = buildWorkerArgs({ harness: "claude", profile: minimalClaude, profileName: "claude-minimal", workerId: "worker-minimal", cwd: "/repo", role: "reviewer", task: "Review minimally", model: "opus", effort: "high", managerTarget });
+  const trustedClaudeArgs = buildWorkerArgs({ harness: "claude", profile: trustedClaude, profileName: "claude-trusted", workerId: "worker-trusted", cwd: "/repo", role: "builder", task: "Build without prompts", model: "opus", effort: "max", managerTarget });
   const opencodeArgs = buildWorkerArgs({ harness: "opencode", profile: opencode, workerId: "worker-c", cwd: "/repo", role: "tester", task: "Return OPEN_OK", model: "opencode/claude-sonnet-5", effort: "high", managerTarget });
   assert.deepEqual(codexArgs.slice(codexArgs.indexOf("--name"), codexArgs.indexOf("--name") + 4), [
     "--name",
@@ -85,12 +89,18 @@ test("harness launch args include identity or the initial task", () => {
   assert.ok(claudeArgs.includes("--safe"));
   assert.ok(claudeArgs.includes("--effort"));
   assert.ok(claudeArgs.includes("worker-b"));
+  assert.match(minimalClaudeArgs.join(" "), /final response to each wake/);
+  assert.doesNotMatch(minimalClaudeArgs.join(" "), /Use intercom_send for progress/);
+  assert.equal(trustedClaudeArgs.includes("--safe"), false);
+  assert.ok(trustedClaudeArgs.includes("worker-trusted"));
   assert.equal(opencodeArgs[0], "run");
   assert.ok(opencodeArgs.includes("--variant"));
   assert.match(opencodeArgs.at(-1) ?? "", /Return OPEN_OK/);
-  for (const args of [piArgs, codexArgs, claudeArgs, opencodeArgs]) {
+  for (const args of [piArgs, codexArgs, claudeArgs, minimalClaudeArgs, trustedClaudeArgs, opencodeArgs]) {
     assert.match(args.join(" "), /manager-a/);
     assert.match(args.join(" "), /intercom_team/);
+  }
+  for (const args of [piArgs, codexArgs, claudeArgs, trustedClaudeArgs, opencodeArgs]) {
     assert.match(args.join(" "), /intercom_send for progress/);
   }
   assert.equal(buildWorkerEnvironment("pi", "advisor-a", "advisor").AGENT_INTERCOM_ORCHESTRATOR_DISABLED, "1");

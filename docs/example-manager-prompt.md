@@ -84,8 +84,9 @@ Use repo-limited safe workers unless broader authority is required:
 
 - Codex: dedicated minimal `CODEX_HOME`, workspace-write sandbox, and approval
   prompts; use yolo only when explicitly justified
-- Claude: `cci --safe` or `ccim --safe`; without `--safe`, the headless wrapper
-  may bypass permission prompts
+- Claude: `claude-safe` (`cci --safe`) or `claude-minimal` (`ccim --safe`) for
+  restricted work; use `claude-trusted` with `permissionProfile: "trusted"`
+  only when broad, non-prompting headless authority is explicitly justified
 - Pi: grant only the approval mode and directories needed for the assignment
 - OpenCode: configure explicit permission rules and plugin paths
 
@@ -119,7 +120,17 @@ Wakeable Claude example:
 
   agent_fleet({
     action: "spawn", harness: "claude", profile: "claude-safe",
+    permissionProfile: "review-readonly",
     id: "<worker-id>", role: "challenger", cwd: "<worktree>",
+    model: "<model>", effort: "max", task: "<assignment>"
+  })
+
+Trusted non-prompting Claude example (broad host authority):
+
+  agent_fleet({
+    action: "spawn", harness: "claude", profile: "claude-trusted",
+    permissionProfile: "trusted",
+    id: "<worker-id>", role: "builder", cwd: "<worktree>",
     model: "<model>", effort: "max", task: "<assignment>"
   })
 

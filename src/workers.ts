@@ -108,13 +108,19 @@ export function validateEffort(harness: Harness, effort: Effort | undefined): Ef
   return effort;
 }
 
-export function standingInstructions(role: string, task: string, managerTarget: string, instructions?: string): string {
+export function standingInstructions(
+  role: string,
+  task: string,
+  managerTarget: string,
+  instructions?: string,
+  communicationInstructions = "Wait for work through Agent Intercom. Use intercom_send for progress, blockers, status, and completion evidence; use intercom_ask only when your next step genuinely depends on the manager's answer.",
+): string {
   return [
     `You are the independent ${role} coworker managed by Agent Intercom. You are a peer, not a child subagent.`,
     `Your manager's Intercom target is ${managerTarget}. Use intercom_team whenever you need the current manager or your managed coworkers.`,
     instructions,
     `Standing assignment: ${task}`,
-    "Wait for work through Agent Intercom. Use intercom_send for progress, blockers, status, and completion evidence; use intercom_ask only when your next step genuinely depends on the manager's answer.",
+    communicationInstructions,
     "Keep downstream tools inside this worker process tree. Do not create detached systemd services, background containers, or remote jobs unless the manager explicitly asks; report every external resource ID so the manager can own its cleanup.",
   ].filter(Boolean).join("\n\n");
 }
@@ -122,6 +128,7 @@ export function standingInstructions(role: string, task: string, managerTarget: 
 export function buildWorkerArgs(input: {
   harness: Harness;
   profile: LaunchProfile;
+  profileName?: string;
   workerId: string;
   cwd: string;
   role: string;
@@ -132,9 +139,12 @@ export function buildWorkerArgs(input: {
   managerTarget: string;
   permissionProfile?: PermissionProfile;
 }): string[] {
-  const { harness, profile, workerId, cwd, role, task, model, effort, instructions, managerTarget, permissionProfile } = input;
+  const { harness, profile, profileName, workerId, cwd, role, task, model, effort, instructions, managerTarget, permissionProfile } = input;
   let args = [...(profile.args ?? [])];
-  const mandate = standingInstructions(role, task, managerTarget, instructions);
+  const communicationInstructions = harness === "claude" && profileName === "claude-minimal"
+    ? "Wait for work through Agent Intercom. Minimal Claude mode does not expose MCP tools such as intercom_send; put progress, blockers, status, and completion evidence in the final response to each wake so the bridge can relay it to the manager. Do not claim that you called an unavailable Intercom tool."
+    : undefined;
+  const mandate = standingInstructions(role, task, managerTarget, instructions, communicationInstructions);
 
   if (harness === "pi") {
     if (permissionProfile) args = applyPiPermissionArgs(args, permissionProfile);
