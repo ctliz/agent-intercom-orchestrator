@@ -477,7 +477,11 @@ export function buildPermissionUnitProperties(
       "PrivateDevices=yes",
       "ProtectSystem=strict",
       "ProtectHome=read-only",
-      "ProtectKernelTunables=yes",
+      // ProtectKernelTunables creates locked procfs submounts. Those prevent the
+      // supervisor and nested harness sandboxes from mounting a private procfs
+      // after unsharing PIDs (bubblewrap reports EPERM / "Mount too revealing").
+      // PrivateUsers=self, NoNewPrivileges, an empty capability bounding set,
+      // and the read-only host mount boundary still prevent host tunable writes.
       "ProtectKernelModules=yes",
       "ProtectControlGroups=yes",
       "RestrictSUIDSGID=yes",

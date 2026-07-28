@@ -374,7 +374,7 @@ Start experimental live TUI wake mode:
 cci --tui --name worker-a --id worker-a --cwd /path/to/repo
 ```
 
-Without `--safe`, `cci` defaults to `--dangerously-skip-permissions` so a headless worker is not blocked by permission prompts. Use that only when full machine access is intentional.
+Without `--safe`, `cci` defaults to `--dangerously-skip-permissions` so a headless worker is not blocked by permission prompts. Use that only when full machine access is intentional. The orchestrator exposes this deliberately as the `claude-trusted` launch profile; pair it with `permissionProfile: "trusted"`. Restricted Claude workers continue to use `claude-safe` or `claude-minimal`; the orchestrator supplies non-interactive Claude permissions inside the outer hardened boundary so read and shell calls do not stall on headless prompts. `claude-minimal` intentionally removes MCP tools, so it reports progress and completion in the final response to each wake rather than calling `intercom_send`; use `claude-safe` when in-turn Intercom tools are required.
 
 ## Why aliases are a good idea
 
@@ -531,6 +531,23 @@ agent_fleet({
   effort: "max",
   cwd: "/path/to/worktree",
   task: "Try to disprove the builder's completion claim."
+})
+```
+
+For intentionally broad host access, select both trusted layers explicitly so the headless worker does not wait on Claude Code permission prompts:
+
+```typescript
+agent_fleet({
+  action: "spawn",
+  harness: "claude",
+  profile: "claude-trusted",
+  permissionProfile: "trusted",
+  id: "claude-trusted-builder",
+  role: "builder",
+  model: "opus",
+  effort: "max",
+  cwd: "/path/to/worktree",
+  task: "Implement the trusted maintenance task and report evidence."
 })
 ```
 

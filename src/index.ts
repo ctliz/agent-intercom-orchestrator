@@ -991,12 +991,12 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     }
     await store.mutate((state) => reserveWorkerRecord(state, worker));
     try {
-      const runtime = permissionProfile.hardened ? await prepareWorkerRuntime(harness, id, agentDir) : undefined;
+      const runtime = permissionProfile.hardened ? await prepareWorkerRuntime(harness, id, agentDir, { profileName }) : undefined;
       if (persistentOpenCode) {
         await rm(worker.healthPath!, { force: true });
         if (params.fresh) await rm(worker.runtimeStatePath!, { force: true });
       }
-      const harnessArgs = buildWorkerArgs({ harness, profile, workerId: id, cwd, role, task, model, effort, instructions, managerTarget: worker.managerSessionId, permissionProfile });
+      const harnessArgs = buildWorkerArgs({ harness, profile, profileName, workerId: id, cwd, role, task, model, effort, instructions, managerTarget: worker.managerSessionId, permissionProfile });
       if (runtime?.extraArgs.length) harnessArgs.push(...runtime.extraArgs);
       const gitMetadataPaths = permissionProfile.git === "read-only" ? await discoverGitMetadataPaths(runner, cwd) : [];
       if (harness === "pi" && permissionProfile.hardened) {

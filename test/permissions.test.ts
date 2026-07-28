@@ -47,6 +47,7 @@ test("permission profiles compile to Pi tool allowlists and systemd properties",
   assert.ok(reviewerProperties.includes("NoNewPrivileges=yes"));
   assert.ok(reviewerProperties.includes("ProtectSystem=strict"));
   assert.ok(reviewerProperties.includes("ProtectHome=read-only"));
+  assert.equal(reviewerProperties.includes("ProtectKernelTunables=yes"), false);
   const currentUid = process.getuid?.();
   if (Number.isInteger(currentUid)) assert.ok(reviewerProperties.includes(`TemporaryFileSystem=/run/user/${currentUid}:rw`));
   assert.ok(reviewerProperties.includes('ReadOnlyPaths="/repo with spaces"'));
@@ -1274,7 +1275,7 @@ test("hardened systemd profile cannot delegate an unsandboxed unit to the user m
   }
 });
 
-test("nested bwrap and unshare sandboxes inherit the outer filesystem boundary", (t) => {
+test("supervisor and nested harness sandboxes can mount private procfs while inheriting the outer boundary", (t) => {
   if (!supportsHardenedUserUnits()) {
     t.skip("systemd 257+ hardened user namespaces are unavailable");
     return;
@@ -1290,11 +1291,16 @@ test("nested bwrap and unshare sandboxes inherit the outer filesystem boundary",
   const outside = join(root, "outside-proof");
   mkdirSync(workspace);
   const properties = buildPermissionUnitProperties(builder, workspace);
+  const nestedScript = `! touch ${JSON.stringify(outside)} && touch bwrap-ok`;
   const result = spawnSync("systemd-run", [
     "--user", "--wait", "--pipe", `--working-directory=${workspace}`,
     ...properties.map((property) => `--property=${property}`),
-    "/bin/sh", "-c",
-    `bwrap --ro-bind / / --bind ${JSON.stringify(workspace)} ${JSON.stringify(workspace)} --dev /dev --proc /proc /bin/sh -c '! touch ${JSON.stringify(outside)} && touch bwrap-ok' && unshare -Ur /bin/sh -c '! touch ${JSON.stringify(outside)} && touch unshare-ok'`,
+    "/usr/bin/bwrap",
+    "--bind", "/", "/",
+    "--dev-bind", "/dev", "/dev",
+    "--unshare-pid", "--proc", "/proc", "--die-with-parent",
+    "--", "/bin/sh", "-c",
+    `! test -w /proc/sys/kernel/hostname && ! test -w /proc/sysrq-trigger && bwrap --ro-bind / / --bind ${JSON.stringify(workspace)} ${JSON.stringify(workspace)} --dev /dev --proc /proc /bin/sh -c ${JSON.stringify(nestedScript)} && unshare -Ur /bin/sh -c '! touch ${JSON.stringify(outside)} && touch unshare-ok'`,
   ], { encoding: "utf8", timeout: 15_000 });
   try {
     assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);

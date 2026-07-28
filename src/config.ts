@@ -68,7 +68,15 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
       args: ["--safe"],
       mode: "persistent",
       maxRuntime: "12h",
-      description: "Wakeable minimal Claude Code worker",
+      description: "Wakeable minimal Claude Code worker with final-response relay but no in-turn MCP tools",
+    },
+    "claude-trusted": {
+      harness: "claude",
+      command: preferredLocalWrapper("cci"),
+      args: [],
+      mode: "persistent",
+      maxRuntime: "12h",
+      description: "Non-prompting wakeable Claude Code worker for explicitly trusted host access",
     },
     "opencode-peer": {
       harness: "opencode",

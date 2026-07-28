@@ -111,6 +111,21 @@ agent_fleet({
   task: "Find defects or missing proof in the builder's completion claim."
 })
 
+// Broad host access must be doubly explicit. This profile omits --safe so a
+// headless Claude Code worker cannot stall on permission prompts.
+agent_fleet({
+  action: "spawn",
+  harness: "claude",
+  profile: "claude-trusted",
+  permissionProfile: "trusted",
+  id: "claude-trusted-maintenance",
+  role: "builder",
+  model: "opus",
+  effort: "max",
+  cwd: "/path/to/worktree",
+  task: "Perform the explicitly trusted maintenance task and report evidence."
+})
+
 agent_fleet({
   action: "spawn",
   harness: "opencode",
@@ -175,7 +190,7 @@ Routing configuration lives under `routing`: `preference` and `roles` order harn
 
 ## Current limitations
 
-- Pi, Codex, and Claude registration is not automatically awaited. Use the `intercomTarget` returned by spawn directly with `intercom_send`; if the first send reports that it is not connected yet, wait briefly and retry. Use `intercom_list` only as a readiness diagnostic or to discover peers not managed by this fleet session.
+- Pi, Codex, and Claude registration is not automatically awaited. Use the `intercomTarget` returned by spawn directly with `intercom_send`; if the first send reports that it is not connected yet, wait briefly and retry. Use `intercom_list` only as a readiness diagnostic or to discover peers not managed by this fleet session. `claude-minimal` intentionally removes MCP tools, so it relays the final response to each wake and cannot send in-turn progress through `intercom_send`; select `claude-safe` when that reporting channel is required.
 - A newly started manager must explicitly `adopt` live workers created by an older manager session before it can stop or renew them. Expired leases remain eligible for orchestrator-wide garbage collection.
 - `opencode-peer` owns a headless OpenCode server and initialized session for wakeable follow-up turns, and retries early server bind/startup exits on a fresh port. `opencode-run` remains available for cheaper one-shot assignments.
 - Manager heartbeat alone does not renew workers. Only manager-received worker Intercom traffic or explicit `renew` resets the idle budget; broker acknowledgements, process existence, and manager messages to the worker do not count. A hung or silent worker therefore reaches checkpoint, grace, and exact-unit cleanup automatically.
