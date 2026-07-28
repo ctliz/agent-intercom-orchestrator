@@ -1,6 +1,6 @@
-import { access, copyFile, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
+import { access, copyFile, lstat, mkdir, readFile, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join, relative } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import type { Harness } from "./types.ts";
 
 export interface WorkerRuntime {
@@ -73,9 +73,26 @@ const DISPOSABLE_RUNTIME_CACHE_PATHS = [
   ["home", ".local", "share", "pnpm", "store"],
 ] as const;
 
+async function assertContainedRuntimePath(base: string, path: string): Promise<void> {
+  const relativePath = relative(base, path);
+  if (!relativePath || isAbsolute(relativePath) || relativePath === ".." || relativePath.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
+    throw new Error(`Runtime cleanup path escapes its root: ${path}`);
+  }
+  const baseInfo = await lstat(base);
+  if (!baseInfo.isDirectory() || baseInfo.isSymbolicLink()) throw new Error(`Runtime cleanup root is not a real directory: ${base}`);
+  let current = base;
+  for (const part of relativePath.split(/[\\/]+/).slice(0, -1)) {
+    current = join(current, part);
+    const info = await lstat(current);
+    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`Runtime cleanup path has a symlink or non-directory ancestor: ${current}`);
+  }
+}
+
 export async function listOrphanWorkerRuntimeIds(agentDir: string, knownWorkerIds: Set<string>): Promise<string[]> {
   const root = join(agentDir, "intercom", "orchestrator", "worker-runtime");
   try {
+    const rootInfo = await lstat(root);
+    if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) return [];
     const entries = await readdir(root, { withFileTypes: true });
     return entries
       .filter((entry) => entry.isDirectory() && !knownWorkerIds.has(entry.name))
@@ -88,7 +105,14 @@ export async function listOrphanWorkerRuntimeIds(agentDir: string, knownWorkerId
 }
 
 export async function removeOrphanWorkerRuntime(workerId: string, agentDir: string): Promise<void> {
-  await rm(workerRuntimeRoot(workerId, agentDir), { recursive: true, force: true });
+  const base = join(agentDir, "intercom", "orchestrator", "worker-runtime");
+  const path = workerRuntimeRoot(workerId, agentDir);
+  try {
+    await assertContainedRuntimePath(base, path);
+    await rm(path, { recursive: true, force: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
 }
 
 export async function hasWorkerRuntimeCaches(workerId: string, agentDir: string): Promise<boolean> {
@@ -106,8 +130,15 @@ export async function hasWorkerRuntimeCaches(workerId: string, agentDir: string)
 
 export async function pruneWorkerRuntimeCaches(workerId: string, agentDir: string): Promise<void> {
   const root = workerRuntimeRoot(workerId, agentDir);
-  await Promise.all(DISPOSABLE_RUNTIME_CACHE_PATHS.map((parts) =>
-    rm(join(root, ...parts), { recursive: true, force: true })));
+  for (const parts of DISPOSABLE_RUNTIME_CACHE_PATHS) {
+    const path = join(root, ...parts);
+    try {
+      await assertContainedRuntimePath(root, path);
+      await rm(path, { recursive: true, force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
 }
 
 export async function prepareWorkerRuntime(

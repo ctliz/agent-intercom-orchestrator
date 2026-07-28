@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -475,8 +475,9 @@ test("cleanup prunes retention-expired terminal workers and preserves recent his
       worker("expired-clean", now - 2 * 24 * 60 * 60_000),
       worker("retained-recent", now - 2 * 60 * 60_000),
       worker("retained-dirty", now - 2 * 24 * 60 * 60_000, true),
+      worker("unsafe-cache", now - 2 * 60 * 60_000),
     ] }));
-    for (const id of ["expired-clean", "retained-recent", "retained-dirty"]) {
+    for (const id of ["expired-clean", "retained-recent", "retained-dirty", "unsafe-cache"]) {
       const root = join(orchestratorDir, "worker-runtime", id);
       await mkdir(root, { recursive: true });
       await writeFile(join(root, "state"), "retained\n");
@@ -484,9 +485,14 @@ test("cleanup prunes retention-expired terminal workers and preserves recent his
     const retainedCache = join(orchestratorDir, "worker-runtime", "retained-recent", "home", ".cache", "npm", "_npx");
     await mkdir(retainedCache, { recursive: true });
     await writeFile(join(retainedCache, "downloaded-tool"), "cache\n");
+    const externalHome = join(agentDir, "external-cache-home");
+    await mkdir(join(externalHome, ".cache", "npm"), { recursive: true });
+    await writeFile(join(externalHome, ".cache", "npm", "keep"), "outside\n");
+    await symlink(externalHome, join(orchestratorDir, "worker-runtime", "unsafe-cache", "home"), "dir");
     const orphanRuntime = join(orchestratorDir, "worker-runtime", "orphaned-run");
     await mkdir(orphanRuntime, { recursive: true });
     await writeFile(join(orphanRuntime, "state"), "orphan\n");
+    await utimes(orphanRuntime, new Date(now - 2 * 60 * 60_000), new Date(now - 2 * 60 * 60_000));
 
     const lifecycle = new Map<string, (...args: any[]) => any>();
     const tools = new Map<string, any>();
@@ -511,16 +517,21 @@ test("cleanup prunes retention-expired terminal workers and preserves recent his
     assert.deepEqual(preview.details.candidates.map((candidate: any) => [candidate.kind === "orphan" ? candidate.workerId : candidate.worker.id, candidate.kind]), [
       ["expired-clean", "prune"],
       ["retained-recent", "cache"],
+      ["unsafe-cache", "cache"],
       ["orphaned-run", "orphan"],
     ]);
-    await fleet.execute("cleanup-execute", { action: "cleanup", execute: true }, new AbortController().signal, () => {}, ctx);
+    const executed = await fleet.execute("cleanup-execute", { action: "cleanup", execute: true }, new AbortController().signal, () => {}, ctx);
+    assert.deepEqual(executed.details.errors.map(({ candidate, error }: any) => [candidate.worker.id, candidate.kind, /symlink/.test(error)]), [
+      ["unsafe-cache", "cache", true],
+    ]);
     const saved = JSON.parse(await readFile(join(orchestratorDir, "workers.json"), "utf8"));
-    assert.deepEqual(saved.workers.map((record: any) => record.id), ["retained-recent", "retained-dirty"]);
+    assert.deepEqual(saved.workers.map((record: any) => record.id), ["retained-recent", "retained-dirty", "unsafe-cache"]);
     await assert.rejects(access(join(orchestratorDir, "worker-runtime", "expired-clean")));
     await assert.rejects(access(join(orchestratorDir, "worker-runtime", "orphaned-run")));
     await assert.rejects(access(join(orchestratorDir, "worker-runtime", "retained-recent", "home", ".cache", "npm")));
     assert.equal(await readFile(join(orchestratorDir, "worker-runtime", "retained-recent", "state"), "utf8"), "retained\n");
     assert.equal(await readFile(join(orchestratorDir, "worker-runtime", "retained-dirty", "state"), "utf8"), "retained\n");
+    assert.equal(await readFile(join(externalHome, ".cache", "npm", "keep"), "utf8"), "outside\n");
     await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -586,7 +597,13 @@ test("forget requires explicit manager acknowledgment after a worker is stopped"
       events: { on() { return () => {}; }, emit() {} },
       registerTool(tool: any) { tools.set(tool.name, tool); },
       registerCommand() {},
-      async exec() { return commandResult(); },
+      async exec(command: string, args: string[]) {
+        if (command === "systemctl" && args.includes("show")) {
+          return { stdout: "LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\n", stderr: "Unit not found", code: 1, killed: false };
+        }
+        if (command === "systemd-cgls") return { stdout: "", stderr: "Unit not found", code: 1, killed: false };
+        return commandResult();
+      },
     };
     const ctx: any = {
       cwd: "/tmp", mode: "rpc", hasUI: false,
