@@ -118,6 +118,7 @@ export interface OrchestratorConfig {
   recentStoppedWorkerHours: number;
   stoppedWorkerRetentionDays: number;
   dirtyStoppedWorkerRetentionDays: number;
+  orphanRuntimeRetentionMinutes: number;
   pruneStoppedWorkersOnCleanup: boolean;
   pruneRuntimeCachesOnStop: boolean;
 }
@@ -162,9 +163,23 @@ export interface WorkerRecord {
   backendDetails?: unknown;
 }
 
+export interface RuntimeCleanupClaim {
+  token: string;
+  workerId: string;
+  runId?: string;
+  terminalAt?: number;
+  unit?: string;
+  action: "cache" | "full" | "orphan";
+  claimedAt: number;
+  ownerPid: number;
+  phase: "claimed" | "moving" | "moved" | "deleting";
+  pathIndexes: number[];
+}
+
 export interface WorkerStateFile {
   version: 1;
   workers: WorkerRecord[];
+  runtimeCleanupClaims?: RuntimeCleanupClaim[];
 }
 
 export interface UnitStatus {

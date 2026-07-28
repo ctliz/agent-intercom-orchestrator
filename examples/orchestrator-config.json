@@ -78,6 +78,7 @@
   "recentStoppedWorkerHours": 6,
   "stoppedWorkerRetentionDays": 7,
   "dirtyStoppedWorkerRetentionDays": 30,
+  "orphanRuntimeRetentionMinutes": 60,
   "pruneStoppedWorkersOnCleanup": true,
   "pruneRuntimeCachesOnStop": true,
   "profiles": {

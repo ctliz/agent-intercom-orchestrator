@@ -177,6 +177,7 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
   recentStoppedWorkerHours: 6,
   stoppedWorkerRetentionDays: 7,
   dirtyStoppedWorkerRetentionDays: 30,
+  orphanRuntimeRetentionMinutes: 60,
   pruneStoppedWorkersOnCleanup: true,
   pruneRuntimeCachesOnStop: true,
 };
@@ -472,6 +473,7 @@ export function mergeConfig(value: unknown): OrchestratorConfig {
     recentStoppedWorkerHours: positiveNumber(value.recentStoppedWorkerHours, DEFAULT_CONFIG.recentStoppedWorkerHours),
     stoppedWorkerRetentionDays: positiveNumber(value.stoppedWorkerRetentionDays, DEFAULT_CONFIG.stoppedWorkerRetentionDays),
     dirtyStoppedWorkerRetentionDays: positiveNumber(value.dirtyStoppedWorkerRetentionDays, DEFAULT_CONFIG.dirtyStoppedWorkerRetentionDays),
+    orphanRuntimeRetentionMinutes: positiveNumber(value.orphanRuntimeRetentionMinutes, DEFAULT_CONFIG.orphanRuntimeRetentionMinutes),
     pruneStoppedWorkersOnCleanup:
       typeof value.pruneStoppedWorkersOnCleanup === "boolean" ? value.pruneStoppedWorkersOnCleanup : DEFAULT_CONFIG.pruneStoppedWorkersOnCleanup,
     pruneRuntimeCachesOnStop:
@@ -645,6 +647,7 @@ export async function writeConfigDefaults(path: string, config: OrchestratorConf
     recentStoppedWorkerHours: config.recentStoppedWorkerHours,
     stoppedWorkerRetentionDays: config.stoppedWorkerRetentionDays,
     dirtyStoppedWorkerRetentionDays: config.dirtyStoppedWorkerRetentionDays,
+    orphanRuntimeRetentionMinutes: config.orphanRuntimeRetentionMinutes,
     pruneStoppedWorkersOnCleanup: config.pruneStoppedWorkersOnCleanup,
     pruneRuntimeCachesOnStop: config.pruneRuntimeCachesOnStop,
   });
