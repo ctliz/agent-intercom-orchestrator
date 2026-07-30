@@ -56,13 +56,11 @@ agent_fleet({ action: "list", all: true }) // explicit cross-manager diagnostics
 
 Normalized effort values are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; `capabilities` reports the subset supported by each harness.
 
-## Automatic routing and supervision
+## Automatic routing and lifecycle
 
 Omit `harness` and `profile` only when the routing policy should decide. Role preset harnesses remain leading preferences. `routing.profilePreferences` tries spawnable profiles in order, while a caller profile stays pinned. `requiresSubagents` uses the caller value when supplied and otherwise the per-role requirement. A configured `routing.preference` is the base order; legacy default harness/profile settings remain compatibility fallbacks. Pass an explicit harness or profile when the user has chosen one.
 
-Every explicit model chooses a direct harness through ordered model rules. Patterns are exact or use one trailing `*`; unmatched identifiers use the configured fallback harness, and literal provider stripping occurs only after harness selection. `explicitOnly` is authoritative—OpenCode is present in the default list but is not hardcoded there. Harness-specific role profile/model/effort settings never cross a harness fallback. Portable role instructions cross only when configured; caller instructions always survive.
-
-Follow the loaded supervision policy. By default it recommends a bounded Ralph loop for substantial iterative work and a bounded `return_on` watcher or timed check-in after spawn. Either recommendation may be disabled without weakening lifecycle enforcement.
+Every explicit model chooses a direct harness through ordered model rules. Patterns are exact or use one trailing `*`; unmatched identifiers use the configured fallback harness, and literal provider stripping occurs only after harness selection. OpenCode is always explicit-only for automatic routing; an explicit harness, profile, or matching explicit model may still select it. Harness-specific role profile/model/effort settings never cross a harness fallback. Portable role instructions cross only when configured; caller instructions always survive.
 
 ## Persistent Pi advisor
 
@@ -187,7 +185,7 @@ agent_fleet({ action: "forget", id: "codex-build-api", acknowledge: true })
 
 Configuration is stored at `~/.pi/agent/intercom/orchestrator/config.json` unless `PI_CODING_AGENT_DIR` changes the Pi agent directory. By default, manager-received worker Intercom traffic or explicit `renew` extends a lease, but never beyond 60 minutes since the last worker activity. The manager begins checkpoint requests 10 minutes before that idle deadline and retries every 5 minutes while available; cleanup waits another 15 minutes, then stops the exact owned cgroup. A persistent systemd user timer checks every 15 minutes even when no manager is running. Default `list` output includes 6 hours of terminal history; `history` exposes all retained records. Cleanup prunes clean terminal records after 7 days and dirty records after 30 days, deletes private runtime directories that remain unregistered for 60 minutes, and successful stops discard disposable package caches while retaining harness session state. Deletion is fenced by durable cleanup claims, rejects symlinked path ancestors, atomically quarantines selected paths, and fails closed unless same-ID systemd units and cgroups are verified absent. Configure this with `recentStoppedWorkerHours`, `stoppedWorkerRetentionDays`, `dirtyStoppedWorkerRetentionDays`, `orphanRuntimeRetentionMinutes`, `pruneStoppedWorkersOnCleanup`, and `pruneRuntimeCachesOnStop`. `stop` is always allowed; `forget` and bulk `prune` require explicit `acknowledge: true`.
 
-Routing configuration lives under `routing`: `preference` and `roles` order harnesses, `explicitOnly` controls automatic exclusions, `profilePreferences` orders launch-profile fallback, `roleRequirements` supplies capability defaults, `modelRouting` controls model inference and normalization (including an optional unmatched-model harness), `fallback` controls portable role instructions, and `capabilities` describes actual harness support. Existing defaults, role presets, and explicit spawn fields remain supported. Ralph and `return_on` recommendations live under top-level `supervision`.
+Routing configuration lives under `routing`: `preference` and `roles` order harnesses, `explicitOnly` controls automatic exclusions (with OpenCode always explicit-only), `profilePreferences` orders launch-profile fallback, `roleRequirements` supplies capability defaults, `modelRouting` controls model inference and normalization (including an optional unmatched-model harness), `fallback` controls portable role instructions, and `capabilities` describes actual harness support. Existing defaults, role presets, and explicit spawn fields remain supported.
 
 ## Current limitations
 

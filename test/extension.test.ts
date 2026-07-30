@@ -50,7 +50,8 @@ test("reconciliation retires completed one-shot units after preserving their com
     extension(pi);
     await lifecycle.get("session_start")?.({}, ctx);
     const saved = JSON.parse(await readFile(statePath, "utf8"));
-    assert.equal(saved.workers[0].state, "completed");
+    assert.equal(saved.workers[0].state, "stopped");
+    assert.equal(saved.workers[0].terminalOutcome, "completed");
     assert.equal(stopped, true);
     await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
   } finally {
@@ -170,8 +171,12 @@ test("manager-received worker Intercom metadata renews only the matching owned w
     extension(pi);
     await lifecycle.get("session_start")?.({}, ctx);
     pi.events.emit("agent-intercom:inbound-message", { from: { id: "activity-worker", name: "activity-worker" }, message: { id: "progress-1" } });
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    const saved = JSON.parse(await readFile(join(orchestratorDir, "workers.json"), "utf8"));
+    let saved: any;
+    for (let attempt = 0; attempt < 40; attempt += 1) {
+      saved = JSON.parse(await readFile(join(orchestratorDir, "workers.json"), "utf8"));
+      if (saved.workers[0].lastWorkerActivityAt > before) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     assert.ok(saved.workers[0].lastWorkerActivityAt > before);
     assert.equal(saved.workers[0].checkpointRequestedAt, undefined);
     assert.ok(saved.workers[0].leaseExpiresAt > before + 30 * 60_000);
@@ -674,7 +679,7 @@ test("extension registers discovery tools and interactive configuration commands
     assert.match(JSON.stringify(tools.get("agent_fleet").parameters), /versions/);
     assert.match(JSON.stringify(tools.get("agent_fleet").parameters), /update/);
     assert.match(JSON.stringify(tools.get("agent_fleet").parameters), /permissionProfile/);
-    for (const command of ["agents", "agents-new", "agents-config", "agents-models", "agents-cleanup"]) {
+    for (const command of ["boss", "agents", "agents-new", "agents-config", "agents-models", "agents-cleanup"]) {
       assert.ok(commands.has(command), `missing /${command}`);
     }
 
@@ -687,7 +692,7 @@ test("extension registers discovery tools and interactive configuration commands
     );
     assert.match(capabilities.content[0].text, /pi: modes=persistent/);
     assert.match(capabilities.content[0].text, /opencode: modes=persistent,one-shot/);
-    assert.match(capabilities.content[0].text, /permissions: builder-restricted,review-readonly,trusted/);
+    assert.match(capabilities.content[0].text, /permissions: builder-restricted,manager-restricted,review-readonly,trusted/);
     const permissions = await tools.get("agent_fleet").execute("permissions-test", { action: "permissions" }, new AbortController().signal, () => {}, ctx);
     assert.match(permissions.content[0].text, /review-readonly \[workspace=read-only git=read-only hardened\]/);
 
@@ -748,7 +753,6 @@ test("route previews automatic selection and explicit profile overrides without 
         roleRequirements: { nestedDefault: { requiresSubagents: true } },
         fallback: { preserveRoleInstructions: false },
       },
-      supervision: { recommendRalphForSubstantialWork: false, recommendReturnOnAfterSpawn: true },
     }));
     const lifecycle = new Map<string, (...args: any[]) => any>();
     const tools = new Map<string, any>();
@@ -804,8 +808,9 @@ test("route previews automatic selection and explicit profile overrides without 
 
     const configuredOpenCode = await fleet.execute("route-open", { action: "route", role: "open" }, new AbortController().signal, () => {}, ctx);
     assert.equal(configuredOpenCode.details.routing.automatic, true);
-    assert.equal(configuredOpenCode.details.routing.selected, "opencode");
-    assert.equal(configuredOpenCode.details.profile, "opencode-run");
+    assert.equal(configuredOpenCode.details.routing.selected, "pi");
+    assert.equal(configuredOpenCode.details.profile, "pi-peer");
+    assert.match(configuredOpenCode.content[0].text, /opencode \[excluded\].*explicit-only/);
 
     const nested = await fleet.execute("route-nested", { action: "route", role: "advisor", requiresSubagents: true }, new AbortController().signal, () => {}, ctx);
     assert.match(nested.content[0].text, /Recommended harness: codex/);
@@ -840,8 +845,7 @@ test("route previews automatic selection and explicit profile overrides without 
     }, new AbortController().signal, () => {}, ctx);
     assert.match(automaticSpawn.content[0].text, /Started routed-builder \[codex\/builder\]/);
     assert.match(automaticSpawn.content[0].text, /automatically selected codex/);
-    assert.doesNotMatch(automaticSpawn.content[0].text, /bounded Ralph loop/);
-    assert.match(automaticSpawn.content[0].text, /return_on/);
+    assert.doesNotMatch(automaticSpawn.content[0].text, /bounded Ralph loop|return_on|cannot wake the manager/i);
     assert.equal(automaticSpawn.details.routing.selected, "codex");
     assert.equal(launches, 1);
 
@@ -855,9 +859,8 @@ test("route previews automatic selection and explicit profile overrides without 
     assert.match(fallbackSpawn.details.routing.reasons.join(" "), /ignored harness-specific preset model and effort/);
     assert.equal(launches, 2);
 
-    assert.doesNotMatch(fleet.promptGuidelines.join("\n"), /Ralph loop/);
-    assert.match(fleet.promptGuidelines.join("\n"), /return_on/);
-    assert.match(fleet.promptGuidelines.join("\n"), /No harness is currently configured as explicit-only/);
+    assert.doesNotMatch(fleet.promptGuidelines.join("\n"), /Ralph loop|return_on|cannot wake the manager/i);
+    assert.match(fleet.promptGuidelines.join("\n"), /Harnesses configured as explicit-only: opencode/);
 
     await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
   } finally {

@@ -19,6 +19,7 @@ import {
   initializeWorkerLifecycle,
   leaseExpiry,
   normalizeModelForHarness,
+  rebindManagerOwner,
   recordWorkerActivity,
   workerIdleDeadline,
   stateFromUnit,
@@ -178,12 +179,14 @@ test("stop resets a failed unit even when descendants survive escalation", async
   assert.ok(calls.some((call) => call.command === "systemctl" && call.args.includes("reset-failed")));
 });
 
-test("unit status maps to normalized worker states", () => {
-  assert.equal(stateFromUnit({ exists: true, activeState: "active", subState: "running" }, "provisioning"), "running");
-  assert.equal(stateFromUnit({ exists: true, activeState: "active", subState: "exited", result: "success", execMainStatus: 0 }, "running"), "completed");
-  assert.equal(stateFromUnit({ exists: true, activeState: "failed", result: "exit-code" }, "running"), "failed");
-  assert.equal(stateFromUnit({ exists: true, activeState: "inactive", execMainStatus: 0 }, "running"), "completed");
-  assert.equal(stateFromUnit({ exists: false }, "running"), "lost");
+test("unit status maps to canonical worker states without inferring readiness", () => {
+  assert.equal(stateFromUnit({ exists: true, activeState: "active", subState: "running" }, "provisioning"), "registering");
+  assert.equal(stateFromUnit({ exists: true, activeState: "active", subState: "running" }, "working"), "working");
+  assert.equal(stateFromUnit({ exists: true, activeState: "active", subState: "exited", result: "success", execMainStatus: 0 }, "registering"), "stopped");
+  assert.equal(stateFromUnit({ exists: true, activeState: "failed", result: "exit-code" }, "registering"), "failed");
+  assert.equal(stateFromUnit({ exists: true, activeState: "inactive", execMainStatus: 0 }, "registering"), "stopped");
+  assert.equal(stateFromUnit({ exists: true, activeState: "deactivating" }, "working"), "working");
+  assert.equal(stateFromUnit({ exists: false }, "registering"), "lost");
   assert.equal(stateFromUnit({ exists: false }, "completed"), "completed");
   assert.equal(stateFromUnit({ exists: false }, "stopped"), "stopped");
 });
@@ -233,6 +236,20 @@ test("heartbeat renewal is activity-gated, capped at the idle deadline, and requ
   assert.equal(running.checkpointAttemptCount, 2);
   const expired = renewObservedWorkerLeases(state, [structuredClone(running)], "session-a", DEFAULT_CONFIG, workerIdleDeadline(DEFAULT_CONFIG, createdAt) + 1);
   assert.deepEqual(expired.renewed, []);
+});
+
+test("manager ownership rebind changes exact context and advances the binding epoch", () => {
+  const worker = createSystemdRecord({
+    id: "owner-worker", runId: "owner-run", harness: "codex", role: "builder", task: "test", cwd: "/tmp",
+    profile: "codex-safe", unit: "owner.service", managerSessionId: "pi-manager", config: DEFAULT_CONFIG, now: 1_000,
+  });
+  worker.managerOwner = { context: "pi", principalId: "pi-manager", sessionId: "pi-manager", bindingEpoch: 0 };
+  assert.deepEqual(rebindManagerOwner(worker, "opencode", "open-manager"), {
+    context: "opencode", principalId: "open-manager", sessionId: "open-manager", bindingEpoch: 1,
+  });
+  assert.deepEqual(rebindManagerOwner({ ...worker, managerOwner: { context: "opencode", principalId: "open-manager", sessionId: "open-manager", bindingEpoch: 1 } }, "opencode", "open-manager"), {
+    context: "opencode", principalId: "open-manager", sessionId: "open-manager", bindingEpoch: 1,
+  });
 });
 
 test("manager-received worker Intercom activity resets the idle budget but manager sends cannot", () => {
@@ -298,6 +315,12 @@ test("expired cleanup snapshot is fenced by renewal or adoption activity", () =>
   worker.state = "running";
   const expectedDeadline = worker.checkpointDeadlineAt!;
   assert.equal(cleanupSnapshotStillEligible(worker, expectedDeadline, expectedDeadline), true);
+  worker.state = "blocked";
+  worker.stateReason = "stop_in_progress";
+  assert.equal(cleanupSnapshotStillEligible(worker, expectedDeadline, expectedDeadline), false);
+  assert.equal(cleanupReason(worker, expectedDeadline), undefined);
+  worker.state = "running";
+  worker.stateReason = undefined;
   recordWorkerActivity(worker, DEFAULT_CONFIG, expectedDeadline + 1);
   worker.managerSessionId = "new-manager";
   assert.equal(cleanupSnapshotStillEligible(worker, expectedDeadline, expectedDeadline + 2), false);
@@ -366,7 +389,7 @@ test("configuration merges profiles, defaults, and role presets without dropping
   assert.equal(config.cleanupTimerMinutes, 10);
   assert.equal(config.cleanupTimerEnabled, false);
   assert.deepEqual(config.routing.preference, ["claude", "pi", "codex", "opencode"]);
-  assert.deepEqual(config.routing.explicitOnly, []);
+  assert.deepEqual(config.routing.explicitOnly, ["opencode"]);
   assert.deepEqual(config.routing.roles.auditor, ["claude", "pi"]);
   assert.deepEqual(config.routing.profilePreferences.codex, ["codex-minimal", "codex-safe"]);
   assert.equal(config.routing.roleRequirements.auditor.requiresSubagents, true);
@@ -375,8 +398,7 @@ test("configuration merges profiles, defaults, and role presets without dropping
   assert.deepEqual(config.routing.modelRouting.stripPrefixes.claude, ["internal/"]);
   assert.equal(config.routing.fallback.preserveRoleInstructions, false);
   assert.deepEqual(config.routing.capabilities.requiresSubagents, ["claude"]);
-  assert.equal(config.supervision.recommendRalphForSubstantialWork, false);
-  assert.equal(config.supervision.recommendReturnOnAfterSpawn, true);
+  assert.deepEqual(config.supervision, {});
   assert.equal(config.defaultModels.pi, "claude/claude-sonnet-5");
   assert.equal(config.defaultEfforts.pi, "max");
   assert.equal(config.roles.auditor.harness, "pi");
@@ -480,8 +502,6 @@ test("default configuration writes preserve custom profiles without serializing 
     draft.routing.modelRouting.stripPrefixes.pi = ["google/"];
     draft.routing.fallback.preserveRoleInstructions = false;
     draft.routing.capabilities.requiresSubagents = ["codex"];
-    draft.supervision.recommendRalphForSubstantialWork = false;
-    draft.supervision.recommendReturnOnAfterSpawn = false;
     await writeConfigDefaults(path, draft);
     const raw = JSON.parse(await readFile(path, "utf8"));
     assert.equal(raw.defaultModels.pi, "codex/gpt-5.6-sol");
@@ -504,13 +524,13 @@ test("default configuration writes preserve custom profiles without serializing 
     assert.deepEqual(raw.routing.capabilities.requiresSubagents, ["codex"]);
     assert.equal(raw.routing.roles.advisor, undefined);
     assert.deepEqual(raw.routing.futurePolicy, { keep: true });
-    assert.equal(raw.supervision.recommendRalphForSubstantialWork, false);
-    assert.equal(raw.supervision.recommendReturnOnAfterSpawn, false);
+    assert.equal(raw.supervision.recommendRalphForSubstantialWork, undefined);
+    assert.equal(raw.supervision.recommendReturnOnAfterSpawn, undefined);
     assert.equal(raw.supervision.futureGuidance, "keep");
     const loaded = await readConfig(path);
     assert.deepEqual(loaded.routing.modelRouting.rules, draft.routing.modelRouting.rules);
     assert.deepEqual(loaded.routing.profilePreferences.codex, draft.routing.profilePreferences.codex);
-    assert.equal(loaded.supervision.recommendReturnOnAfterSpawn, false);
+    assert.deepEqual(loaded.supervision, {});
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -557,9 +577,17 @@ test("forget keeps the worker id reserved until its runtime deletion finishes", 
   const store = new WorkerStore(join(root, "workers.json"));
   const oldWorker: WorkerRecord = {
     id: "same-worker", runId: "old-run", harness: "pi", backend: "systemd", role: "builder", task: "old", cwd: "/tmp",
-    state: "stopping", owned: true, managerSessionId: "manager", createdAt: 1, updatedAt: 1, leaseExpiresAt: Date.now() + 60_000,
+    state: "stopped", owned: true, managerSessionId: "manager", createdAt: 1, updatedAt: 1, leaseExpiresAt: Date.now() + 60_000,
   };
-  const newWorker: WorkerRecord = { ...oldWorker, runId: "new-run", task: "new", state: "provisioning" };
+  const newWorker: WorkerRecord = {
+    ...oldWorker,
+    runId: "new-run",
+    workerIncarnationId: "new-run",
+    workerGeneration: 1,
+    managerOwner: { context: "pi", principalId: "manager", sessionId: "manager", bindingEpoch: 1 },
+    task: "new",
+    state: "provisioning",
+  };
   const runtimeRoot = workerRuntimeRoot(oldWorker.id, agentDir);
   await mkdir(runtimeRoot, { recursive: true });
   await writeFile(join(runtimeRoot, "old-state"), "old\n");
@@ -575,7 +603,7 @@ test("forget keeps the worker id reserved until its runtime deletion finishes", 
       await rm(path, { recursive: true, force: true });
     });
     await entered;
-    await assert.rejects(store.mutate((state) => reserveWorkerRecord(state, newWorker)), /already stopping/);
+    await assert.rejects(store.mutate((state) => reserveWorkerRecord(state, newWorker)), /runtime cleanup in progress/);
     assert.equal(await readFile(join(runtimeRoot, "old-state"), "utf8"), "old\n");
     releaseDelete();
     await forgetting;

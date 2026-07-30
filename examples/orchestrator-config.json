@@ -22,6 +22,14 @@
     "preference": ["pi", "codex", "claude", "opencode"],
     "explicitOnly": ["opencode"],
     "roles": {
+      "manager": ["pi"],
+      "worker": ["codex"],
+      "scout": ["codex"],
+      "scout-medium": ["codex"],
+      "adversary": ["claude"],
+      "council-systems": ["codex"],
+      "council-critical": ["claude"],
+      "council-alternative": ["claude"],
       "advisor": ["pi", "codex", "claude"],
       "researcher": ["pi", "codex", "claude"],
       "reviewer": ["pi", "codex", "claude"],
@@ -40,7 +48,7 @@
       "rules": [
         {
           "harness": "codex",
-          "patterns": ["codex/*", "openai/*", "codex-*", "gpt-*", "o1", "o1-*", "o2", "o2-*", "o3", "o3-*", "o4", "o4-*", "o5", "o5-*", "o6", "o6-*", "o7", "o7-*", "o8", "o8-*", "o9", "o9-*"]
+          "patterns": ["codex/*", "openai/*", "codex-*", "gpt-*"]
         },
         {
           "harness": "claude",
@@ -58,10 +66,6 @@
     "capabilities": {
       "requiresSubagents": ["codex", "claude"]
     }
-  },
-  "supervision": {
-    "recommendRalphForSubstantialWork": true,
-    "recommendReturnOnAfterSpawn": true
   },
   "leaseMinutes": 30,
   "idleTimeoutMinutes": 60,
@@ -92,7 +96,7 @@
     "codex-safe": {
       "harness": "codex",
       "command": "coi",
-      "args": ["--no-tui", "--sandbox", "workspace-write", "--ask-for-approval", "on-request"],
+      "args": ["--no-tui"],
       "mode": "persistent",
       "maxRuntime": "12h"
     },
@@ -150,12 +154,65 @@
       "git": "read-only",
       "hardened": true
     },
+    "manager-restricted": {
+      "workspace": "read-only",
+      "git": "read-only",
+      "hardened": true
+    },
     "trusted": {
       "workspace": "host",
       "git": "full"
     }
   },
   "roles": {
+    "manager": {
+      "harness": "pi",
+      "permissionProfile": "manager-restricted",
+      "model": "codex/gpt-5.6-sol",
+      "effort": "high"
+    },
+    "worker": {
+      "harness": "codex",
+      "permissionProfile": "builder-restricted",
+      "model": "gpt-5.6-sol",
+      "effort": "medium"
+    },
+    "scout": {
+      "harness": "codex",
+      "permissionProfile": "review-readonly",
+      "model": "gpt-5.6-sol",
+      "effort": "low"
+    },
+    "scout-medium": {
+      "harness": "codex",
+      "permissionProfile": "review-readonly",
+      "model": "gpt-5.6-sol",
+      "effort": "medium"
+    },
+    "adversary": {
+      "harness": "claude",
+      "permissionProfile": "review-readonly",
+      "model": "claude-opus-5",
+      "effort": "xhigh"
+    },
+    "council-systems": {
+      "harness": "codex",
+      "permissionProfile": "review-readonly",
+      "model": "gpt-5.6-sol",
+      "effort": "xhigh"
+    },
+    "council-critical": {
+      "harness": "claude",
+      "permissionProfile": "review-readonly",
+      "model": "claude-opus-5",
+      "effort": "xhigh"
+    },
+    "council-alternative": {
+      "harness": "claude",
+      "permissionProfile": "review-readonly",
+      "model": "claude-fable-5",
+      "effort": "medium"
+    },
     "advisor": {
       "harness": "pi",
       "profile": "pi-peer",

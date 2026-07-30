@@ -10,11 +10,12 @@ import {
   executeCleanupCandidatesIsolated,
   recoverRuntimeCleanupClaims,
   terminalCachePaths,
+  terminalWorkerAt,
 } from "../src/runtime-cleanup.ts";
 import { workerRuntimeRoot } from "../src/runtime.ts";
 import { WorkerStore } from "../src/store.ts";
 import { verifyUnitAbsentAndEmpty } from "../src/systemd.ts";
-import type { CommandRunner, RuntimeCleanupClaim, WorkerRecord, WorkerStateFile } from "../src/types.ts";
+import type { CommandRunner, RuntimeCleanupClaim, WorkerRecord } from "../src/types.ts";
 import { reserveWorkerRecord } from "../src/index.ts";
 
 function worker(overrides: Partial<WorkerRecord> = {}): WorkerRecord {
@@ -48,6 +49,10 @@ const absentRunner: CommandRunner = {
     return { stdout: "", stderr: "", code: 0 };
   },
 };
+
+test("migration-pending workers are never eligible for terminal runtime cleanup", () => {
+  assert.equal(terminalWorkerAt(worker({ state: "migration_pending", stoppedAt: undefined, updatedAt: 42 })), undefined);
+});
 
 test("orphan runtime retention defaults and overrides are configurable", () => {
   assert.equal(DEFAULT_CONFIG.orphanRuntimeRetentionMinutes, 60);
@@ -406,26 +411,24 @@ test("a fresh cleanup claim blocks same-id reservation only during verification 
 });
 
 test("a workers.json commit failure after quarantine rename restores the full runtime", async () => {
-  class FailingCommitStore extends WorkerStore {
-    failMovedCommit = false;
-    override async write(state: WorkerStateFile): Promise<void> {
-      if (this.failMovedCommit && state.runtimeCleanupClaims?.some((claim) => claim.phase === "moved")) {
-        this.failMovedCommit = false;
-        throw new Error("injected state commit failure");
-      }
-      await super.write(state);
-    }
-  }
   const root = await mkdtemp(join(tmpdir(), "agent-intercom-commit-recovery-"));
   const agentDir = join(root, "agent");
-  const store = new FailingCommitStore(join(root, "workers.json"));
+  let armed = false;
+  let cleanupCommits = 0;
+  const store = new WorkerStore(join(root, "workers.json"), {
+    faultInjector(point) {
+      if (!armed || point !== "after_temp_write") return;
+      cleanupCommits += 1;
+      if (cleanupCommits === 3) throw new Error("injected state commit failure");
+    },
+  });
   const record = worker();
   const runtime = workerRuntimeRoot(record.id, agentDir);
   try {
     await mkdir(runtime, { recursive: true });
     await writeFile(join(runtime, "primary-state"), "preserve me");
     await store.write({ version: 1, workers: [record] });
-    store.failMovedCommit = true;
+    armed = true;
     await assert.rejects(deleteTerminalRuntimeSafely({
       store,
       runner: absentRunner,

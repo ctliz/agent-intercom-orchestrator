@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { DEFAULT_CONFIG, mergeConfig, readConfig, writeConfig, writeConfigDefaults } from "../src/config.ts";
+import { configMigrationDiagnostics, DEFAULT_CONFIG, mergeConfig, readConfig, readConfigWithDiagnostics, writeConfig, writeConfigDefaults } from "../src/config.ts";
 
 test("policy config merges partial values without dropping typed defaults", () => {
   assert.equal(mergeConfig({}).routing.modelRouting.unmatchedHarness, null);
@@ -14,14 +14,14 @@ test("policy config merges partial values without dropping typed defaults", () =
       roleRequirements: { builder: { requiresSubagents: true }, invalid: { requiresSubagents: "yes" } },
       modelRouting: {
         unmatchedHarness: "opencode",
-        rules: [{ harness: "codex", patterns: ["private/*", "private/*", "bad*pattern"] }],
+        rules: [{ harness: "codex", patterns: ["private/*", "private/*", "bad*pattern", "o2", "o9-*"] }],
         stripPrefixes: { codex: ["private/", "bad*"] },
       },
       fallback: { preserveRoleInstructions: false },
     },
-    supervision: { recommendReturnOnAfterSpawn: false },
+    supervision: { futureGuidance: "ignored by normalized policy" },
   });
-  assert.deepEqual(config.routing.explicitOnly, []);
+  assert.deepEqual(config.routing.explicitOnly, ["opencode"]);
   assert.deepEqual(config.routing.profilePreferences.codex, ["custom", "codex-safe"]);
   assert.deepEqual(config.routing.roleRequirements.builder, { requiresSubagents: true });
   assert.deepEqual(config.routing.roleRequirements.invalid, {});
@@ -30,8 +30,7 @@ test("policy config merges partial values without dropping typed defaults", () =
   assert.deepEqual(config.routing.modelRouting.rules, [{ harness: "codex", patterns: ["private/*"] }]);
   assert.deepEqual(config.routing.modelRouting.stripPrefixes.codex, ["private/"]);
   assert.equal(config.routing.fallback.preserveRoleInstructions, false);
-  assert.equal(config.supervision.recommendRalphForSubstantialWork, true);
-  assert.equal(config.supervision.recommendReturnOnAfterSpawn, false);
+  assert.deepEqual(config.supervision, {});
 });
 
 test("legacy defaultProfiles migrate into ordered fallback without overriding explicit new policy", () => {
@@ -67,15 +66,13 @@ test("default-policy writes preserve unknown config and round-trip policy deltas
     config.routing.modelRouting.rules = [{ harness: "pi", patterns: ["google/*"] }];
     config.routing.modelRouting.stripPrefixes.pi = ["google/"];
     config.routing.fallback.preserveRoleInstructions = false;
-    config.supervision.recommendRalphForSubstantialWork = false;
-    config.supervision.recommendReturnOnAfterSpawn = false;
     await writeConfigDefaults(path, config);
 
     const raw = JSON.parse(await readFile(path, "utf8"));
     assert.equal(raw.futureTopLevel, true);
     assert.deepEqual(raw.routing.futureRouting, { keep: true });
     assert.deepEqual(raw.routing.profilePreferences.futureHarness, ["keep"]);
-    assert.deepEqual(raw.routing.explicitOnly, []);
+    assert.equal(Object.hasOwn(raw.routing, "explicitOnly"), false);
     assert.deepEqual(raw.routing.profilePreferences.codex, ["codex-minimal", "codex-safe"]);
     assert.deepEqual(raw.routing.roleRequirements.builder, { requiresSubagents: true });
     assert.equal(raw.routing.modelRouting.unmatchedHarness, "opencode");
@@ -87,8 +84,8 @@ test("default-policy writes preserve unknown config and round-trip policy deltas
     assert.equal(raw.routing.fallback.futureFallback, true);
     assert.equal(raw.routing.capabilities.futureCapability, true);
     assert.equal(raw.supervision.futureGuidance, "keep");
-    assert.equal(raw.supervision.recommendRalphForSubstantialWork, false);
-    assert.equal(raw.supervision.recommendReturnOnAfterSpawn, false);
+    assert.equal(Object.hasOwn(raw.supervision, "recommendRalphForSubstantialWork"), false);
+    assert.equal(Object.hasOwn(raw.supervision, "recommendReturnOnAfterSpawn"), false);
     assert.equal((await stat(path)).mode & 0o777, 0o600);
 
     const roundTrip = await readConfig(path);
@@ -135,8 +132,82 @@ test("full config writes round-trip all policy fields", async () => {
       supervision: { recommendRalphForSubstantialWork: false, recommendReturnOnAfterSpawn: false },
     });
     await writeConfig(path, config);
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(Object.hasOwn(raw.supervision, "recommendRalphForSubstantialWork"), false);
+    assert.equal(Object.hasOwn(raw.supervision, "recommendReturnOnAfterSpawn"), false);
     assert.deepEqual(await readConfig(path), config);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("legacy supervision fields produce additive diagnostics and disappear on intentional save", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "orchestrator-supervision-migration-"));
+  const path = join(directory, "config.json");
+  try {
+    const legacy = {
+      futureTopLevel: { keep: true },
+      supervision: {
+        futureGuidance: "keep",
+        recommendRalphForSubstantialWork: true,
+        recommendReturnOnAfterSpawn: false,
+      },
+    };
+    assert.deepEqual(configMigrationDiagnostics(legacy).map((item) => item.path), [
+      "supervision.recommendRalphForSubstantialWork",
+      "supervision.recommendReturnOnAfterSpawn",
+    ]);
+    await writeFile(path, JSON.stringify(legacy));
+    const parsed = await readConfigWithDiagnostics(path);
+    assert.deepEqual(parsed.config.supervision, {});
+    assert.equal(parsed.diagnostics.length, 2);
+    await writeConfigDefaults(path, parsed.config);
+    const saved = JSON.parse(await readFile(path, "utf8"));
+    assert.deepEqual(saved.futureTopLevel, { keep: true });
+    assert.equal(saved.supervision.futureGuidance, "keep");
+    assert.equal(Object.hasOwn(saved.supervision, "recommendRalphForSubstantialWork"), false);
+    assert.equal(Object.hasOwn(saved.supervision, "recommendReturnOnAfterSpawn"), false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("config normalization reads only exact own data descriptors", () => {
+  let getterCalls = 0;
+  const inherited = { defaultHarness: "claude", recommendReturnOnAfterSpawn: true };
+  const raw = Object.create(inherited) as Record<string, unknown>;
+  Object.defineProperty(raw, "defaultHarness", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return "codex";
+    },
+  });
+  const supervision = Object.create(inherited) as Record<string, unknown>;
+  Object.defineProperty(supervision, "recommendRalphForSubstantialWork", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return true;
+    },
+  });
+  raw.supervision = supervision;
+  raw.roles = JSON.parse('{"__proto__":{"harness":"claude"},"safe":{"harness":"codex"}}');
+  const accessorArgs: string[] = [];
+  Object.defineProperty(accessorArgs, "0", {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return "--yolo";
+    },
+  });
+  raw.profiles = { accessor: { harness: "codex", command: "coi", args: accessorArgs } };
+
+  const result = mergeConfig(raw);
+  assert.equal(getterCalls, 0);
+  assert.equal(result.defaultHarness, DEFAULT_CONFIG.defaultHarness);
+  assert.equal(Object.hasOwn(result.roles, "__proto__"), false);
+  assert.equal(result.roles.safe.harness, "codex");
+  assert.equal(result.profiles.accessor.args, undefined);
+  assert.deepEqual(configMigrationDiagnostics(raw), []);
 });

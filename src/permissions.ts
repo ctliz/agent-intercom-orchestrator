@@ -25,6 +25,11 @@ export const SAFE_PI_BUILD_TOOLS = [
   "write",
 ];
 
+export const SAFE_PI_MANAGER_TOOLS = [
+  ...SAFE_PI_READ_TOOLS,
+  "bash",
+];
+
 const SENSITIVE_HOME_PATHS = [
   "~/.ssh",
   "~/.aws",
@@ -316,6 +321,15 @@ export const DEFAULT_PERMISSION_PROFILES: Record<string, PermissionProfile> = {
     inaccessiblePaths: SENSITIVE_HOME_PATHS,
     environment: SCRUBBED_CREDENTIAL_ENV,
   },
+  "manager-restricted": {
+    description: "The isolated integration worktree is read-only; only Controller-provisioned runtime and evidence paths may be writable",
+    workspace: "read-only",
+    git: "read-only",
+    hardened: true,
+    piTools: SAFE_PI_MANAGER_TOOLS,
+    inaccessiblePaths: SENSITIVE_HOME_PATHS,
+    environment: SCRUBBED_CREDENTIAL_ENV,
+  },
 };
 
 function expandHome(path: string): string {
@@ -555,6 +569,78 @@ export function buildPermissionEnvironment(profileName: string, profile: Permiss
 export function applyPiPermissionArgs(args: string[], profile: PermissionProfile): string[] {
   if (!profile.piTools?.length) return args;
   return [...args, "--tools", [...new Set(profile.piTools)].join(",")];
+}
+
+export type CodexNativeSandbox = "read-only" | "workspace-write" | "danger-full-access";
+
+const CODEX_SANDBOX_RANK: Record<CodexNativeSandbox, number> = {
+  "read-only": 0,
+  "workspace-write": 1,
+  "danger-full-access": 2,
+};
+
+function permissionSandbox(profile: PermissionProfile): CodexNativeSandbox {
+  if (profile.workspace === "read-only") return "read-only";
+  if (profile.workspace === "read-write") return "workspace-write";
+  return "danger-full-access";
+}
+
+function isCodexNativeSandbox(value: string): value is CodexNativeSandbox {
+  return Object.hasOwn(CODEX_SANDBOX_RANK, value);
+}
+
+/**
+ * Compile an Orc permission profile to the inner Codex sandbox. Existing launch
+ * args may tighten the result, but can never widen it. Shortcut bypass flags are
+ * replaced by the explicit native policy so hardened roles cannot inherit them.
+ */
+export function applyCodexPermissionArgs(args: string[], profile: PermissionProfile): string[] {
+  const retained: string[] = [];
+  const declared: CodexNativeSandbox[] = [];
+  const recordSandbox = (rawValue: string): void => {
+    const value = rawValue.trim().replace(/^(?:"([^"]*)"|'([^']*)')$/, "$1$2");
+    if (!isCodexNativeSandbox(value)) throw new Error(`Invalid Codex sandbox policy: ${value || "<missing>"}`);
+    declared.push(value);
+  };
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === "--sandbox" || argument === "-s") {
+      const value = args[index + 1];
+      if (!value) throw new Error("Invalid Codex sandbox policy: <missing>");
+      recordSandbox(value);
+      index += 1;
+      continue;
+    }
+    if (argument.startsWith("--sandbox=")) {
+      recordSandbox(argument.slice("--sandbox=".length));
+      continue;
+    }
+    if (argument === "-c" || argument === "--config") {
+      const value = args[index + 1];
+      if (value && /^sandbox_mode\s*=/.test(value)) {
+        recordSandbox(value.slice(value.indexOf("=") + 1));
+        index += 1;
+        continue;
+      }
+      retained.push(argument);
+      continue;
+    }
+    if (argument.startsWith("--config=sandbox_mode=")) {
+      recordSandbox(argument.slice("--config=sandbox_mode=".length));
+      continue;
+    }
+    if (argument === "--yolo" || argument.startsWith("--yolo=")
+      || argument === "--dangerously-bypass-approvals-and-sandbox"
+      || argument.startsWith("--dangerously-bypass-approvals-and-sandbox=")) {
+      declared.push("danger-full-access");
+      continue;
+    }
+    retained.push(argument);
+  }
+  const requested = permissionSandbox(profile);
+  const effective = [requested, ...declared].reduce((tightest, candidate) =>
+    CODEX_SANDBOX_RANK[candidate] < CODEX_SANDBOX_RANK[tightest] ? candidate : tightest);
+  return [...retained, "--sandbox", effective];
 }
 
 const SAFE_GIT_COMMANDS = new Set([

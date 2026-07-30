@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
-import { applyPiPermissionArgs } from "./permissions.ts";
+import { applyCodexPermissionArgs, applyPiPermissionArgs } from "./permissions.ts";
 export { normalizeModelForHarness } from "./routing.ts";
-import type { Effort, Harness, LaunchProfile, OrchestratorConfig, PermissionProfile, SupervisionConfig, UnitStatus, WorkerRecord, WorkerState } from "./types.ts";
+import type { Effort, Harness, LaunchProfile, ManagerOwnerBinding, ManagerOwnerKind, OrchestratorConfig, PermissionProfile, UnitStatus, WorkerRecord, WorkerState } from "./types.ts";
 
 export const EFFORT_LEVELS: Effort[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -57,6 +57,17 @@ export function initializeWorkerLifecycle(worker: WorkerRecord, config: Orchestr
   return changed;
 }
 
+export function rebindManagerOwner(worker: WorkerRecord, context: ManagerOwnerKind, sessionId: string): ManagerOwnerBinding {
+  const previous = worker.managerOwner;
+  const sameBinding = previous?.context === context && previous.principalId === sessionId && previous.sessionId === sessionId;
+  return {
+    context,
+    principalId: sessionId,
+    sessionId,
+    bindingEpoch: previous ? previous.bindingEpoch + (sameBinding ? 0 : 1) : 0,
+  } as ManagerOwnerBinding;
+}
+
 export function recordWorkerActivity(worker: WorkerRecord, config: OrchestratorConfig, now = Date.now()): void {
   worker.lastWorkerActivityAt = now;
   worker.idleDeadlineAt = workerIdleDeadline(config, now);
@@ -76,7 +87,7 @@ export function checkpointWarningAt(worker: WorkerRecord, config: OrchestratorCo
 export function cleanupSnapshotStillEligible(worker: WorkerRecord, expectedCheckpointDeadlineAt: number, now = Date.now()): boolean {
   return worker.owned
     && isLiveState(worker.state)
-    && worker.state !== "stopping"
+    && worker.stateReason !== "stop_in_progress"
     && worker.checkpointDeadlineAt === expectedCheckpointDeadlineAt
     && worker.checkpointDeadlineAt <= now;
 }
@@ -87,17 +98,6 @@ export function validateWorkerId(value: string): string {
     throw new Error("Worker id must be 2-80 characters using letters, numbers, dot, underscore, or dash.");
   }
   return id;
-}
-
-export function supervisionGuidance(supervision: SupervisionConfig): string[] {
-  return [
-    supervision.recommendRalphForSubstantialWork
-      ? "Use a bounded Ralph loop for substantial iterative delegated work that benefits from context resets; skip Ralph for quick one-shot work."
-      : undefined,
-    supervision.recommendReturnOnAfterSpawn
-      ? "After spawning coworkers, arrange a bounded return_on watcher or timed check-in for completion/timeout because Intercom delivery alone does not wake the manager."
-      : undefined,
-  ].filter((line): line is string => Boolean(line));
 }
 
 export function validateEffort(harness: Harness, effort: Effort | undefined): Effort | undefined {
@@ -153,6 +153,7 @@ export function buildWorkerArgs(input: {
     if (effort) args.push("--thinking", effort);
     args.push("--append-system-prompt", mandate);
   } else if (harness === "codex") {
+    if (permissionProfile) args = applyCodexPermissionArgs(args, permissionProfile);
     if (model) args.push("-c", `model=\"${model}\"`);
     if (effort) args.push("-c", `model_reasoning_effort=\"${effort}\"`);
     args.push("--name", workerId, "--id", workerId, "--cwd", cwd, "--instructions", mandate);
@@ -209,19 +210,25 @@ export function buildWorkerEnvironment(
   return ownedEnvironment;
 }
 
+export function isTerminalState(state: WorkerState): boolean {
+  return state === "failed" || state === "lost" || state === "stopped" || state === "completed";
+}
+
+export function isLiveState(state: WorkerState): boolean {
+  return state !== "migration_pending" && !isTerminalState(state);
+}
+
 export function stateFromUnit(status: UnitStatus, previous: WorkerState): WorkerState {
-  if (!status.exists) {
-    if (previous === "stopped" || previous === "completed") return previous;
-    return "lost";
+  if (!status.exists) return isTerminalState(previous) ? previous : "lost";
+  if (status.activeState === "active" && status.subState === "exited") return "stopped";
+  if (status.activeState === "active") {
+    if (["ready", "working", "waiting", "paused", "stalled", "blocked", "unreachable"].includes(previous)) return previous;
+    return "registering";
   }
-  if (status.activeState === "active" && status.subState === "exited") return "completed";
-  if (status.activeState === "active") return "running";
   if (status.activeState === "activating" || status.activeState === "reloading") return "provisioning";
   if (status.activeState === "failed" || (status.result && status.result !== "success")) return "failed";
-  if (status.activeState === "deactivating") return "stopping";
-  if (status.activeState === "inactive") {
-    return status.execMainStatus === 0 ? "completed" : previous === "stopped" ? "stopped" : "failed";
-  }
+  if (status.activeState === "deactivating") return previous;
+  if (status.activeState === "inactive") return status.execMainStatus === 0 ? "stopped" : previous === "stopped" ? "stopped" : "failed";
   return previous;
 }
 
@@ -270,21 +277,17 @@ export function createSystemdRecord(input: {
   };
 }
 
-export function isLiveState(state: WorkerState): boolean {
-  return state === "provisioning" || state === "running" || state === "idle" || state === "needs_attention" || state === "stopping";
-}
-
 export function terminalWorkerTimestamp(worker: WorkerRecord): number {
   return worker.stoppedAt ?? worker.updatedAt ?? worker.createdAt;
 }
 
 export function isRecentTerminalWorker(worker: WorkerRecord, config: OrchestratorConfig, now = Date.now()): boolean {
-  return !isLiveState(worker.state)
+  return isTerminalState(worker.state)
     && terminalWorkerTimestamp(worker) > now - config.recentStoppedWorkerHours * 60 * 60_000;
 }
 
 export function stoppedWorkerRetentionReason(worker: WorkerRecord, config: OrchestratorConfig, now = Date.now()): string | undefined {
-  if (!worker.owned || isLiveState(worker.state)) return undefined;
+  if (!worker.owned || !isTerminalState(worker.state)) return undefined;
   const retentionDays = worker.dirtyAtStop
     ? config.dirtyStoppedWorkerRetentionDays
     : config.stoppedWorkerRetentionDays;
@@ -294,7 +297,7 @@ export function stoppedWorkerRetentionReason(worker: WorkerRecord, config: Orche
 }
 
 export function cleanupReason(worker: WorkerRecord, now = Date.now()): string | undefined {
-  if (!worker.owned || !isLiveState(worker.state)) return undefined;
+  if (!worker.owned || !isLiveState(worker.state) || worker.stateReason === "stop_in_progress") return undefined;
   if (worker.checkpointDeadlineAt !== undefined && worker.checkpointDeadlineAt <= now) {
     return `idle checkpoint grace expired ${Math.ceil((now - worker.checkpointDeadlineAt) / 1000)}s ago`;
   }

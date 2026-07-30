@@ -8,6 +8,8 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DEFAULT_CONFIG, readConfig, resolveProfileCommand, writeConfigDefaults } from "./config.ts";
+import { assertDirectInteractiveBossCommand, bossAuthorityUnavailableMessage, parseBossCommand } from "./boss-command.ts";
+import { runBossProtectedPreflight } from "./boss-preflight.ts";
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
 import { buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy } from "./permissions.ts";
 import { resolvePiRuntime } from "./pi-runtime.ts";
@@ -29,11 +31,12 @@ import {
   initializeWorkerLifecycle,
   isLiveState,
   isRecentTerminalWorker,
+  isTerminalState,
   newRunId,
+  rebindManagerOwner,
   recordWorkerActivity,
   stateFromUnit,
   stoppedWorkerRetentionReason,
-  supervisionGuidance,
   validateEffort,
   validateWorkerId,
 } from "./workers.ts";
@@ -267,6 +270,12 @@ function formatTime(timestamp: number): string {
   return new Date(timestamp).toISOString();
 }
 
+function workerIncarnation(worker: WorkerRecord): string {
+  const incarnation = worker.workerIncarnationId ?? worker.runId;
+  if (!incarnation) throw new Error(`Worker ${worker.id} has no incarnation identity`);
+  return incarnation;
+}
+
 function formatWorker(worker: WorkerRecord): string {
   const target = worker.intercomTarget ? ` target=${worker.intercomTarget}` : "";
   const unit = worker.unit ? ` unit=${worker.unit}` : "";
@@ -309,10 +318,42 @@ export async function removeWorkerRuntimeAndRecord(
   agentDir: string,
   removeRuntime: (path: string) => Promise<void> = async (path) => rm(path, { recursive: true, force: true }),
 ): Promise<void> {
-  await removeFullRuntimePathsSafely(worker.id, agentDir, removeRuntime);
+  const incarnation = workerIncarnation(worker);
+  const token = `forget-${worker.id}-${randomUUID()}`;
   await store.mutate((state) => {
-    state.workers = state.workers.filter((candidate) => candidate.id !== worker.id || candidate.runId !== worker.runId);
+    const current = state.workers.find((candidate) => candidate.id === worker.id && workerIncarnation(candidate) === incarnation);
+    if (!current) throw new Error(`Worker ${worker.id} changed before runtime cleanup`);
+    if (state.runtimeCleanupClaims?.some((claim) => claim.workerId === worker.id)) {
+      throw new Error(`Worker ${worker.id} has runtime cleanup in progress`);
+    }
+    (state.runtimeCleanupClaims ??= []).push({
+      token,
+      workerId: worker.id,
+      runId: incarnation,
+      terminalAt: terminalWorkerAt(current),
+      unit: current.unit,
+      action: "full",
+      claimedAt: Date.now(),
+      ownerPid: process.pid,
+      phase: "deleting",
+      pathIndexes: [],
+    });
   });
+  try {
+    await removeFullRuntimePathsSafely(worker.id, agentDir, removeRuntime);
+    await store.mutate((state) => {
+      state.workers = state.workers.filter((candidate) => candidate.id !== worker.id || workerIncarnation(candidate) !== incarnation);
+      state.runtimeCleanupClaims = state.runtimeCleanupClaims?.filter((claim) => claim.token !== token);
+    });
+  } catch (error) {
+    await store.mutateConditionally((state) => {
+      const claim = state.runtimeCleanupClaims?.find((candidate) => candidate.token === token);
+      if (!claim) return { value: undefined, changed: false };
+      claim.ownerPid = 0;
+      return { value: undefined, changed: true };
+    }).catch(() => undefined);
+    throw error;
+  }
 }
 
 export type LeaseHeartbeatResult = {
@@ -328,13 +369,13 @@ export function renewObservedWorkerLeases(
   now = Date.now(),
 ): LeaseHeartbeatResult {
   const observedLiveRuns = new Set(observedWorkers
-    .filter((worker) => worker.managerSessionId === managerId && worker.owned && isLiveState(worker.state) && worker.state !== "stopping")
+    .filter((worker) => worker.managerSessionId === managerId && worker.owned && isLiveState(worker.state) && worker.stateReason !== "stop_in_progress")
     .map((worker) => `${worker.id}\u0000${worker.runId}`));
   const renewed: WorkerRecord[] = [];
   const checkpointRequested: WorkerRecord[] = [];
   for (const worker of state.workers) {
     if (!observedLiveRuns.has(`${worker.id}\u0000${worker.runId}`)) continue;
-    if (worker.managerSessionId !== managerId || !worker.owned || !isLiveState(worker.state) || worker.state === "stopping") continue;
+    if (worker.managerSessionId !== managerId || !worker.owned || !isLiveState(worker.state) || worker.stateReason === "stop_in_progress") continue;
     initializeWorkerLifecycle(worker, config, now);
     const lastActivity = worker.lastWorkerActivityAt!;
     const idleDeadline = worker.idleDeadlineAt!;
@@ -368,7 +409,7 @@ export function recordIntercomWorkerActivity(
   now = Date.now(),
 ): WorkerRecord | undefined {
   const worker = state.workers.find((candidate) => {
-    if (candidate.managerSessionId !== managerId || !candidate.owned || !isLiveState(candidate.state) || candidate.state === "stopping") return false;
+    if (candidate.managerSessionId !== managerId || !candidate.owned || !isLiveState(candidate.state) || candidate.stateReason === "stop_in_progress") return false;
     const expectedSenderId = candidate.intercomTarget ?? candidate.id;
     // Broker-assigned/stable sender IDs are authoritative. A display name must
     // never be able to keep another worker's lease alive.
@@ -453,7 +494,6 @@ function formatConfig(config: OrchestratorConfig, configPath: string): string {
   lines.push(`routing model rules: ${config.routing.modelRouting.rules.map((rule) => `${rule.harness}=[${rule.patterns.join(",")}]`).join("; ") || "(none)"}`);
   lines.push(`routing model prefix stripping: ${HARNESSES.map((harness) => `${harness}=[${config.routing.modelRouting.stripPrefixes[harness]?.join(",") ?? ""}]`).join(" ")}`);
   lines.push(`routing preserve role instructions on fallback: ${config.routing.fallback.preserveRoleInstructions}`);
-  lines.push(`supervision: ralph=${config.supervision.recommendRalphForSubstantialWork} return_on=${config.supervision.recommendReturnOnAfterSpawn}`);
   lines.push(`lease=${config.leaseMinutes}m idle=${config.idleTimeoutMinutes}m checkpoint-warning=${config.checkpointWarningMinutes}m retry=${config.checkpointRetryMinutes}m grace=${config.cleanupGraceMinutes}m heartbeat=${config.heartbeatSeconds}s max-runtime=${config.maxRuntime}`);
   lines.push(`cleanup: startup=${config.cleanupExpiredOnStart} shutdown=${config.cleanupOnShutdown} timer=${config.cleanupTimerEnabled ? `${config.cleanupTimerMinutes}m` : "disabled"} prune-stopped=${config.pruneStoppedWorkersOnCleanup}`);
   lines.push(`history: recent=${config.recentStoppedWorkerHours}h retention=${config.stoppedWorkerRetentionDays}d dirty-retention=${config.dirtyStoppedWorkerRetentionDays}d orphan-runtime-retention=${config.orphanRuntimeRetentionMinutes}m prune-caches-on-stop=${config.pruneRuntimeCachesOnStop}`);
@@ -470,7 +510,6 @@ function fleetPromptGuidelines(config: OrchestratorConfig): string[] {
     "For sandboxed builder profiles such as codex-safe, create the feature worktree before spawning and pass that worktree as cwd. Do not ask the worker to create a sibling worktree outside its writable cwd.",
     "Use capabilities, profiles, permissions, models, variants, versions, or config before guessing models, permission policy, effort levels, package state, or defaults.",
     `When the caller did not explicitly choose routing fields, pass harness=auto, effort=auto, and subagents=auto (or omit them when the client preserves optional fields); never invent pi/off/false placeholders. Capability-aware routing then chooses an installed eligible harness. Use action=route with the same explicit constraints to preview the selection. Explicit harness/profile choices always win; explicit model identifiers use the configured model-routing rules and unmatched-model harness.${explicitOnly}`,
-    ...supervisionGuidance(config.supervision),
     "Preview update and cleanup before execute=true. Updates preserve detected install sources; never kill sessions the fleet does not own.",
     "Persistent workers expire after an activity-bounded idle budget. Worker messages to the manager or explicit renew extend it; manager heartbeat alone does not. Default list output hides older terminal history; use history when needed. Stop completed workers promptly, rely on configured retention cleanup, and use forget or bulk prune with acknowledge=true only after deliberate closure.",
   ];
@@ -483,7 +522,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   const configPath = join(agentDir, "intercom", "orchestrator", "config.json");
   const statePath = join(agentDir, "intercom", "orchestrator", "workers.json");
   const openCodePeerDir = join(agentDir, "intercom", "orchestrator", "opencode-peers");
-  const store = new WorkerStore(statePath);
+  const configuredManagerContext = process.env.AGENT_INTERCOM_MANAGER_CONTEXT;
+  const managerOwnerContext = configuredManagerContext === "opencode" || configuredManagerContext === "headless_cli" ? configuredManagerContext : "pi";
+  const store = new WorkerStore(statePath, { legacyManagerContext: managerOwnerContext });
   const runner = runnerFor(pi);
   let config: OrchestratorConfig;
   let currentCtx: ExtensionContext | undefined;
@@ -555,25 +596,45 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   };
 
   const reconcile = async (): Promise<WorkerRecord[]> => {
-    const snapshot = await store.read();
+    let snapshot = await store.read();
+    for (const pending of snapshot.workers.filter((worker) => worker.state === "migration_pending")) {
+      const status = pending.unit ? await getUnitStatus(runner, pending.unit) : { exists: false };
+      let resolution: "stopped" | "failed" | "lost" | "unreachable" | undefined;
+      if (!status.exists) resolution = "lost";
+      else if (status.activeState === "failed" || (status.result && status.result !== "success")) resolution = "failed";
+      else if (status.activeState === "inactive" || (status.activeState === "active" && status.subState === "exited")) resolution = status.execMainStatus === 0 ? "stopped" : "failed";
+      else if (pending.migrationAudit?.reconcileBy !== undefined && Date.now() >= pending.migrationAudit.reconcileBy) resolution = "unreachable";
+      if (resolution) {
+        await store.reconcileLegacyStopping(pending.id, resolution, {
+          expectedGeneration: snapshot.generation,
+          observedAt: Date.now(),
+          reason: resolution === "unreachable" ? "legacy_stopping_unresolved" : "legacy_stopping_reconciled",
+        });
+        snapshot = await store.read();
+      }
+    }
     const observations = await Promise.all(
       snapshot.workers
-        .filter((worker): worker is WorkerRecord & { unit: string } => Boolean(worker.unit))
-        .map(async (worker) => ({
-          id: worker.id,
-          runId: worker.runId,
-          unit: worker.unit,
-          status: await getUnitStatus(runner, worker.unit),
-          health: worker.healthPath ? await readOpenCodePeerHealth(worker.healthPath) : undefined,
-        })),
+        .filter((worker) => worker.state !== "migration_pending")
+        .filter((worker) => typeof worker.unit === "string")
+        .map(async (worker) => {
+          const unit = worker.unit!;
+          return {
+            id: worker.id,
+            runId: workerIncarnation(worker),
+            unit,
+            status: await getUnitStatus(runner, unit),
+            health: worker.healthPath ? await readOpenCodePeerHealth(worker.healthPath) : undefined,
+          };
+        }),
     );
     const { workers, retireUnits } = await store.mutate((state) => {
       const retireUnits: string[] = [];
       for (const observation of observations) {
-        const worker = state.workers.find((candidate) => candidate.id === observation.id && candidate.runId === observation.runId && candidate.unit === observation.unit);
+        const worker = state.workers.find((candidate) => candidate.id === observation.id && workerIncarnation(candidate) === observation.runId && candidate.unit === observation.unit);
         if (!worker) continue;
         const observedState = stateFromUnit(observation.status, worker.state);
-        const nextState = worker.state === "stopping" && observedState === "running" ? "stopping" : observedState;
+        const nextState = observedState;
         if (observation.health?.runId === worker.runId) {
           worker.backendDetails = observation.health;
           if (observation.health.openCodeSessionId) worker.externalSessionId = observation.health.openCodeSessionId;
@@ -582,11 +643,14 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         }
         if (nextState !== worker.state || observation.status.mainPid !== worker.mainPid) {
           worker.state = nextState;
+          if (observation.status.activeState === "active" && observation.status.subState === "exited" && observation.status.execMainStatus === 0) {
+            worker.terminalOutcome = "completed";
+          }
           worker.mainPid = observation.status.mainPid;
           worker.updatedAt = Date.now();
           if (nextState === "failed") worker.lastError = observation.status.result || `service exited with ${observation.status.execMainStatus ?? "unknown status"}`;
         }
-        if (nextState === "completed" && observation.status.activeState === "active" && observation.status.subState === "exited") {
+        if (observation.status.activeState === "active" && observation.status.subState === "exited") {
           retireUnits.push(observation.unit);
         }
       }
@@ -614,7 +678,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   } = {}): Promise<WorkerRecord> => {
     const stoppedAt = Date.now();
     const worker = await store.mutate((state) => {
-      const current = state.workers.find((candidate) => candidate.id === target.id && candidate.runId === target.runId);
+      const current = state.workers.find((candidate) => candidate.id === target.id && workerIncarnation(candidate) === workerIncarnation(target));
       if (!current) throw new Error(`Worker ${target.id} changed before it could be stopped`);
       if (!current.owned) throw new Error(`Worker ${current.id} is not owned by this orchestrator`);
       if (options.expectedManagerSessionId && current.managerSessionId !== options.expectedManagerSessionId) {
@@ -624,7 +688,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         && !cleanupSnapshotStillEligible(current, options.expectedCheckpointDeadlineAt, stoppedAt)) {
         throw new Error(`Worker ${current.id} lifecycle changed or was renewed before expired cleanup`);
       }
-      current.state = "stopping";
+      current.state = "blocked";
+      current.stateReason = "stop_in_progress";
       current.stopReason = options.reason ?? "manager-requested";
       current.updatedAt = stoppedAt;
       return structuredClone(current);
@@ -633,7 +698,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     const dirty: { dirty?: boolean; status?: string; error?: string } = await inspectWorkerDirtyState(worker)
       .catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
     await store.mutate((state) => {
-      const current = state.workers.find((candidate) => candidate.id === worker.id && candidate.runId === worker.runId);
+      const current = state.workers.find((candidate) => candidate.id === worker.id && workerIncarnation(candidate) === workerIncarnation(worker));
       if (!current) return;
       if (dirty.dirty !== undefined) current.dirtyAtStop = dirty.dirty;
       if (dirty.status) current.dirtyStatusAtStop = dirty.status;
@@ -648,9 +713,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     }
 
     const finalWorker = await store.mutate((state) => {
-      const current = state.workers.find((candidate) => candidate.id === worker.id && candidate.runId === worker.runId);
+      const current = state.workers.find((candidate) => candidate.id === worker.id && workerIncarnation(candidate) === workerIncarnation(worker));
       if (!current) throw new Error(`Worker ${worker.id} changed while it was stopping`);
       current.state = stopError ? "failed" : "stopped";
+      current.stateReason = undefined;
       if (!stopError) current.mainPid = undefined;
       current.stoppedAt = Date.now();
       current.updatedAt = current.stoppedAt;
@@ -667,10 +733,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           runner,
           agentDir,
           workerId: finalWorker.id,
-          runId: finalWorker.runId,
+          runId: workerIncarnation(finalWorker),
           terminalAt,
           action: "cache",
-          eligible: (candidate) => !isLiveState(candidate.state),
+          eligible: (candidate) => isTerminalState(candidate.state),
         }).catch(() => false);
       }
     }
@@ -686,11 +752,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       runner,
       agentDir,
       workerId: target.id,
-      runId: target.runId,
+      runId: workerIncarnation(target),
       terminalAt,
       action: "full",
       now,
-      eligible: (candidate) => !isLiveState(candidate.state)
+      eligible: (candidate) => isTerminalState(candidate.state)
         && (!expectedReason || stoppedWorkerRetentionReason(candidate, config, now) === expectedReason),
     });
   };
@@ -705,19 +771,22 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     });
     const migrated = await store.read();
     const claimedIds = new Set((migrated.runtimeCleanupClaims ?? []).map((claim) => claim.workerId));
-    const liveCandidates = migrated.workers
-      .map((worker) => ({ worker, reason: cleanupReason(worker, now), kind: "stop" as const }))
-      .filter((item): item is { worker: WorkerRecord; reason: string; kind: "stop" } => Boolean(item.reason));
+    const liveCandidates = migrated.workers.flatMap((worker) => {
+      const reason = cleanupReason(worker, now);
+      return reason ? [{ worker, reason, kind: "stop" as const }] : [];
+    });
     const pruneCandidates = config.pruneStoppedWorkersOnCleanup
       ? migrated.workers
         .filter((worker) => !claimedIds.has(worker.id))
-        .map((worker) => ({ worker, reason: stoppedWorkerRetentionReason(worker, config, now), kind: "prune" as const }))
-        .filter((item): item is { worker: WorkerRecord; reason: string; kind: "prune" } => Boolean(item.reason))
+        .flatMap((worker) => {
+          const reason = stoppedWorkerRetentionReason(worker, config, now);
+          return reason ? [{ worker, reason, kind: "prune" as const }] : [];
+        })
       : [];
     const prunedRuns = new Set(pruneCandidates.map(({ worker }) => `${worker.id}\u0000${worker.runId}`));
     const cacheCandidates = config.pruneRuntimeCachesOnStop
       ? (await Promise.all(migrated.workers
-        .filter((worker) => !claimedIds.has(worker.id) && !isLiveState(worker.state) && !prunedRuns.has(`${worker.id}\u0000${worker.runId}`))
+        .filter((worker) => !claimedIds.has(worker.id) && isTerminalState(worker.state) && !prunedRuns.has(`${worker.id}\u0000${worker.runId}`))
         .map(async (worker) => {
           try {
             return { worker, paths: await existingTerminalCachePaths(worker.id, agentDir), error: undefined };
@@ -779,11 +848,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           runner,
           agentDir,
           workerId: candidate.worker.id,
-          runId: candidate.worker.runId,
+          runId: workerIncarnation(candidate.worker),
           terminalAt,
           action: "cache",
           now,
-          eligible: (worker) => !isLiveState(worker.state),
+          eligible: (worker) => isTerminalState(worker.state),
         });
       }
       return deleteOrphanRuntimeSafely({
@@ -1226,9 +1295,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
             ? "\nThe task initialized this persistent OpenCode session. It remains wakeable through Intercom until stopped."
             : "\nThe task was passed to this one-shot OpenCode run as its initial prompt."
           : `\nNext: send this task directly to '${worker.intercomTarget}' with intercom_send. Reserve intercom_ask for a later question that blocks your own next step. Do not call intercom_list just to rediscover this owned target. If first delivery reports that it is not connected yet, wait briefly and retry:\n${worker.task}`;
-        const recommendations = supervisionGuidance(config.supervision);
-        const reliability = recommendations.length ? `\n${recommendations.join(" ")}` : "";
-        return textResult(`Started ${formatWorker(worker)}${preview.routing.automatic ? `\n${preview.routing.reasons[0]}.` : ""}${next}${reliability}`, { worker, routing: preview.routing });
+        return textResult(`Started ${formatWorker(worker)}${preview.routing.automatic ? `\n${preview.routing.reasons[0]}.` : ""}${next}`, { worker, routing: preview.routing });
       }
 
       if (params.action === "route") {
@@ -1314,7 +1381,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         const selected = params.id
           ? extractWorkers({ version: 1, workers: scoped }, params.id)
           : scoped;
-        const candidates = selected.filter((worker) => !isLiveState(worker.state));
+        const candidates = selected.filter((worker) => isTerminalState(worker.state));
         const pruned: string[] = [];
         const errors: Array<{ workerId: string; error: string }> = [];
         for (const worker of candidates) {
@@ -1433,7 +1500,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           const selected = extractWorkers(state, params.id);
           const renewed: WorkerRecord[] = [];
           for (const worker of selected) {
-            if (!worker.owned || !isLiveState(worker.state) || worker.state === "stopping") continue;
+            if (!worker.owned || !isLiveState(worker.state) || worker.stateReason === "stop_in_progress") continue;
             if (worker.managerSessionId !== owner) throw new Error(`Worker ${worker.id} belongs to another manager session; adopt it before renewing`);
             recordWorkerActivity(worker, config, now);
             renewed.push(structuredClone(worker));
@@ -1448,9 +1515,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         if (!params.id) throw new Error("forget requires id");
         const owner = managerSessionId(ctx);
         const worker = extractWorkers(await store.read(), params.id)[0];
-        if (isLiveState(worker.state)) {
+        if (!isTerminalState(worker.state)) {
           if (worker.managerSessionId !== owner) throw new Error(`Worker ${worker.id} belongs to another manager session; adopt it before forgetting`);
-          throw new Error(`Refusing to forget live worker ${worker.id}; stop it first`);
+          throw new Error(worker.state === "migration_pending"
+            ? `Refusing to forget migration-pending worker ${worker.id}; reconcile its legacy stopping state first`
+            : `Refusing to forget live worker ${worker.id}; stop it first`);
         }
         if (params.acknowledge !== true) {
           const warnings = [
@@ -1468,10 +1537,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           runner,
           agentDir,
           workerId: worker.id,
-          runId: worker.runId,
+          runId: workerIncarnation(worker),
           terminalAt,
           action: "full",
-          eligible: (candidate) => !isLiveState(candidate.state),
+          eligible: (candidate) => isTerminalState(candidate.state),
         });
         if (!forgotten) throw new Error(`Worker ${worker.id} changed or a same-ID unit could not be verified absent before runtime deletion`);
         await updateStatus(ctx);
@@ -1486,8 +1555,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           const current = state.workers.find((candidate) => candidate.id === observed.id && candidate.runId === observed.runId);
           if (!current) throw new Error(`Worker ${observed.id} changed before it could be adopted`);
           if (!current.owned) throw new Error(`Worker ${current.id} was not created by this orchestrator`);
-          if (!isLiveState(current.state) || current.state === "stopping") throw new Error(`Worker ${current.id} is ${current.state}; only active live workers can be adopted`);
+          if (!isLiveState(current.state) || current.stateReason === "stop_in_progress") throw new Error(`Worker ${current.id} is ${current.state}; only active live workers can be adopted`);
           const now = Date.now();
+          current.managerOwner = rebindManagerOwner(current, managerOwnerContext, owner);
           current.managerSessionId = owner;
           recordWorkerActivity(current, config, now);
           return structuredClone(current);
@@ -1551,6 +1621,27 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       const first = result.content[0];
       const text = first?.type === "text" ? first.text : "(no output)";
       return new Text(theme.fg(isPartial ? "warning" : "toolOutput", text), 0, 0);
+    },
+  });
+
+  pi.registerCommand("boss", {
+    description: "Create, inspect, resume, pause, cancel, prove, approve, or reject a protected Boss run",
+    getArgumentCompletions: (prefix) => {
+      const actions = ["create", "status", "resume", "pause", "cancel", "proof", "approve", "reject"];
+      const filtered = actions.filter((action) => action.startsWith(prefix.trim().toLowerCase()));
+      return filtered.length ? filtered.map((action) => ({ value: action, label: action })) : null;
+    },
+    handler: async (args, ctx) => {
+      try {
+        assertDirectInteractiveBossCommand(ctx);
+        const request = parseBossCommand(args);
+        const preflight = await runBossProtectedPreflight();
+        const checks = preflight.checks.map((check) => `- ${check.code}: ${check.prerequisite}${check.remediation ? ` — ${check.remediation}` : ""}`).join("\n");
+        const message = `${bossAuthorityUnavailableMessage(request)}\n\nProtected preflight (${preflight.version}):\n${checks}`;
+        await ctx.ui.editor("Boss protected authority unavailable", message);
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
     },
   });
 

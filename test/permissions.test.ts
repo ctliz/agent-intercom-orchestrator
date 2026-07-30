@@ -10,6 +10,7 @@ import { DEFAULT_CONFIG } from "../src/config.ts";
 import { resolvePiRuntime } from "../src/pi-runtime.ts";
 import { supportsHardenedUserUnits } from "./systemd-support.ts";
 import {
+  applyCodexPermissionArgs,
   applyPiPermissionArgs,
   blockedToolReason,
   buildPermissionEnvironment,
@@ -25,6 +26,10 @@ import {
 } from "../src/permissions.ts";
 
 test("built-in roles choose conservative permission profiles", () => {
+  assert.equal(DEFAULT_CONFIG.roles.manager.permissionProfile, "manager-restricted");
+  assert.equal(DEFAULT_CONFIG.roles.worker.permissionProfile, "builder-restricted");
+  assert.equal(DEFAULT_CONFIG.roles.scout.permissionProfile, "review-readonly");
+  assert.equal(DEFAULT_CONFIG.roles.adversary.permissionProfile, "review-readonly");
   assert.equal(DEFAULT_CONFIG.roles.advisor.permissionProfile, "review-readonly");
   assert.equal(DEFAULT_CONFIG.roles.researcher.permissionProfile, "review-readonly");
   assert.equal(DEFAULT_CONFIG.roles.reviewer.permissionProfile, "review-readonly");
@@ -32,10 +37,31 @@ test("built-in roles choose conservative permission profiles", () => {
   assert.equal(DEFAULT_CONFIG.roles.builder.permissionProfile, "builder-restricted");
 });
 
+test("Codex permissions map to an explicit native sandbox without widening tighter launch policy", () => {
+  const reviewer = DEFAULT_CONFIG.permissionProfiles["review-readonly"];
+  const builder = DEFAULT_CONFIG.permissionProfiles["builder-restricted"];
+  const manager = DEFAULT_CONFIG.permissionProfiles["manager-restricted"];
+  const trusted = DEFAULT_CONFIG.permissionProfiles.trusted;
+  assert.ok(reviewer && builder && manager && trusted);
+
+  assert.deepEqual(applyCodexPermissionArgs(["--no-tui"], reviewer), ["--no-tui", "--sandbox", "read-only"]);
+  assert.deepEqual(applyCodexPermissionArgs(DEFAULT_CONFIG.profiles["codex-minimal"].args ?? [], reviewer), ["--no-tui", "--sandbox", "read-only"]);
+  assert.deepEqual(applyCodexPermissionArgs(["--no-tui"], builder), ["--no-tui", "--sandbox", "workspace-write"]);
+  assert.deepEqual(applyCodexPermissionArgs(["--sandbox", "read-only", "--no-tui"], builder), ["--no-tui", "--sandbox", "read-only"]);
+  assert.deepEqual(applyCodexPermissionArgs(["--sandbox=workspace-write", "--no-tui"], reviewer), ["--no-tui", "--sandbox", "read-only"]);
+  assert.deepEqual(applyCodexPermissionArgs(["-c", 'sandbox_mode="danger-full-access"', "-c", 'model="gpt-5.6-sol"'], reviewer), ["-c", 'model="gpt-5.6-sol"', "--sandbox", "read-only"]);
+  assert.deepEqual(applyCodexPermissionArgs(["--yolo", "--no-tui"], manager), ["--no-tui", "--sandbox", "read-only"]);
+  assert.deepEqual(applyCodexPermissionArgs(["--yolo=true", "--no-tui"], manager), ["--no-tui", "--sandbox", "read-only"]);
+  assert.deepEqual(applyCodexPermissionArgs(["--no-tui"], trusted), ["--no-tui", "--sandbox", "danger-full-access"]);
+  assert.throws(() => applyCodexPermissionArgs(["--sandbox", "future-mode"], reviewer), /Invalid Codex sandbox policy/);
+  assert.deepEqual(DEFAULT_CONFIG.profiles["codex-safe"].args, ["--no-tui"]);
+});
+
 test("permission profiles compile to Pi tool allowlists and systemd properties", () => {
   const reviewer = DEFAULT_CONFIG.permissionProfiles["review-readonly"];
   const builder = DEFAULT_CONFIG.permissionProfiles["builder-restricted"];
-  assert.ok(reviewer && builder);
+  const manager = DEFAULT_CONFIG.permissionProfiles["manager-restricted"];
+  assert.ok(reviewer && builder && manager);
 
   const args = applyPiPermissionArgs(["--mode", "rpc"], reviewer);
   assert.deepEqual(args.slice(-2), ["--tools", reviewer.piTools?.join(",")]);
@@ -79,6 +105,13 @@ test("permission profiles compile to Pi tool allowlists and systemd properties",
   assert.ok(builderProperties.includes('ReadOnlyPaths="-/shared/.git/worktrees/repo"'));
   assert.ok(builderProperties.includes('ReadOnlyPaths="-/shared/.git"'));
   assert.equal(builderProperties.some((property) => property === 'ReadOnlyPaths="/repo"'), false);
+
+  const managerArgs = applyPiPermissionArgs(["--mode", "rpc"], manager);
+  assert.match(managerArgs.at(-1) ?? "", /(?:^|,)bash(?:,|$)/);
+  assert.doesNotMatch(managerArgs.at(-1) ?? "", /(?:^|,)(?:edit|write)(?:,|$)/);
+  const managerProperties = buildPermissionUnitProperties(manager, "/integration");
+  assert.ok(managerProperties.includes('ReadOnlyPaths="/integration"'));
+  assert.equal(managerProperties.includes('ReadWritePaths="/integration"'), false);
 });
 
 test("glab project-local config masks apply only to real Git metadata directories", () => {
