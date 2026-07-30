@@ -174,10 +174,9 @@ agent_fleet({ action: "forget", id: "codex-build-api", acknowledge: true })
 
 ## Pi commands
 
-- `/coagents` — open the compact, colored, read-only coworker overlay; Enter expands the selected worker
-- `/agents` — inspect live and recently terminal coworkers
-- `/agents history` — inspect complete retained history for this manager
-- `/agents all` — inspect the explicit cross-manager inventory
+- `/agents` — open the compact, colored, read-only coworker overlay for this Pi; Enter expands the selected worker
+- `/agents history` — browse complete retained history for this manager
+- `/agents all` — browse the explicit cross-manager inventory
 - `/agents-new` — interactive role, harness, launch profile, permission profile, model, effort, cwd, id, and task wizard
 - `/agents-config` — edit per-harness defaults, lifecycle settings, and role presets
 - `/agents-models [pi|codex|claude|opencode]` — browse available models

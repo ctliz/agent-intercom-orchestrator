@@ -52,7 +52,7 @@
   "pi": {
     "extensions": [
       "./src/index.ts",
-      "./src/coagent-browser.ts"
+      "./src/agents-browser.ts"
     ],
     "skills": [
       "./skills"

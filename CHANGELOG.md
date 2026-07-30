@@ -2,9 +2,9 @@
 
 ## Unreleased
 
-- Keep `/coagents` aligned with the canonical worker lifecycle so current nonterminal states such as `ready`, `working`, and `waiting` appear live, and render the overlay on an opaque padded background so chat text cannot bleed through it.
+- Replace the legacy `/agents` text editor with the compact graphical browser, scoped to the current Pi by default with `/agents history` and `/agents all` views; keep it aligned with the canonical worker lifecycle and render it on an opaque padded background so chat text cannot bleed through it.
 - Make worker startup fail closed across systemd submission, queued activation, stable PID verification, and exact-run Intercom readiness; add durable stop fencing, late-unit reconciliation, honest unverified adapter states, user-manager backlog protection, and serialized systemd integration tests.
-- Add `/coagents`, a compact colored read-only coworker overlay with live/all views, refresh, short default summaries, and Enter-to-expand task, path, process, lifecycle, and manager details.
+- Add a compact colored read-only coworker overlay with live/all views, refresh, short default summaries, and Enter-to-expand task, path, process, lifecycle, and manager details.
 - Harden runtime cleanup with durable same-ID claims, fail-closed systemd/cgroup revalidation, symlink-safe contained paths, atomic quarantine and crash recovery, isolated candidate failures, and a configurable 60-minute grace period for unregistered runtimes.
 - Add an explicit non-prompting `claude-trusted` launch profile for headless Claude Code work paired with the broad `trusted` permission profile, and give `claude-minimal` accurate final-response relay instructions because minimal mode intentionally removes MCP tools.
 - Seed restricted `codex-minimal` workers from the dedicated `.codex-i-m` home selected by the `coim` wrapper instead of preparing an unused `.codex` directory.

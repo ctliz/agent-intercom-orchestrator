@@ -1787,25 +1787,6 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerCommand("agents", {
-    description: "Show live/recent coworkers; use /agents history for retained history or /agents all for every managed worker",
-    handler: async (args, ctx) => {
-      if (!config) await loadConfig();
-      const workers = await reconcile();
-      const view = args.trim().toLowerCase();
-      const scoped = view === "all"
-        ? workers
-        : workersAttachedToManager(workers, managerSessionId(ctx));
-      const visible = view === "all" || view === "history"
-        ? scoped
-        : scoped.filter((worker) => isLiveState(worker.state) || isRecentTerminalWorker(worker, config));
-      const text = formatWorkers(visible, scoped.length - visible.length);
-      const title = view === "all" ? "All managed coworkers" : view === "history" ? "Retained coworker history" : "Coworkers attached to this Pi";
-      if (ctx.hasUI) await ctx.ui.editor(title, text);
-      else ctx.ui.notify(text, "info");
-    },
-  });
-
   pi.registerCommand("agents-models", {
     description: "Browse models available to a worker harness",
     handler: async (args, ctx) => {

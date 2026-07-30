@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-test("coagent browser is compact by default and expands details on Enter", async () => {
-  const agentDir = await mkdtemp(join(tmpdir(), "coagent-browser-test-"));
+test("agents browser is manager-scoped, compact by default, and expands details on Enter", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "agents-browser-test-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
   try {
@@ -25,7 +25,17 @@ test("coagent browser is compact by default and expands details on Enter", async
       intercomTarget: "browser-worker",
       unit: "agent-intercom-worker-browser-worker.service",
       mainPid: 1234,
-      managerSessionId: "manager-session-id",
+      managerOwner: { sessionId: "manager-session-id" },
+      updatedAt: now,
+      idleDeadlineAt: now + 60_000,
+    }, {
+      id: "other-manager-worker",
+      harness: "pi",
+      role: "advisor",
+      state: "ready",
+      task: "Belongs to another manager and must not appear in the default scope.",
+      cwd: "/home/example/worktrees/other-project",
+      managerOwner: { sessionId: "other-manager-session" },
       updatedAt: now,
       idleDeadlineAt: now + 60_000,
     }] }));
@@ -34,7 +44,7 @@ test("coagent browser is compact by default and expands details on Enter", async
     const pi: any = {
       registerCommand(name: string, command: any) { commands.set(name, command); },
     };
-    const extensionUrl = new URL(`../src/coagent-browser.ts?test=${Date.now()}`, import.meta.url);
+    const extensionUrl = new URL(`../src/agents-browser.ts?test=${Date.now()}`, import.meta.url);
     const { default: extension } = await import(extensionUrl.href);
     extension(pi);
 
@@ -48,6 +58,7 @@ test("coagent browser is compact by default and expands details on Enter", async
     };
     const ctx: any = {
       mode: "tui",
+      sessionManager: { getSessionId: () => "manager-session-id", getSessionFile: () => undefined },
       ui: {
         notify() {},
         async custom(factory: any) {
@@ -62,9 +73,13 @@ test("coagent browser is compact by default and expands details on Enter", async
       },
     };
 
-    await commands.get("coagents").handler("", ctx);
+    assert.ok(commands.has("agents"));
+    assert.equal(commands.has("coagents"), false);
+    await commands.get("agents").handler("", ctx);
     assert.match(collapsed, /1 live/);
+    assert.match(collapsed, /this Pi/);
     assert.match(collapsed, /browser-worker/);
+    assert.doesNotMatch(collapsed, /other-manager-worker/);
     assert.match(collapsed, /cwd\s+browser-project/);
     assert.doesNotMatch(collapsed, /\/home\/example\/worktrees\/browser-project/);
     assert.match(collapsed, /enter expand details/);

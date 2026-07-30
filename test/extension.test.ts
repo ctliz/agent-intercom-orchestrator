@@ -794,7 +794,7 @@ test("extension registers discovery tools and interactive configuration commands
     assert.match(JSON.stringify(tools.get("agent_fleet").parameters), /versions/);
     assert.match(JSON.stringify(tools.get("agent_fleet").parameters), /update/);
     assert.match(JSON.stringify(tools.get("agent_fleet").parameters), /permissionProfile/);
-    for (const command of ["boss", "agents", "agents-new", "agents-config", "agents-models", "agents-cleanup"]) {
+    for (const command of ["boss", "agents-new", "agents-config", "agents-models", "agents-cleanup"]) {
       assert.ok(commands.has(command), `missing /${command}`);
     }
 

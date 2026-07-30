@@ -19,6 +19,7 @@ type Worker = {
   unit?: string;
   mainPid?: number;
   managerSessionId?: string;
+  managerOwner?: { sessionId?: string };
   updatedAt?: number;
   idleDeadlineAt?: number;
   lastError?: string;
@@ -55,24 +56,43 @@ function shortDirectory(path?: string): string {
   return name || path;
 }
 
-export default function coagentBrowser(pi: ExtensionAPI) {
-  pi.registerCommand("coagents", {
-    description: "Open the standalone read-only co-agent browser",
-    handler: async (_args, ctx) => {
+function workerManagerSession(worker: Worker): string | undefined {
+  return worker.managerOwner?.sessionId ?? worker.managerSessionId;
+}
+
+export default function agentsBrowser(pi: ExtensionAPI) {
+  pi.registerCommand("agents", {
+    description: "Browse coworkers; use /agents history for retained history or /agents all for every manager",
+    handler: async (args, ctx) => {
+      let workers = await readWorkers();
+      const view = args.trim().toLowerCase();
+      const crossManager = view === "all";
+      const managerSession = ctx.sessionManager.getSessionId() || ctx.sessionManager.getSessionFile();
+      const scopedWorkers = () => crossManager
+        ? workers
+        : workers.filter((worker) => workerManagerSession(worker) === managerSession);
+      let showAll = view === "all" || view === "history";
+
       if (ctx.mode !== "tui") {
-        ctx.ui.notify("/coagents requires interactive TUI mode", "error");
+        const scoped = scopedWorkers();
+        const visible = showAll ? scoped : scoped.filter(isWorkerLive);
+        const text = visible.length
+          ? visible.map((worker) => `${worker.id} [${worker.harness}/${worker.role}] ${worker.state}`).join("\n")
+          : "No matching coworkers.";
+        ctx.ui.notify(text, "info");
         return;
       }
 
-      let workers = await readWorkers();
-      let showAll = false;
       let selected = 0;
       let expanded = false;
       let refreshing = false;
       let refreshError: string | undefined;
 
       await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-        const visibleWorkers = () => showAll ? workers : workers.filter(isWorkerLive);
+        const visibleWorkers = () => {
+          const scoped = scopedWorkers();
+          return showAll ? scoped : scoped.filter(isWorkerLive);
+        };
         const clampSelection = () => {
           const visible = visibleWorkers();
           selected = Math.max(0, Math.min(selected, Math.max(0, visible.length - 1)));
@@ -98,11 +118,13 @@ export default function coagentBrowser(pi: ExtensionAPI) {
             const inner = Math.max(20, width - 4);
             const visible = visibleWorkers();
             clampSelection();
-            const liveCount = workers.filter(isWorkerLive).length;
+            const scoped = scopedWorkers();
+            const liveCount = scoped.filter(isWorkerLive).length;
             const border = theme.fg("border", "─".repeat(Math.max(1, width)));
             const lines: string[] = [border];
             const mode = showAll ? "all retained" : "live only";
-            lines.push(truncateToWidth(`  ${theme.fg("accent", theme.bold("Co-agent Browser"))}  ${theme.fg("muted", `${liveCount} live · ${workers.length} total · ${mode}`)}`, width));
+            const scope = crossManager ? "all managers" : "this Pi";
+            lines.push(truncateToWidth(`  ${theme.fg("accent", theme.bold("Agents"))}  ${theme.fg("muted", `${liveCount} live · ${scoped.length} total · ${scope} · ${mode}`)}`, width));
             lines.push(border);
 
             if (visible.length === 0) {
@@ -160,7 +182,8 @@ export default function coagentBrowser(pi: ExtensionAPI) {
                 if (worker.intercomTarget) lines.push(truncateToWidth(`  ${theme.fg("dim", "intercom")}  ${theme.fg("accent", worker.intercomTarget)}`, width));
                 if (worker.unit) lines.push(truncateToWidth(`  ${theme.fg("dim", "unit")}  ${worker.unit}${worker.mainPid ? ` · ${theme.fg("dim", "pid")} ${worker.mainPid}` : ""}`, width));
                 lines.push(truncateToWidth(`  ${theme.fg("dim", "updated")}  ${time(worker.updatedAt)}  ${theme.fg("dim", "· idle deadline")}  ${time(worker.idleDeadlineAt)}`, width));
-                if (worker.managerSessionId) lines.push(truncateToWidth(`  ${theme.fg("dim", "manager")}  ${worker.managerSessionId}`, width));
+                const ownerSession = workerManagerSession(worker);
+                if (ownerSession) lines.push(truncateToWidth(`  ${theme.fg("dim", "manager")}  ${ownerSession}`, width));
               }
               if (worker.lastError) lines.push(truncateToWidth(`  ${theme.fg("error", `error  ${worker.lastError}`)}`, width));
               lines.push(truncateToWidth(`  ${theme.fg("dim", `enter ${expanded ? "collapse" : "expand details"}`)}`, width));
