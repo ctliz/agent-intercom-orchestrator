@@ -237,6 +237,8 @@ export interface WorkerRecord {
   checkpointLastAttemptAt?: number;
   checkpointAttemptCount?: number;
   checkpointDeadlineAt?: number;
+  /** Durable stop intent fences a queued unit that materializes after stop. */
+  stopRequestedAt?: number;
   stoppedAt?: number;
   stopReason?: string;
   dirtyAtStop?: boolean;
@@ -301,12 +303,20 @@ export interface LegacyWorkerStateFileV1 extends WorkerStateFile {
 }
 
 export interface UnitStatus {
+  /** Whether systemd returned an authoritative snapshot. */
+  verified?: boolean;
   exists: boolean;
   activeState?: string;
   subState?: string;
   mainPid?: number;
   result?: string;
   execMainStatus?: number;
+  /** Non-empty while systemd still has a queued job for the unit. */
+  job?: string;
+  activeEnterTimestampMonotonic?: number;
+  inactiveEnterTimestampMonotonic?: number;
+  execMainStartTimestampMonotonic?: number;
+  error?: string;
 }
 
 export interface CommandResult {

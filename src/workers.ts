@@ -218,7 +218,22 @@ export function isLiveState(state: WorkerState): boolean {
   return state !== "migration_pending" && !isTerminalState(state);
 }
 
+export function unitRequiresStopFence(worker: WorkerRecord, status: UnitStatus): boolean {
+  if (status.verified === false) return false;
+  const stopIntent = Boolean(worker.stopRequestedAt || worker.stateReason === "stop_in_progress" || isTerminalState(worker.state));
+  if (!stopIntent) return false;
+  return Boolean(status.job
+    || status.activeState === "active"
+    || status.activeState === "activating"
+    || status.activeState === "deactivating"
+    || status.mainPid);
+}
+
 export function stateFromUnit(status: UnitStatus, previous: WorkerState): WorkerState {
+  // An unverifiable snapshot or a queued systemd job must never become a
+  // terminal conclusion. Preserve terminal intent, otherwise keep waiting.
+  if (status.verified === false) return previous;
+  if (status.job) return isTerminalState(previous) ? previous : "provisioning";
   if (!status.exists) return isTerminalState(previous) ? previous : "lost";
   if (status.activeState === "active" && status.subState === "exited") return "stopped";
   if (status.activeState === "active") {
@@ -228,7 +243,13 @@ export function stateFromUnit(status: UnitStatus, previous: WorkerState): Worker
   if (status.activeState === "activating" || status.activeState === "reloading") return "provisioning";
   if (status.activeState === "failed" || (status.result && status.result !== "success")) return "failed";
   if (status.activeState === "deactivating") return previous;
-  if (status.activeState === "inactive") return status.execMainStatus === 0 ? "stopped" : previous === "stopped" ? "stopped" : "failed";
+  if (status.activeState === "inactive") {
+    if (previous === "stopped") return "stopped";
+    // ExecMainStatus defaults to zero even when ExecStart never ran. Require
+    // activation/start evidence before interpreting zero as a clean stop.
+    const started = Boolean(status.execMainStartTimestampMonotonic || status.activeEnterTimestampMonotonic || status.mainPid);
+    return started && status.execMainStatus === 0 ? "stopped" : "failed";
+  }
   return previous;
 }
 

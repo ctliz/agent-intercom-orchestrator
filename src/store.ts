@@ -39,7 +39,7 @@ const LEGACY_WORKER_KEYS = new Set([
   "id", "runId", "harness", "backend", "role", "task", "cwd", "profile", "permissionProfile", "model", "effort", "instructions",
   "state", "owned", "managerSessionId", "intercomTarget", "unit", "mainPid", "externalSessionId", "healthPath", "runtimeStatePath",
   "createdAt", "updatedAt", "leaseExpiresAt", "lastWorkerActivityAt", "idleDeadlineAt", "checkpointRequestedAt", "checkpointLastAttemptAt",
-  "checkpointAttemptCount", "checkpointDeadlineAt", "stoppedAt", "stopReason", "dirtyAtStop", "dirtyStatusAtStop", "dirtyCheckErrorAtStop",
+  "checkpointAttemptCount", "checkpointDeadlineAt", "stopRequestedAt", "stoppedAt", "stopReason", "dirtyAtStop", "dirtyStatusAtStop", "dirtyCheckErrorAtStop",
   "lastError", "backendDetails",
 ]);
 const V2_STORED_WORKER_KEYS = new Set([
@@ -47,7 +47,7 @@ const V2_STORED_WORKER_KEYS = new Set([
   "permissionProfile", "model", "effort", "instructions", "state", "stateReason", "terminalOutcome", "owned", "managerOwner",
   "migrationAudit", "intercomTarget", "unit", "mainPid", "externalSessionId", "healthPath", "runtimeStatePath", "createdAt", "updatedAt",
   "leaseExpiresAt", "lastWorkerActivityAt", "idleDeadlineAt", "checkpointRequestedAt", "checkpointLastAttemptAt", "checkpointAttemptCount",
-  "checkpointDeadlineAt", "stoppedAt", "stopReason", "dirtyAtStop", "dirtyStatusAtStop", "dirtyCheckErrorAtStop", "lastError", "backendDetails",
+  "checkpointDeadlineAt", "stopRequestedAt", "stoppedAt", "stopReason", "dirtyAtStop", "dirtyStatusAtStop", "dirtyCheckErrorAtStop", "lastError", "backendDetails",
 ]);
 const V2_API_WORKER_KEYS = new Set([...V2_STORED_WORKER_KEYS, "runId", "managerSessionId"]);
 const STRING_WORKER_KEYS = [
@@ -56,7 +56,7 @@ const STRING_WORKER_KEYS = [
 ] as const;
 const NUMBER_WORKER_KEYS = [
   "mainPid", "lastWorkerActivityAt", "idleDeadlineAt", "checkpointRequestedAt", "checkpointLastAttemptAt", "checkpointAttemptCount",
-  "checkpointDeadlineAt", "stoppedAt",
+  "checkpointDeadlineAt", "stopRequestedAt", "stoppedAt",
 ] as const;
 
 export type WorkerStoreFaultPoint =

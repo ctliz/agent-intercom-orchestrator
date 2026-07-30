@@ -7,7 +7,7 @@ import { DEFAULT_CONFIG, mergeConfig, readConfig, resolveProfileCommand, writeCo
 import { parseOpenCodeModelsVerbose, parsePiModels, recordIntercomWorkerActivity, removeWorkerRuntimeAndRecord, renewObservedWorkerLeases, reserveWorkerRecord, workersAttachedToManager } from "../src/index.ts";
 import { workerRuntimeRoot } from "../src/runtime.ts";
 import { WorkerStore } from "../src/store.ts";
-import { launchUnit, makeUnitName, parseDurationToSeconds, readUnitProcessTree, sanitizeUnitPart, stopUnit } from "../src/systemd.ts";
+import { getUnitStatus, launchUnit, makeUnitName, parseDurationToSeconds, readUnitProcessTree, sanitizeUnitPart, stopUnit, waitForUnitRunning } from "../src/systemd.ts";
 import type { WorkerRecord } from "../src/types.ts";
 import {
   boundedLeaseExpiry,
@@ -139,7 +139,49 @@ test("systemd launch retains one-shot exit status without --collect", async () =
   });
   const args = calls[0].args;
   assert.equal(args.includes("--collect"), false);
+  assert.ok(args.includes("--no-block"));
   assert.ok(args.includes("--property=RemainAfterExit=yes"));
+});
+
+test("unit status preserves queued jobs, activation evidence, and indeterminate timeouts", async () => {
+  const queued = await getUnitStatus({
+    async exec() {
+      return {
+        stdout: "LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nResult=success\nExecMainStatus=0\nJob=77/start\nActiveEnterTimestampMonotonic=0\nInactiveEnterTimestampMonotonic=12\nExecMainStartTimestampMonotonic=0\n",
+        stderr: "", code: 0,
+      };
+    },
+  }, "queued.service");
+  assert.equal(queued.verified, true);
+  assert.equal(queued.job, "77/start");
+  assert.equal(queued.inactiveEnterTimestampMonotonic, 12);
+
+  const timedOut = await getUnitStatus({
+    async exec() { return { stdout: "", stderr: "", code: 143, killed: true }; },
+  }, "unknown.service");
+  assert.equal(timedOut.verified, false);
+  assert.match(timedOut.error ?? "", /timed out/);
+});
+
+test("running verification waits through a queued job and requires an active main pid", async () => {
+  let reads = 0;
+  const status = await waitForUnitRunning({
+    async exec() {
+      reads += 1;
+      if (reads === 1) return { stdout: "LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nJob=88/start\n", stderr: "", code: 0 };
+      return { stdout: "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nJob=\nExecMainStartTimestampMonotonic=10\n", stderr: "", code: 0 };
+    },
+  }, "worker.service", { timeoutMs: 100, intervalMs: 1, stableMs: 0 });
+  assert.equal(status.mainPid, 4242);
+  assert.equal(reads, 2);
+});
+
+test("running verification rejects a process that fails before readiness", async () => {
+  await assert.rejects(waitForUnitRunning({
+    async exec() {
+      return { stdout: "LoadState=loaded\nActiveState=failed\nSubState=failed\nMainPID=0\nResult=exit-code\nExecMainStatus=1\nJob=\n", stderr: "", code: 0 };
+    },
+  }, "worker.service", { timeoutMs: 50, intervalMs: 1 }), /failed before readiness/);
 });
 
 test("stop verifies the worker cgroup and escalates remaining descendants", async () => {
@@ -153,6 +195,9 @@ test("stop verifies the worker cgroup and escalates remaining descendants", asyn
         return cgroupReads === 1
           ? { stdout: "Control group /user.slice/worker.service:\n└─4242 chromium\n", stderr: "", code: 0 }
           : { stdout: "", stderr: "", code: 1 };
+      }
+      if (command === "systemctl" && args.includes("show")) {
+        return { stdout: "LoadState=not-found\nActiveState=inactive\nSubState=dead\nJob=\n", stderr: "", code: 0 };
       }
       return { stdout: "", stderr: "", code: 0 };
     },
@@ -172,10 +217,13 @@ test("stop resets a failed unit even when descendants survive escalation", async
       if (command === "systemd-cgls") {
         return { stdout: "Control group /user.slice/worker.service:\n└─4242 stuck-child\n", stderr: "", code: 0 };
       }
+      if (command === "systemctl" && args.includes("show")) {
+        return { stdout: "LoadState=not-found\nActiveState=inactive\nSubState=dead\nJob=\n", stderr: "", code: 0 };
+      }
       return { stdout: "", stderr: "", code: 0 };
     },
   };
-  await assert.rejects(stopUnit(runner, "worker.service"), /still owns processes/);
+  await assert.rejects(stopUnit(runner, "worker.service", { timeoutMs: 50, intervalMs: 1, stableMs: 0 }), /still owns processes/);
   assert.ok(calls.some((call) => call.command === "systemctl" && call.args.includes("reset-failed")));
 });
 
@@ -184,7 +232,10 @@ test("unit status maps to canonical worker states without inferring readiness", 
   assert.equal(stateFromUnit({ exists: true, activeState: "active", subState: "running" }, "working"), "working");
   assert.equal(stateFromUnit({ exists: true, activeState: "active", subState: "exited", result: "success", execMainStatus: 0 }, "registering"), "stopped");
   assert.equal(stateFromUnit({ exists: true, activeState: "failed", result: "exit-code" }, "registering"), "failed");
-  assert.equal(stateFromUnit({ exists: true, activeState: "inactive", execMainStatus: 0 }, "registering"), "stopped");
+  assert.equal(stateFromUnit({ exists: true, activeState: "inactive", execMainStatus: 0 }, "registering"), "failed");
+  assert.equal(stateFromUnit({ exists: true, activeState: "inactive", execMainStatus: 0, execMainStartTimestampMonotonic: 10 }, "registering"), "stopped");
+  assert.equal(stateFromUnit({ exists: true, activeState: "inactive", job: "42/start" }, "registering"), "provisioning");
+  assert.equal(stateFromUnit({ verified: false, exists: false }, "registering"), "registering");
   assert.equal(stateFromUnit({ exists: true, activeState: "deactivating" }, "working"), "working");
   assert.equal(stateFromUnit({ exists: false }, "registering"), "lost");
   assert.equal(stateFromUnit({ exists: false }, "completed"), "completed");

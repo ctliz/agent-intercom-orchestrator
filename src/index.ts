@@ -14,10 +14,11 @@ import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-ti
 import { buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy } from "./permissions.ts";
 import { resolvePiRuntime } from "./pi-runtime.ts";
 import { prepareWorkerRuntime, workerRuntimeRoot, workerSocketRuntimeRoot } from "./runtime.ts";
+import { INTERCOM_CONTROL_RECEIVED_EVENT, INTERCOM_CONTROL_REGISTER_EVENT, INTERCOM_CONTROL_SEND_EVENT, registerOwnedWorkerReadinessProbeType, registerOwnedWorkerReadinessResponder, WORKER_READINESS_ACK, WORKER_READINESS_PROBE, WorkerReadinessAckTracker } from "./readiness.ts";
 import { deleteOrphanRuntimeSafely, deleteTerminalRuntimeSafely, executeCleanupCandidatesIsolated, existingTerminalCachePaths, listRuntimeRoots, recoverStaleRuntimeCleanupClaims, removeFullRuntimePathsSafely, terminalWorkerAt } from "./runtime-cleanup.ts";
 import { detectHarnessAvailability, formatRoutingDecision, inferHarnessFromModel, normalizeModelForHarness, roleInstructionsForHarness, roleRequiresSubagents, resolveHarnessRoute, type HarnessAvailability, type RoutingDecision } from "./routing.ts";
 import { WorkerStore } from "./store.ts";
-import { getUnitStatus, launchUnit, listWorkerUnits, listWorkerUnitsForVerification, makeUnitName, parseDurationToSeconds, readUnitLogs, readUnitProcessTree, sanitizeUnitPart, stopUnit, systemdAvailable } from "./systemd.ts";
+import { formatUnitStatus, getUnitStatus, getUserManagerHealth, launchUnit, listWorkerUnits, listWorkerUnitsForVerification, makeUnitName, parseDurationToSeconds, readUnitLogs, readUnitProcessTree, sanitizeUnitPart, stopUnit, systemdAvailable, waitForUnitRunning } from "./systemd.ts";
 import type { CommandRunner, Effort, Harness, OrchestratorConfig, PermissionProfile, RolePreset, WorkerRecord, WorkerStateFile } from "./types.ts";
 import {
   boundedLeaseExpiry,
@@ -37,6 +38,7 @@ import {
   recordWorkerActivity,
   stateFromUnit,
   stoppedWorkerRetentionReason,
+  unitRequiresStopFence,
   validateEffort,
   validateWorkerId,
 } from "./workers.ts";
@@ -66,9 +68,11 @@ const ACTIONS = [
   "config",
 ] as const;
 const HARNESSES = ["pi", "codex", "claude", "opencode"] as const;
+const COORDINATED_ADAPTER_PROFILES = new Set(["codex-safe", "codex-minimal", "claude-safe", "claude-minimal", "claude-trusted"]);
 const EFFORTS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 const STATUS_KEY = "agent-intercom-orchestrator";
 const PI_PEER_LAUNCHER = fileURLToPath(new URL("./pi-peer-launcher.mjs", import.meta.url));
+const ADAPTER_READINESS_LAUNCHER = fileURLToPath(new URL("./adapter-readiness-launcher.mjs", import.meta.url));
 const OPENCODE_PEER_LAUNCHER = fileURLToPath(new URL("./opencode-peer-launcher.mjs", import.meta.url));
 const GIT_GUARD_BIN = fileURLToPath(new URL("./guard-bin", import.meta.url));
 const CLEAN_ENV_LAUNCHER = fileURLToPath(new URL("./clean-env-launcher.mjs", import.meta.url));
@@ -212,6 +216,17 @@ async function waitForOpenCodePeerHealth(path: string, runId: string, timeoutMs 
     await delay(100);
   }
   throw new Error(`Timed out waiting for OpenCode peer readiness at ${path}`);
+}
+
+async function waitForAdapterPeerHealth(path: string, runId: string, harness: "codex" | "claude", timeoutMs = 30_000): Promise<OpenCodePeerHealth> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const health = await readOpenCodePeerHealth(path);
+    if (health?.runId === runId && health.error) throw new Error(`${harness} adapter failed readiness: ${health.error}`);
+    if (health?.runId === runId && health.ready === true && health.connected === true) return health;
+    await delay(100);
+  }
+  throw new Error(`Timed out waiting for ${harness} adapter Intercom readiness at ${path}`);
 }
 
 async function persistOpenCodePeerState(path: string, workerId: string, sessionId: string, cwd: string): Promise<void> {
@@ -506,7 +521,7 @@ function fleetPromptGuidelines(config: OrchestratorConfig): string[] {
     : " No harness is currently configured as explicit-only.";
   return [
     "Pi workers are independent Intercom peers, not pi-subagents. Use role=advisor for a persistent Pi advisor coworker.",
-    "After agent_fleet spawns Pi, Codex, or Claude, send its assignment to the returned intercomTarget with intercom_send; reserve intercom_ask for a question that blocks the manager's next step. Use intercom_send for progress/status checkpoints. Do not call intercom_list merely to rediscover an owned worker. Pi, Codex, and Claude may need a brief registration delay before first delivery; OpenCode receives its initial task at launch.",
+    "After agent_fleet spawns Pi, Codex, or Claude, send its assignment to the returned intercomTarget with intercom_send; reserve intercom_ask for a question that blocks the manager's next step. Use intercom_send for progress/status checkpoints. Do not call intercom_list merely to rediscover an owned worker. Persistent Pi workers created by an interactive Pi manager and built-in coordinated Codex/Claude profiles wait for exact-run Intercom readiness; headless/OpenCode-manager Pi workers and custom persistent adapter profiles remain honestly `registering` after process stability unless they adopt the readiness contract. OpenCode receives its initial task after its plugin/session readiness handshake. A failed assignment delivery is therefore a new disconnect and should be investigated with status/logs, not treated as normal startup delay.",
     "For sandboxed builder profiles such as codex-safe, create the feature worktree before spawning and pass that worktree as cwd. Do not ask the worker to create a sibling worktree outside its writable cwd.",
     "Use capabilities, profiles, permissions, models, variants, versions, or config before guessing models, permission policy, effort levels, package state, or defaults.",
     `When the caller did not explicitly choose routing fields, pass harness=auto, effort=auto, and subagents=auto (or omit them when the client preserves optional fields); never invent pi/off/false placeholders. Capability-aware routing then chooses an installed eligible harness. Use action=route with the same explicit constraints to preview the selection. Explicit harness/profile choices always win; explicit model identifiers use the configured model-routing rules and unmatched-model harness.${explicitOnly}`,
@@ -517,7 +532,14 @@ function fleetPromptGuidelines(config: OrchestratorConfig): string[] {
 
 export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   registerWorkerPermissionPolicy(pi);
-  if (process.env.AGENT_INTERCOM_ORCHESTRATOR_DISABLED === "1") return;
+  const unsubscribeWorkerReadiness = registerOwnedWorkerReadinessResponder(pi);
+  if (process.env.AGENT_INTERCOM_ORCHESTRATOR_DISABLED === "1") {
+    if (unsubscribeWorkerReadiness) {
+      pi.on("session_start", () => { registerOwnedWorkerReadinessProbeType(pi); });
+      pi.on("session_shutdown", () => unsubscribeWorkerReadiness());
+    }
+    return;
+  }
   const agentDir = getAgentDir();
   const configPath = join(agentDir, "intercom", "orchestrator", "config.json");
   const statePath = join(agentDir, "intercom", "orchestrator", "workers.json");
@@ -526,6 +548,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   const managerOwnerContext = configuredManagerContext === "opencode" || configuredManagerContext === "headless_cli" ? configuredManagerContext : "pi";
   const store = new WorkerStore(statePath, { legacyManagerContext: managerOwnerContext });
   const runner = runnerFor(pi);
+  const readinessAcks = new WorkerReadinessAckTracker();
+  pi.events.emit(INTERCOM_CONTROL_REGISTER_EVENT, { type: WORKER_READINESS_ACK, version: 1 });
+  const unsubscribeReadinessAcks = pi.events.on(INTERCOM_CONTROL_RECEIVED_EVENT, (payload) => readinessAcks.record(payload));
   let config: OrchestratorConfig;
   let currentCtx: ExtensionContext | undefined;
   let heartbeat: NodeJS.Timeout | undefined;
@@ -547,6 +572,39 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     config = await readConfig(configPath);
     promptGuidelines.splice(0, promptGuidelines.length, ...fleetPromptGuidelines(config));
     return config;
+  };
+
+  const waitForPiPeerReadiness = async (target: string, runId: string, unit: string, timeoutMs = 20_000) => {
+    const deadline = Date.now() + timeoutMs;
+    let lastStatus = await getUnitStatus(runner, unit);
+    while (Date.now() < deadline) {
+      if (lastStatus.verified !== false && !lastStatus.job && lastStatus.exists
+        && lastStatus.activeState === "active" && lastStatus.mainPid) {
+        const requestId = `readiness-${runId}-${randomUUID()}`;
+        readinessAcks.expect(requestId, runId, target);
+        pi.events.emit(INTERCOM_CONTROL_SEND_EVENT, {
+          requestId,
+          to: target,
+          control: {
+            type: WORKER_READINESS_PROBE,
+            version: 1,
+            data: { requestId, expectedRunId: runId },
+          },
+        });
+        const attemptDeadline = Math.min(deadline, Date.now() + 500);
+        while (Date.now() < attemptDeadline) {
+          if (readinessAcks.consume(requestId)) return lastStatus;
+          await delay(50);
+        }
+        readinessAcks.discard(requestId);
+      } else if (lastStatus.verified !== false && !lastStatus.job
+        && (!lastStatus.exists || lastStatus.activeState === "failed" || lastStatus.activeState === "inactive")) {
+        throw new Error(`Pi worker ${target} exited before Intercom readiness (${formatUnitStatus(lastStatus)})`);
+      }
+      await delay(100);
+      lastStatus = await getUnitStatus(runner, unit);
+    }
+    throw new Error(`Timed out waiting for Pi worker ${target} Intercom readiness for run ${runId} (${formatUnitStatus(lastStatus)})`);
   };
 
   const inspectVersions = () => inspectAdapterFamily({
@@ -633,6 +691,12 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       for (const observation of observations) {
         const worker = state.workers.find((candidate) => candidate.id === observation.id && workerIncarnation(candidate) === observation.runId && candidate.unit === observation.unit);
         if (!worker) continue;
+        if (unitRequiresStopFence(worker, observation.status)) {
+          worker.lastError = `stopped or terminal worker record still has a live or queued unit (${formatUnitStatus(observation.status)})`;
+          worker.updatedAt = Date.now();
+          retireUnits.push(observation.unit);
+          continue;
+        }
         const observedState = stateFromUnit(observation.status, worker.state);
         const nextState = observedState;
         if (observation.health?.runId === worker.runId) {
@@ -691,6 +755,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       current.state = "blocked";
       current.stateReason = "stop_in_progress";
       current.stopReason = options.reason ?? "manager-requested";
+      current.stopRequestedAt = stoppedAt;
       current.updatedAt = stoppedAt;
       return structuredClone(current);
     });
@@ -1113,7 +1178,22 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       managerSessionId: managerSessionId(ctx),
       config,
     });
+    const persistentPi = harness === "pi" && profile.mode === "persistent";
+    const verifiedPersistentPi = persistentPi && managerOwnerContext === "pi";
     const persistentOpenCode = harness === "opencode" && profile.mode === "persistent";
+    const persistentAdapter = (harness === "codex" || harness === "claude")
+      && profile.mode === "persistent"
+      && COORDINATED_ADAPTER_PROFILES.has(profileName);
+    const managerHealth = await getUserManagerHealth(runner);
+    if (!managerHealth.responsive) {
+      throw new Error(`systemd user manager is not responsive; refusing worker submission: ${managerHealth.error ?? "unknown liveness failure"}`);
+    }
+    if (managerHealth.settled === false) {
+      throw new Error(`systemd user manager has ${managerHealth.persistentJobs?.length ?? managerHealth.jobCount ?? "unknown"} jobs that remained queued across the liveness window; refusing worker submission until the backlog clears`);
+    }
+    if ((managerHealth.jobCount ?? 0) > 32) {
+      throw new Error(`systemd user manager has ${managerHealth.jobCount} queued jobs; refusing worker submission until the backlog clears`);
+    }
     if (permissionProfile.hardened) {
       const version = await systemdVersion(runner);
       if (version !== undefined && version < 257) throw new Error(`Permission profile ${permissionProfileName} requires systemd 257 or newer for PrivatePIDs (found ${version})`);
@@ -1133,14 +1213,17 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       worker.runtimeStatePath = join(stateDir, `${id}.state.json`);
       workerHealthPath = join(launchStateDir, `${id}.health.json`);
       workerStatePath = join(launchStateDir, `${id}.state.json`);
+    } else if (persistentAdapter) {
+      const stateDir = runtimeRoot ?? join(agentDir, "intercom", "orchestrator", "adapter-health");
+      const launchStateDir = runtimeWorkerRoot ?? stateDir;
+      worker.healthPath = join(stateDir, `${id}.${runId}.adapter-health.json`);
+      workerHealthPath = join(launchStateDir, `${id}.${runId}.adapter-health.json`);
     }
     await store.mutate((state) => reserveWorkerRecord(state, worker));
     try {
       const runtime = permissionProfile.hardened ? await prepareWorkerRuntime(harness, id, agentDir, { profileName }) : undefined;
-      if (persistentOpenCode) {
-        await rm(worker.healthPath!, { force: true });
-        if (params.fresh) await rm(worker.runtimeStatePath!, { force: true });
-      }
+      if (persistentOpenCode || persistentAdapter) await rm(worker.healthPath!, { force: true });
+      if (persistentOpenCode && params.fresh) await rm(worker.runtimeStatePath!, { force: true });
       const harnessArgs = buildWorkerArgs({ harness, profile, profileName, workerId: id, cwd, role, task, model, effort, instructions, managerTarget: worker.managerSessionId, permissionProfile });
       if (runtime?.extraArgs.length) harnessArgs.push(...runtime.extraArgs);
       const gitMetadataPaths = permissionProfile.git === "read-only" ? await discoverGitMetadataPaths(runner, cwd) : [];
@@ -1177,12 +1260,16 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       if (!executable) throw new Error(`Launch command not found or not executable: ${profile.command}`);
       const wrappedLauncher = harness === "pi"
         ? PI_PEER_LAUNCHER
-        : harness === "opencode" && profile.mode === "persistent"
-          ? OPENCODE_PEER_LAUNCHER
-          : undefined;
+        : persistentAdapter
+          ? ADAPTER_READINESS_LAUNCHER
+          : harness === "opencode" && profile.mode === "persistent"
+            ? OPENCODE_PEER_LAUNCHER
+            : undefined;
       let launchCommand = wrappedLauncher ? process.execPath : executable;
       let args = wrappedLauncher
-        ? [wrappedLauncher, "--", executable, ...(piRuntime?.args ?? []), ...harnessArgs]
+        ? persistentAdapter
+          ? [wrappedLauncher, "--harness", harness, "--", executable, ...harnessArgs]
+          : [wrappedLauncher, "--", executable, ...(piRuntime?.args ?? []), ...harnessArgs]
         : harnessArgs;
       const unitEnvironment: Record<string, string> = {
         ...permissionEnvironment,
@@ -1196,6 +1283,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         ...(persistentOpenCode ? {
           AGENT_INTERCOM_OPENCODE_HEALTH_PATH: workerHealthPath!,
           AGENT_INTERCOM_OPENCODE_STATE_PATH: workerStatePath!,
+        } : {}),
+        ...(persistentAdapter ? {
+          AGENT_INTERCOM_ADAPTER_HEALTH_PATH: workerHealthPath!,
         } : {}),
       };
       if (permissionProfile.hardened) {
@@ -1221,31 +1311,68 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         ),
         environment: unitEnvironment,
       });
+      let status = profile.mode === "persistent"
+        ? await waitForUnitRunning(runner, unit)
+        : await getUnitStatus(runner, unit);
+      if (verifiedPersistentPi) {
+        status = await waitForPiPeerReadiness(id, runId, unit);
+      }
       if (persistentOpenCode) {
         const health = await waitForOpenCodePeerHealth(worker.healthPath!, runId);
         worker.externalSessionId = health.openCodeSessionId;
-        worker.backendDetails = health;
+        worker.backendDetails = { ...health, systemd: status, readiness: "intercom-runid-verified" };
         await persistOpenCodePeerState(worker.runtimeStatePath!, id, health.openCodeSessionId!, cwd);
+      } else if (persistentAdapter) {
+        const health = await waitForAdapterPeerHealth(worker.healthPath!, runId, harness);
+        worker.backendDetails = { ...health, systemd: status, readiness: "intercom-runid-verified" };
+        await rm(worker.healthPath!, { force: true });
+        worker.healthPath = undefined;
+      } else {
+        worker.backendDetails = {
+          systemd: status,
+          readiness: verifiedPersistentPi
+            ? "intercom-runid-verified"
+            : profile.mode === "persistent"
+              ? "process-stable-unverified"
+              : "submitted",
+        };
       }
-      const status = await getUnitStatus(runner, unit);
+      if (profile.mode === "persistent") {
+        status = await waitForUnitRunning(runner, unit, { timeoutMs: 5_000, stableMs: 250 });
+        worker.backendDetails = { ...(worker.backendDetails as Record<string, unknown>), systemd: status };
+      }
       return await store.mutate((state) => {
         const current = state.workers.find((candidate) => candidate.id === id && candidate.runId === runId);
         if (!current) throw new Error(`Worker ${id} changed while it was starting`);
         if (current.state === "provisioning") current.state = stateFromUnit(status, "provisioning");
+        if ((verifiedPersistentPi || persistentOpenCode || persistentAdapter) && current.state === "registering") {
+          current.state = "ready";
+        }
         current.mainPid = status.mainPid;
         current.updatedAt = Date.now();
         if (worker.externalSessionId) current.externalSessionId = worker.externalSessionId;
+        if (persistentAdapter) current.healthPath = undefined;
         if (worker.backendDetails) current.backendDetails = worker.backendDetails;
+        if (profile.mode === "persistent" && current.state !== "registering" && current.state !== "ready") {
+          throw new Error(`Worker ${id} did not reach a running registration state (${formatUnitStatus(status)})`);
+        }
         return structuredClone(current);
       });
     } catch (error) {
-      await stopUnit(runner, unit).catch(() => undefined);
+      const cleanupError = await stopUnit(runner, unit).then(() => undefined).catch((stopError) => stopError);
+      if (persistentAdapter && worker.healthPath) await rm(worker.healthPath, { force: true }).catch(() => undefined);
       await store.mutate((state) => {
         const current = state.workers.find((candidate) => candidate.id === id && candidate.runId === runId);
         if (!current) return;
         current.state = "failed";
         current.updatedAt = Date.now();
-        current.lastError = error instanceof Error ? error.message : String(error);
+        const primary = error instanceof Error ? error.message : String(error);
+        current.stopReason = "spawn-failed";
+        current.stopRequestedAt = Date.now();
+        if (persistentAdapter) current.healthPath = undefined;
+        current.lastError = cleanupError
+          ? `${primary}; cleanup is indeterminate: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`
+          : primary;
       });
       throw error;
     }
@@ -1294,8 +1421,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           ? mode === "persistent"
             ? "\nThe task initialized this persistent OpenCode session. It remains wakeable through Intercom until stopped."
             : "\nThe task was passed to this one-shot OpenCode run as its initial prompt."
-          : `\nNext: send this task directly to '${worker.intercomTarget}' with intercom_send. Reserve intercom_ask for a later question that blocks your own next step. Do not call intercom_list just to rediscover this owned target. If first delivery reports that it is not connected yet, wait briefly and retry:\n${worker.task}`;
-        return textResult(`Started ${formatWorker(worker)}${preview.routing.automatic ? `\n${preview.routing.reasons[0]}.` : ""}${next}`, { worker, routing: preview.routing });
+          : worker.state === "ready"
+            ? `\nIntercom registration for run ${worker.runId} was verified. Send the task directly to '${worker.intercomTarget}' with intercom_send:\n${worker.task}`
+            : `\nThe worker process was submitted but did not produce a persistent readiness acknowledgment. Inspect status/logs before assignment delivery:\n${worker.task}`;
+        const verb = worker.state === "ready" || worker.state === "working" || worker.state === "waiting" ? "Started" : "Launched";
+        return textResult(`${verb} ${formatWorker(worker)}${preview.routing.automatic ? `\n${preview.routing.reasons[0]}.` : ""}${next}`, { worker, routing: preview.routing });
       }
 
       if (params.action === "route") {
@@ -1343,9 +1473,12 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           : workersAttachedToManager(reconciled, managerSessionId(ctx));
         const workers = extractWorkers({ version: 1, workers: visible }, params.id);
         if (params.id && workers[0]?.unit) {
-          const processes = await readUnitProcessTree(runner, workers[0].unit);
+          const [processes, unitStatus] = await Promise.all([
+            readUnitProcessTree(runner, workers[0].unit),
+            getUnitStatus(runner, workers[0].unit),
+          ]);
           const processText = processes.tree || "(unit cgroup is empty or unloaded)";
-          return textResult(`${formatWorkers(workers)}\n\nCgroup process tree:\n${processText}`, { workers, processes });
+          return textResult(`${formatWorkers(workers)}\n\nSystemd: ${formatUnitStatus(unitStatus)}\n\nCgroup process tree:\n${processText}`, { workers, processes, unitStatus });
         }
         return textResult(formatWorkers(workers), { workers });
       }
@@ -1430,7 +1563,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       }
 
       if (params.action === "doctor") {
-        const available = await systemdAvailable(runner);
+        const managerHealth = await getUserManagerHealth(runner);
+        const available = managerHealth.responsive && await systemdAvailable(runner);
         const adapters = await inspectVersions();
         const adapterDrift = adapters.filter((adapter) => adapter.status === "outdated" || adapter.status === "missing");
         const profileLines = Object.entries(config.profiles).map(([name, profile]) => {
@@ -1481,8 +1615,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         const units = available ? await listWorkerUnits(runner) : [];
         const untrackedUnits = units.filter((unit) => !recordedUnits.has(unit));
         return textResult(
-          [`systemd user manager: ${available ? "available" : "unavailable"} version=${installedSystemdVersion ?? "unknown"} bubblewrap=${bubblewrapAvailable ? "available" : "missing"} hardened-profiles=${hardenedProfilesReady}`, `managed user namespaces: nsresourced=${managedUserNamespaces.nsresourced} mountfsd=${managedUserNamespaces.mountfsd}`, `cleanup timer: enabled=${cleanupTimerStatus.enabled} active=${cleanupTimerStatus.active} source-current=${cleanupTimerStatus.sourceCurrent}`, `Pi peer launcher: ${PI_PEER_LAUNCHER}`, `OpenCode peer launcher: ${OPENCODE_PEER_LAUNCHER}`, `OpenCode Intercom plugin: ${opencodeIntercomPlugin}`, `adapter versions: ${adapterDrift.length ? `${adapterDrift.map((adapter) => `${adapter.id}=${adapter.current ?? "missing"}->${adapter.latest ?? "unknown"}`).join(", ")} — run agent_fleet update for commands` : "coordinated"}`, `permission profiles: ${Object.keys(config.permissionProfiles).sort().join(", ")}`, `config: ${configPath}`, `state: ${statePath}`, `untracked worker units: ${untrackedUnits.length ? untrackedUnits.join(", ") : "none"}`, ...profileLines].join("\n"),
-          { systemd: available, systemdVersion: installedSystemdVersion, bubblewrapAvailable, hardenedProfilesReady, managedUserNamespaces, cleanupTimerStatus, piPeerLauncher: PI_PEER_LAUNCHER, opencodePeerLauncher: OPENCODE_PEER_LAUNCHER, opencodeIntercomPlugin, adapters, configPath, statePath, untrackedUnits },
+          [`systemd user manager: ${available ? "available" : "unavailable"} responsive=${managerHealth.responsive} settled=${managerHealth.settled ?? "unknown"} jobs=${managerHealth.jobCount ?? "unknown"}${managerHealth.error ? ` error=${managerHealth.error}` : ""} version=${installedSystemdVersion ?? "unknown"} bubblewrap=${bubblewrapAvailable ? "available" : "missing"} hardened-profiles=${hardenedProfilesReady}`, ...(managerHealth.jobs?.length ? [`systemd queued jobs: ${managerHealth.jobs.slice(0, 10).join(" | ")}${managerHealth.jobs.length > 10 ? ` | +${managerHealth.jobs.length - 10} more` : ""}`] : []), `managed user namespaces: nsresourced=${managedUserNamespaces.nsresourced} mountfsd=${managedUserNamespaces.mountfsd}`, `cleanup timer: enabled=${cleanupTimerStatus.enabled} active=${cleanupTimerStatus.active} source-current=${cleanupTimerStatus.sourceCurrent}`, `Pi peer launcher: ${PI_PEER_LAUNCHER}`, `Adapter readiness launcher: ${ADAPTER_READINESS_LAUNCHER}`, `OpenCode peer launcher: ${OPENCODE_PEER_LAUNCHER}`, `OpenCode Intercom plugin: ${opencodeIntercomPlugin}`, `adapter versions: ${adapterDrift.length ? `${adapterDrift.map((adapter) => `${adapter.id}=${adapter.current ?? "missing"}->${adapter.latest ?? "unknown"}`).join(", ")} — run agent_fleet update for commands` : "coordinated"}`, `permission profiles: ${Object.keys(config.permissionProfiles).sort().join(", ")}`, `config: ${configPath}`, `state: ${statePath}`, `untracked worker units: ${untrackedUnits.length ? untrackedUnits.join(", ") : "none"}`, ...profileLines].join("\n"),
+          { systemd: available, managerHealth, systemdVersion: installedSystemdVersion, bubblewrapAvailable, hardenedProfilesReady, managedUserNamespaces, cleanupTimerStatus, piPeerLauncher: PI_PEER_LAUNCHER, adapterReadinessLauncher: ADAPTER_READINESS_LAUNCHER, opencodePeerLauncher: OPENCODE_PEER_LAUNCHER, opencodeIntercomPlugin, adapters, configPath, statePath, untrackedUnits },
         );
       }
 
@@ -1490,7 +1624,15 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         if (!params.id) throw new Error("logs requires id");
         const worker = extractWorkers(await store.read(), params.id)[0];
         if (!worker.unit) throw new Error(`Worker ${worker.id} does not use a systemd unit`);
-        return textResult(await readUnitLogs(runner, worker.unit, params.lines), { worker });
+        const [logs, unitStatus] = await Promise.all([
+          readUnitLogs(runner, worker.unit, params.lines),
+          getUnitStatus(runner, worker.unit),
+        ]);
+        const neverStarted = !unitStatus.execMainStartTimestampMonotonic && !unitStatus.activeEnterTimestampMonotonic && !unitStatus.mainPid;
+        const diagnostic = logs.startsWith("(no journal output") && neverStarted
+          ? `\n\nSystemd: ${formatUnitStatus(unitStatus)}\nNo journal exists because systemd has no evidence that ExecStart ever ran.`
+          : `\n\nSystemd: ${formatUnitStatus(unitStatus)}`;
+        return textResult(`${logs}${diagnostic}`, { worker, unitStatus });
       }
 
       if (params.action === "renew") {
@@ -1872,6 +2014,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
+    pi.events.emit(INTERCOM_CONTROL_REGISTER_EVENT, { type: WORKER_READINESS_ACK, version: 1 });
+    registerOwnedWorkerReadinessProbeType(pi);
     await loadConfig();
     await recoverCleanupClaims();
     if (process.env.AGENT_INTERCOM_DISABLE_CLEANUP_TIMER !== "1") {
@@ -1909,6 +2053,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     heartbeat = undefined;
     heartbeatRunning = false;
     unsubscribeWorkerActivity();
+    unsubscribeReadinessAcks();
+    unsubscribeWorkerReadiness?.();
+    readinessAcks.clear();
     ctx.ui.setStatus(STATUS_KEY, undefined);
     if (config?.cleanupOnShutdown && event.reason !== "reload") {
       const sessionId = managerSessionId(ctx);
