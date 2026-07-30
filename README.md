@@ -33,7 +33,7 @@ agent_fleet({ action: "versions" })
 agent_fleet({ action: "capabilities" })
 ```
 
-You should also have `/agents`, `/agents-new`, `/agents-config`, `/agents-models`, and `/agents-cleanup`. Install the Codex, Claude, and OpenCode adapters before spawning those harnesses; the [worker guide](docs/creating-and-supervising-worker-agents.md#install-the-adapters) has the complete commands.
+You should also have `/coagents`, `/agents`, `/agents-new`, `/agents-config`, `/agents-models`, and `/agents-cleanup`. `/coagents` opens a compact, colored, read-only overlay: select a worker with the arrow keys and press Enter to expand full task, path, process, lifecycle, and manager details. Install the Codex, Claude, and OpenCode adapters before spawning those harnesses; the [worker guide](docs/creating-and-supervising-worker-agents.md#install-the-adapters) has the complete commands.
 
 To check and update the complete adapter family without replacing Git installs with npm installs:
 

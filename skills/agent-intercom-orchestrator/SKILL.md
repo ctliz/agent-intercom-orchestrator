@@ -176,6 +176,7 @@ agent_fleet({ action: "forget", id: "codex-build-api", acknowledge: true })
 
 ## Pi commands
 
+- `/coagents` — open the compact, colored, read-only coworker overlay; Enter expands the selected worker
 - `/agents` — inspect live and recently terminal coworkers
 - `/agents history` — inspect complete retained history for this manager
 - `/agents all` — inspect the explicit cross-manager inventory
