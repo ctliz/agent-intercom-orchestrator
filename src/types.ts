@@ -1,6 +1,6 @@
 export type Harness = "pi" | "codex" | "claude" | "opencode";
 export type WorkerBackend = "systemd";
-export type WorkerState =
+export type LegacyWorkerState =
   | "provisioning"
   | "running"
   | "idle"
@@ -10,6 +10,83 @@ export type WorkerState =
   | "stopping"
   | "stopped"
   | "lost";
+
+/** The participant lifecycle vocabulary persisted by WorkerStore v2. */
+export type CanonicalWorkerState =
+  | "provisioning"
+  | "registering"
+  | "ready"
+  | "working"
+  | "waiting"
+  | "paused"
+  | "stalled"
+  | "blocked"
+  | "failed"
+  | "lost"
+  | "unreachable"
+  | "stopped";
+
+/**
+ * `migration_pending` is deliberately not a participant lifecycle state. It is
+ * a read-only store record used while a legacy `stopping` process is reconciled.
+ * Legacy members remain in this compatibility union until all callers use the
+ * canonical lifecycle vocabulary.
+ */
+export type WorkerState = LegacyWorkerState | CanonicalWorkerState | "migration_pending";
+
+export type ManagerOwnerKind = "pi" | "opencode" | "headless_cli";
+
+interface ManagerOwnerBindingBase {
+  principalId: string;
+  sessionId: string;
+  bindingEpoch: number;
+}
+
+export interface PiManagerOwnerBinding extends ManagerOwnerBindingBase {
+  context: "pi";
+}
+
+export interface OpenCodeManagerOwnerBinding extends ManagerOwnerBindingBase {
+  context: "opencode";
+}
+
+export interface HeadlessCliManagerOwnerBinding extends ManagerOwnerBindingBase {
+  context: "headless_cli";
+}
+
+/** Exact owning Manager recipient and authority binding for one worker. */
+export type ManagerOwnerBinding =
+  | PiManagerOwnerBinding
+  | OpenCodeManagerOwnerBinding
+  | HeadlessCliManagerOwnerBinding;
+
+export type WorkerTerminalOutcome = "completed";
+
+export interface WorkerMigrationOutcomeAudit {
+  stoppedAt?: number;
+  stopReason?: string;
+  dirtyAtStop?: boolean;
+  dirtyStatusAtStop?: string;
+  dirtyCheckErrorAtStop?: string;
+  lastError?: string;
+  terminalOutcome?: WorkerTerminalOutcome;
+}
+
+export interface WorkerMigrationAudit {
+  sourceVersion: 1;
+  migratedAt: number;
+  originalState: LegacyWorkerState;
+  originalRunId: string;
+  mappedState: CanonicalWorkerState | "migration_pending";
+  originalOutcome: WorkerMigrationOutcomeAudit;
+  managerOwnerInferredFromLegacySession: true;
+  requiresReadinessReconciliation?: true;
+  legacyIdleHint?: true;
+  dispatchDenied?: true;
+  reconcileBy?: number;
+  resolvedAt?: number;
+  resolution?: "stopped" | "failed" | "lost" | "unreachable";
+}
 
 export type Effort = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type WorkspacePolicy = "host" | "read-only" | "read-write";
@@ -88,10 +165,7 @@ export interface RoutingConfig {
   };
 }
 
-export interface SupervisionConfig {
-  recommendRalphForSubstantialWork: boolean;
-  recommendReturnOnAfterSpawn: boolean;
-}
+export type SupervisionConfig = Record<string, never>;
 
 export interface OrchestratorConfig {
   defaultHarness: Harness;
@@ -125,7 +199,11 @@ export interface OrchestratorConfig {
 
 export interface WorkerRecord {
   id: string;
+  /** @deprecated Use workerIncarnationId. This remains a lossless API alias during migration. */
   runId: string;
+  workerIncarnationId?: string;
+  workerGeneration?: number;
+  bossRunId?: string;
   harness: Harness;
   backend: WorkerBackend;
   role: string;
@@ -137,8 +215,13 @@ export interface WorkerRecord {
   effort?: Effort;
   instructions?: string;
   state: WorkerState;
+  stateReason?: string;
+  terminalOutcome?: WorkerTerminalOutcome;
   owned: boolean;
+  /** @deprecated Use managerOwner.sessionId. */
   managerSessionId: string;
+  managerOwner?: ManagerOwnerBinding;
+  migrationAudit?: WorkerMigrationAudit;
   intercomTarget?: string;
   unit?: string;
   mainPid?: number;
@@ -163,6 +246,14 @@ export interface WorkerRecord {
   backendDetails?: unknown;
 }
 
+/** Canonical in-memory v2 record. Deprecated aliases are hydrated for callers but are not serialized. */
+export interface WorkerRecordV2 extends WorkerRecord {
+  workerIncarnationId: string;
+  workerGeneration: number;
+  state: CanonicalWorkerState | "migration_pending";
+  managerOwner: ManagerOwnerBinding;
+}
+
 export interface RuntimeCleanupClaim {
   token: string;
   workerId: string;
@@ -176,10 +267,37 @@ export interface RuntimeCleanupClaim {
   pathIndexes: number[];
 }
 
+export interface WorkerGenerationLedgerEntry {
+  workerId: string;
+  /** Highest generation ever committed for this worker id, including forgotten records. */
+  generation: number;
+}
+
 export interface WorkerStateFile {
-  version: 1;
+  /** Version 1 is accepted only as a compatibility input and explicit migration source. */
+  version: 1 | 2;
+  /** Monotonic compare-and-swap generation. Required for canonical version 2 snapshots. */
+  generation?: number;
   workers: WorkerRecord[];
+  /** Durable anti-reuse ledger. Canonical version 2 snapshots always include it. */
+  workerGenerations?: WorkerGenerationLedgerEntry[];
   runtimeCleanupClaims?: RuntimeCleanupClaim[];
+  /** Active schema features; an unsupported feature prevents reads and mutations. */
+  activeFeatures?: string[];
+}
+
+/** Exact canonical snapshot returned by WorkerStore reads. */
+export interface WorkerStateFileV2 extends WorkerStateFile {
+  version: 2;
+  generation: number;
+  workers: WorkerRecordV2[];
+  workerGenerations: WorkerGenerationLedgerEntry[];
+}
+
+export interface LegacyWorkerStateFileV1 extends WorkerStateFile {
+  version: 1;
+  generation?: never;
+  activeFeatures?: never;
 }
 
 export interface UnitStatus {

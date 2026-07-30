@@ -3,11 +3,85 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { DEFAULT_PERMISSION_PROFILES } from "./permissions.ts";
-import { DEFAULT_MODEL_ROUTING, isSafeModelPattern } from "./routing.ts";
-import type { Effort, GitPolicy, Harness, LaunchProfile, ModelRoutingRule, OrchestratorConfig, PermissionProfile, RolePreset, RoutingConfig, SupervisionConfig, WorkspacePolicy } from "./types.ts";
+import { BOSS_SYMBOLIC_PROFILE_NAMES, bossSymbolicRolePresets, DEFAULT_MODEL_ROUTING, isSafeModelPattern } from "./routing.ts";
+import type { Effort, GitPolicy, Harness, LaunchProfile, ModelRoutingRule, OrchestratorConfig, PermissionProfile, RolePreset, RoutingConfig, WorkspacePolicy } from "./types.ts";
 
 const HARNESSES: Harness[] = ["pi", "codex", "claude", "opencode"];
 const EFFORTS: Effort[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const RETIRED_SUPERVISION_FIELDS = [
+  "recommendRalphForSubstantialWork",
+  "recommendReturnOnAfterSpawn",
+] as const;
+const UNSAFE_CONFIG_KEYS = new Set(["__proto__", "prototype", "constructor"]);
+const BOSS_SYMBOLIC_PROFILES = new Set<string>(BOSS_SYMBOLIC_PROFILE_NAMES);
+
+export interface ConfigMigrationDiagnostic {
+  code: "retired-supervision-recommendation";
+  path: `supervision.${typeof RETIRED_SUPERVISION_FIELDS[number]}`;
+  message: string;
+}
+
+export interface ConfigMergeResult {
+  config: OrchestratorConfig;
+  diagnostics: ConfigMigrationDiagnostic[];
+}
+
+/**
+ * Copy only own enumerable data descriptors. Configuration parsing must not run
+ * accessors, consume inherited values, or honor prototype-mutating property names.
+ */
+function descriptorSafeClone(value: unknown, seen = new Map<object, unknown>()): unknown {
+  if (value === null || typeof value !== "object") return value;
+  const prior = seen.get(value);
+  if (prior !== undefined) return prior;
+  let descriptors: PropertyDescriptorMap;
+  try {
+    descriptors = Object.getOwnPropertyDescriptors(value);
+  } catch {
+    return undefined;
+  }
+  if (Array.isArray(value)) {
+    const output: unknown[] = [];
+    seen.set(value, output);
+    const declaredLength = descriptors.length && "value" in descriptors.length ? descriptors.length.value : 0;
+    const length = Number.isSafeInteger(declaredLength) && declaredLength >= 0 && declaredLength <= 100_000
+      ? declaredLength
+      : 0;
+    for (let index = 0; index < length; index += 1) {
+      const descriptor = descriptors[String(index)];
+      // Materialize holes/accessors as invalid values so downstream `every`
+      // checks cannot accidentally accept a sparse array without reading it.
+      output[index] = descriptor?.enumerable && "value" in descriptor
+        ? descriptorSafeClone(descriptor.value, seen)
+        : undefined;
+    }
+    return output;
+  }
+  const output: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  seen.set(value, output);
+  for (const [key, descriptor] of Object.entries(descriptors)) {
+    if (UNSAFE_CONFIG_KEYS.has(key) || !descriptor.enumerable || !("value" in descriptor)) continue;
+    output[key] = descriptorSafeClone(descriptor.value, seen);
+  }
+  return output;
+}
+
+function migrationDiagnosticsForSafeConfig(value: unknown): ConfigMigrationDiagnostic[] {
+  if (!isRecord(value) || !isRecord(value.supervision)) return [];
+  const supervision = value.supervision;
+  return RETIRED_SUPERVISION_FIELDS.flatMap((field): ConfigMigrationDiagnostic[] => Object.hasOwn(supervision, field)
+    ? [{
+      code: "retired-supervision-recommendation",
+      path: `supervision.${field}`,
+      message: `supervision.${field} is retired and ignored; intentional config serialization will remove it. Orc does not recommend or install Ralph or return-on.`,
+    }]
+    : []);
+}
+
+/** Inspect raw config migration needs without invoking any input property accessor. */
+export function configMigrationDiagnostics(value: unknown): ConfigMigrationDiagnostic[] {
+  return migrationDiagnosticsForSafeConfig(descriptorSafeClone(value));
+}
 
 function preferredLocalWrapper(name: string): string {
   const path = join(homedir(), ".local", "bin", name);
@@ -41,10 +115,10 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
     "codex-safe": {
       harness: "codex",
       command: preferredLocalWrapper("coi"),
-      args: ["--no-tui", "--sandbox", "workspace-write", "--ask-for-approval", "on-request"],
+      args: ["--no-tui"],
       mode: "persistent",
       maxRuntime: "12h",
-      description: "Wakeable Codex worker with a workspace-write sandbox",
+      description: "Wakeable Codex worker; the permission profile selects the native sandbox",
     },
     "codex-minimal": {
       harness: "codex",
@@ -97,6 +171,7 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
   },
   permissionProfiles: structuredClone(DEFAULT_PERMISSION_PROFILES),
   roles: {
+    ...bossSymbolicRolePresets(),
     advisor: {
       harness: "pi",
       profile: "pi-peer",
@@ -137,6 +212,14 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
     preference: ["pi", "codex", "claude", "opencode"],
     explicitOnly: ["opencode"],
     roles: {
+      manager: ["pi"],
+      worker: ["codex"],
+      scout: ["codex"],
+      "scout-medium": ["codex"],
+      adversary: ["claude"],
+      "council-systems": ["codex"],
+      "council-critical": ["claude"],
+      "council-alternative": ["claude"],
       advisor: ["pi", "codex", "claude"],
       researcher: ["pi", "codex", "claude"],
       reviewer: ["pi", "codex", "claude"],
@@ -158,10 +241,7 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
       requiresSubagents: ["codex", "claude"],
     },
   },
-  supervision: {
-    recommendRalphForSubstantialWork: true,
-    recommendReturnOnAfterSpawn: true,
-  },
+  supervision: {} as OrchestratorConfig["supervision"],
   leaseMinutes: 30,
   heartbeatSeconds: 60,
   maxRuntime: "2h",
@@ -325,7 +405,8 @@ function mergeModelRules(value: unknown, fallback: ModelRoutingRule[]): ModelRou
     const patterns = [...new Set(candidate.patterns
       .filter((pattern): pattern is string => typeof pattern === "string")
       .map((pattern) => pattern.trim())
-      .filter(isSafeModelPattern))];
+      .filter(isSafeModelPattern)
+      .filter((pattern) => !/^o[1-9](?:-\*)?$/i.test(pattern)))];
     return patterns.length ? [{ harness: candidate.harness, patterns }] : [];
   });
 }
@@ -353,17 +434,11 @@ function mergeModelRouting(value: unknown): RoutingConfig["modelRouting"] {
   };
 }
 
-function mergeSupervision(value: unknown): SupervisionConfig {
-  const fallback = DEFAULT_CONFIG.supervision;
-  if (!isRecord(value)) return structuredClone(fallback);
-  return {
-    recommendRalphForSubstantialWork: typeof value.recommendRalphForSubstantialWork === "boolean"
-      ? value.recommendRalphForSubstantialWork
-      : fallback.recommendRalphForSubstantialWork,
-    recommendReturnOnAfterSpawn: typeof value.recommendReturnOnAfterSpawn === "boolean"
-      ? value.recommendReturnOnAfterSpawn
-      : fallback.recommendReturnOnAfterSpawn,
-  };
+function mergeSupervision(value: unknown): OrchestratorConfig["supervision"] {
+  // Retired recommendation fields are diagnosed from the raw input before this
+  // normalization step. They must never survive in OrchestratorConfig.
+  void value;
+  return {} as OrchestratorConfig["supervision"];
 }
 
 function mergeRouting(
@@ -383,6 +458,7 @@ function mergeRouting(
   const roles = structuredClone(fallback.roles);
   if (isRecord(value.roles)) {
     for (const [role, preference] of Object.entries(value.roles)) {
+      if (BOSS_SYMBOLIC_PROFILES.has(role)) continue;
       if (Array.isArray(preference)) roles[role] = [...new Set(preference.filter(isHarness))];
     }
   }
@@ -399,7 +475,7 @@ function mergeRouting(
   const fallbackPolicy = isRecord(value.fallback) ? value.fallback : {};
   return {
     preference: mergeHarnessList(value.preference, fallback.preference),
-    explicitOnly: mergeHarnessList(value.explicitOnly, fallback.explicitOnly),
+    explicitOnly: [...new Set([...mergeHarnessList(value.explicitOnly, fallback.explicitOnly), "opencode" as const])],
     roles,
     profilePreferences: mergeProfilePreferences(value.profilePreferences, fallback.profilePreferences, defaultProfiles),
     roleRequirements,
@@ -415,7 +491,7 @@ function mergeRouting(
   };
 }
 
-export function mergeConfig(value: unknown): OrchestratorConfig {
+function mergeSafeConfig(value: unknown): OrchestratorConfig {
   if (!isRecord(value)) return structuredClone(DEFAULT_CONFIG);
   const profiles = structuredClone(DEFAULT_CONFIG.profiles);
   if (isRecord(value.profiles)) {
@@ -434,6 +510,7 @@ export function mergeConfig(value: unknown): OrchestratorConfig {
   const roles = structuredClone(DEFAULT_CONFIG.roles);
   if (isRecord(value.roles)) {
     for (const [name, roleValue] of Object.entries(value.roles)) {
+      if (BOSS_SYMBOLIC_PROFILES.has(name)) continue;
       const role = mergeRole(roleValue);
       if (role) roles[name] = { ...(roles[name] ?? {}), ...role };
     }
@@ -481,13 +558,39 @@ export function mergeConfig(value: unknown): OrchestratorConfig {
   };
 }
 
-export async function readConfig(path: string): Promise<OrchestratorConfig> {
+/** Normalize raw configuration and return every additive migration diagnostic. */
+export function mergeConfigWithDiagnostics(value: unknown): ConfigMergeResult {
+  const safeValue = descriptorSafeClone(value);
+  return {
+    config: mergeSafeConfig(safeValue),
+    diagnostics: migrationDiagnosticsForSafeConfig(safeValue),
+  };
+}
+
+export function mergeConfig(value: unknown): OrchestratorConfig {
+  return mergeConfigWithDiagnostics(value).config;
+}
+
+export async function readConfigWithDiagnostics(path: string): Promise<ConfigMergeResult> {
   try {
-    return mergeConfig(JSON.parse(await readFile(path, "utf8")));
+    return mergeConfigWithDiagnostics(JSON.parse(await readFile(path, "utf8")));
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return structuredClone(DEFAULT_CONFIG);
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { config: structuredClone(DEFAULT_CONFIG), diagnostics: [] };
+    }
     throw new Error(`Could not read orchestrator config ${path}: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+export async function readConfig(path: string): Promise<OrchestratorConfig> {
+  const result = await readConfigWithDiagnostics(path);
+  for (const diagnostic of result.diagnostics) {
+    process.emitWarning(diagnostic.message, {
+      code: "AGENT_INTERCOM_CONFIG_MIGRATION",
+      detail: `path=${diagnostic.path}`,
+    });
+  }
+  return result.config;
 }
 
 async function writeConfigValue(path: string, value: unknown): Promise<void> {
@@ -498,10 +601,11 @@ async function writeConfigValue(path: string, value: unknown): Promise<void> {
 }
 
 export async function writeConfig(path: string, config: OrchestratorConfig): Promise<void> {
-  await writeConfigValue(path, config);
+  await writeConfigValue(path, mergeConfig(config));
 }
 
 export async function writeConfigDefaults(path: string, config: OrchestratorConfig): Promise<void> {
+  config = mergeConfig(config);
   let existing: Record<string, unknown> = {};
   try {
     const parsed = JSON.parse(await readFile(path, "utf8"));
@@ -615,12 +719,6 @@ export async function writeConfigDefaults(path: string, config: OrchestratorConf
   delete existingSupervision.recommendReturnOnAfterSpawn;
   const supervision = {
     ...existingSupervision,
-    ...(config.supervision.recommendRalphForSubstantialWork !== DEFAULT_CONFIG.supervision.recommendRalphForSubstantialWork
-      ? { recommendRalphForSubstantialWork: config.supervision.recommendRalphForSubstantialWork }
-      : {}),
-    ...(config.supervision.recommendReturnOnAfterSpawn !== DEFAULT_CONFIG.supervision.recommendReturnOnAfterSpawn
-      ? { recommendReturnOnAfterSpawn: config.supervision.recommendReturnOnAfterSpawn }
-      : {}),
   };
   await writeConfigValue(path, {
     ...existing,

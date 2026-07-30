@@ -5,7 +5,7 @@ import { WorkerStore } from "./store.ts";
 import { listWorkerUnitsForVerification, sanitizeUnitPart, verifyUnitAbsentAndEmpty } from "./systemd.ts";
 import type { CommandRunner, OrchestratorConfig, RuntimeCleanupClaim, WorkerRecord, WorkerStateFile } from "./types.ts";
 import { workerRuntimeRoot } from "./runtime.ts";
-import { isLiveState, validateWorkerId } from "./workers.ts";
+import { isTerminalState, validateWorkerId } from "./workers.ts";
 
 export const TERMINAL_CACHE_PATHS = [
   ["home", ".cache", "npm"],
@@ -17,7 +17,7 @@ export const TERMINAL_CACHE_PATHS = [
 ] as const;
 
 export function terminalWorkerAt(worker: WorkerRecord): number | undefined {
-  if (!worker.owned || isLiveState(worker.state)) return undefined;
+  if (!worker.owned || !isTerminalState(worker.state)) return undefined;
   return worker.stoppedAt ?? worker.updatedAt;
 }
 
@@ -355,10 +355,12 @@ async function transitionToMoved(input: {
     claim.pathIndexes = existing;
     claim.phase = "moving";
     await persist();
-    for (const entry of selectedEntries(claim, input.agentDir)) {
+    const movingClaim = claims(state).find((candidate) => candidate.token === input.token && candidate.phase === "moving");
+    if (!movingClaim) throw new Error(`Cleanup claim ${input.token} was not durably published as moving`);
+    for (const entry of selectedEntries(movingClaim, input.agentDir)) {
       await (input.renamePath ?? rename)(entry.path, entry.quarantine);
     }
-    claim.phase = "moved";
+    movingClaim.phase = "moved";
     await persist();
     return true;
   });

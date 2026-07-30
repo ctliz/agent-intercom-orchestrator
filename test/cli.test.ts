@@ -99,6 +99,7 @@ test("CLI renew records activity before startup cleanup can expire the worker", 
       PI_CODING_AGENT_DIR: agentDir,
       AGENT_INTERCOM_ORCHESTRATOR_DISABLED: "",
       AGENT_INTERCOM_DISABLE_CLEANUP_TIMER: "1",
+      OPENCODE_INTERCOM_FLEET: "1",
     }, JSON.stringify({
       managerSessionId: "opencode-manager-test",
       cwd: process.cwd(),
@@ -109,7 +110,8 @@ test("CLI renew records activity before startup cleanup can expire the worker", 
     assert.equal(response.ok, true);
     assert.match(response.result.content[0].text, /Renewed 1 worker lease/);
     const state = JSON.parse(await readFile(join(orchestratorDir, "workers.json"), "utf8"));
-    assert.equal(state.workers[0].state, "running");
+    assert.equal(state.workers[0].state, "registering");
+    assert.equal(state.workers[0].managerOwner.context, "opencode");
     assert.ok(state.workers[0].lastWorkerActivityAt > old);
   } finally {
     await rm(agentDir, { recursive: true, force: true });
@@ -135,6 +137,7 @@ test("internal manager heartbeat returns checkpoint requests without exposing a 
       PI_CODING_AGENT_DIR: agentDir,
       AGENT_INTERCOM_ORCHESTRATOR_DISABLED: "",
       AGENT_INTERCOM_DISABLE_CLEANUP_TIMER: "1",
+      OPENCODE_INTERCOM_FLEET: "1",
     }, JSON.stringify({
       managerSessionId: "opencode-manager-test",
       cwd: process.cwd(),

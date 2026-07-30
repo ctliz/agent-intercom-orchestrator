@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { DEFAULT_CONFIG, mergeConfig } from "../src/config.ts";
 import {
+  BOSS_SYMBOLIC_PROFILE_NAMES,
   detectHarnessAvailability,
   formatRoutingDecision,
   inferHarnessFromModel,
@@ -10,6 +11,7 @@ import {
   normalizeModelForHarness,
   roleInstructionsForHarness,
   roleRequiresSubagents,
+  resolveBossSymbolicProfile,
   resolveHarnessRoute,
   type HarnessAvailability,
 } from "../src/routing.ts";
@@ -76,20 +78,20 @@ test("subagent-required work excludes Pi and selects direct Codex before Claude"
   assert.match(decision.candidates[0].reasons.join(" "), /nested subagents are required/);
 });
 
-test("explicitOnly defaults protect OpenCode, remain config-authoritative, and explicit overrides win", () => {
+test("OpenCode remains explicit-only and explicit overrides win", () => {
   const onlyOpenCode = availability({
     pi: { available: false, reasons: ["missing"] },
     codex: { available: false, reasons: ["missing"] },
     claude: { available: false, reasons: ["missing"] },
   });
   const automatic = resolveHarnessRoute({
-    role: "worker",
+    role: "custom",
     defaultHarness: "pi",
     routing: DEFAULT_CONFIG.routing,
     availability: onlyOpenCode,
   });
   const explicit = resolveHarnessRoute({
-    role: "worker",
+    role: "custom",
     defaultHarness: "pi",
     routing: DEFAULT_CONFIG.routing,
     availability: onlyOpenCode,
@@ -105,17 +107,18 @@ test("explicitOnly defaults protect OpenCode, remain config-authoritative, and e
   assert.match(explicit.reasons.join(" "), /does not support configured nested subagents/);
 
   const configuredAutomatic = resolveHarnessRoute({
-    role: "worker",
+    role: "custom",
     defaultHarness: "pi",
     routing: { ...DEFAULT_CONFIG.routing, explicitOnly: [] },
     availability: onlyOpenCode,
   });
-  assert.equal(configuredAutomatic.selected, "opencode");
+  assert.equal(configuredAutomatic.selected, undefined);
+  assert.match(configuredAutomatic.candidates.find((candidate) => candidate.harness === "opencode")?.reasons.join(" ") ?? "", /explicit-only/);
 });
 
 test("configured routing preference outranks the legacy default fallback", () => {
   const decision = resolveHarnessRoute({
-    role: "worker",
+    role: "custom",
     defaultHarness: "pi",
     routing: { ...DEFAULT_CONFIG.routing, preference: ["claude", "codex", "pi", "opencode"] },
     availability: availability(),
@@ -132,13 +135,86 @@ test("explicit model identifiers select direct Codex or Claude harnesses", () =>
   assert.equal(inferHarnessFromModel("openai/gpt-5.4"), "codex");
   assert.equal(inferHarnessFromModel("gpt-5.6-sol"), "codex");
   assert.equal(inferHarnessFromModel("codex-mini-latest"), "codex");
-  assert.equal(inferHarnessFromModel("o2"), "codex");
-  assert.equal(inferHarnessFromModel("o9-reasoning"), "codex");
+  assert.equal(inferHarnessFromModel("o2"), undefined);
+  assert.equal(inferHarnessFromModel("o9-reasoning"), undefined);
   assert.equal(inferHarnessFromModel("o1x"), undefined);
   assert.equal(inferHarnessFromModel("claude/claude-fable-5"), "claude");
   assert.equal(inferHarnessFromModel("anthropic/claude-opus-4-8"), "claude");
   assert.equal(inferHarnessFromModel("opus"), "claude");
   assert.equal(inferHarnessFromModel("google/gemini-3"), undefined);
+});
+
+test("Boss symbolic profiles resolve exact deterministic tuples with harness instruction layers", () => {
+  assert.deepEqual(BOSS_SYMBOLIC_PROFILE_NAMES, [
+    "manager",
+    "worker",
+    "scout",
+    "scout-medium",
+    "adversary",
+    "council-systems",
+    "council-critical",
+    "council-alternative",
+  ]);
+  const expected = {
+    manager: ["pi", "codex/gpt-5.6-sol", "high", "manager-restricted"],
+    worker: ["codex", "gpt-5.6-sol", "medium", "builder-restricted"],
+    scout: ["codex", "gpt-5.6-sol", "low", "review-readonly"],
+    "scout-medium": ["codex", "gpt-5.6-sol", "medium", "review-readonly"],
+    adversary: ["claude", "claude-opus-5", "xhigh", "review-readonly"],
+    "council-systems": ["codex", "gpt-5.6-sol", "xhigh", "review-readonly"],
+    "council-critical": ["claude", "claude-opus-5", "xhigh", "review-readonly"],
+    "council-alternative": ["claude", "claude-fable-5", "medium", "review-readonly"],
+  } as const;
+  for (const name of BOSS_SYMBOLIC_PROFILE_NAMES) {
+    const first = resolveBossSymbolicProfile(name);
+    const second = resolveBossSymbolicProfile(name);
+    assert.ok(first);
+    assert.deepEqual([first.harness, first.model, first.effort, first.permissionProfile], expected[name]);
+    assert.deepEqual(first, second);
+    assert.notEqual(first, second);
+    assert.match(first.instructions ?? "", new RegExp(`${first.harness === "pi" ? "Pi" : first.harness === "codex" ? "Codex" : "Claude Code"} harness layer`));
+  }
+  assert.equal(resolveBossSymbolicProfile("Manager"), undefined);
+  assert.equal(resolveBossSymbolicProfile("manager "), undefined);
+  assert.equal(resolveBossSymbolicProfile("council"), undefined);
+  let coerced = false;
+  const hostileName = {
+    [Symbol.toPrimitive]() {
+      coerced = true;
+      return "manager";
+    },
+  };
+  assert.equal(resolveBossSymbolicProfile(hostileName as unknown as string), undefined);
+  assert.equal(coerced, false);
+
+  const attemptedOverride = mergeConfig({
+    roles: { manager: { harness: "claude", model: "claude-haiku", effort: "minimal", permissionProfile: "trusted" } },
+    routing: { roles: { manager: ["claude"] } },
+  });
+  assert.deepEqual(
+    [attemptedOverride.roles.manager.harness, attemptedOverride.roles.manager.model, attemptedOverride.roles.manager.effort, attemptedOverride.roles.manager.permissionProfile],
+    expected.manager,
+  );
+  assert.deepEqual(attemptedOverride.routing.roles.manager, ["pi"]);
+
+  const unavailableManager = resolveHarnessRoute({
+    role: "manager",
+    defaultHarness: "claude",
+    routing: attemptedOverride.routing,
+    availability: availability({ pi: { available: false, reasons: ["purpose-built Manager unavailable"] } }),
+  });
+  assert.equal(unavailableManager.selected, undefined);
+  assert.deepEqual(unavailableManager.candidates.map((candidate) => candidate.harness), ["pi"]);
+  const explicitOverride = resolveHarnessRoute({
+    role: "manager",
+    defaultHarness: "pi",
+    routing: attemptedOverride.routing,
+    availability: availability(),
+    explicitHarness: "claude",
+    explicitSource: "harness",
+  });
+  assert.equal(explicitOverride.selected, "claude");
+  assert.equal(explicitOverride.automatic, false);
 });
 
 test("model routing is ordered, config-driven, normalized, and limited to safe patterns", () => {
@@ -215,7 +291,7 @@ test("zero eligible harnesses returns an explainable preview decision", () => {
     claude: { available: false, reasons: ["claude missing"] },
   });
   const decision = resolveHarnessRoute({
-    role: "worker",
+    role: "custom",
     defaultHarness: "pi",
     routing: DEFAULT_CONFIG.routing,
     availability: unavailable,

@@ -57,14 +57,14 @@
       "./skills"
     ]
   },
+  "dependencies": {
+    "@dataforxyz/agent-intercom-core": "git+https://github.com/dataforxyz/agent-intercom-core.git#8316cbab548f422ad11c78ed887fabeef94817c1"
+  },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
     "typebox": "*"
-  },
-  "dependencies": {
-    "@dataforxyz/agent-intercom-core": "git+https://github.com/dataforxyz/agent-intercom-core.git#cb5d2212912db0cd8abbb16ab08e4b539424a05d"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "*",
@@ -76,5 +76,8 @@
   },
   "publishConfig": {
     "access": "public"
+  },
+  "engines": {
+    "node": ">=22.19.0"
   }
 }
