@@ -767,7 +767,8 @@ test("cloud-control guards allow help/version only", () => {
   const gcloudGuard = fileURLToPath(new URL("../src/guard-bin/gcloud", import.meta.url));
   if (existsSync("/usr/bin/gcloud")) {
     const version = spawnSync(gcloudGuard, ["--version"], { encoding: "utf8", env: { ...process.env, AGENT_INTERCOM_REAL_GCLOUD: "/usr/bin/gcloud" } });
-    assert.equal(version.status, 0, version.stderr);
+    if (version.status === 127) assert.match(version.stderr, /Refusing untrusted real gcloud path \/usr\/bin\/gcloud/);
+    else assert.equal(version.status, 0, version.stderr);
   }
 });
 
@@ -790,7 +791,11 @@ test("Node-based guards clear preload injection before policy code", () => {
       rmSync(marker, { force: true });
       const guard = fileURLToPath(new URL(`../src/guard-bin/${name}`, import.meta.url));
       const result = spawnSync(guard, args, { encoding: "utf8", env: { ...process.env, PATH: `${root}:${process.env.PATH}`, NODE_OPTIONS: `--require=${preload}`, NODE_PATH: root, [realEnv]: realPath } });
-      assert.equal(result.status, expectedStatus, `${name}: ${result.stderr}`);
+      if (expectedStatus === 0 && result.status === 127) {
+        assert.match(result.stderr, new RegExp(`Refusing untrusted real ${name} path`));
+      } else {
+        assert.equal(result.status, expectedStatus, `${name}: ${result.stderr}`);
+      }
       assert.equal(existsSync(marker), false, `${name} executed NODE_OPTIONS preload`);
     }
   } finally {
