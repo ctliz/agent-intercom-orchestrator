@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Make worker startup fail closed across systemd submission, queued activation, stable PID verification, and exact-run Intercom readiness; add durable stop fencing, late-unit reconciliation, honest unverified adapter states, user-manager backlog protection, and serialized systemd integration tests.
 - Add `/coagents`, a compact colored read-only coworker overlay with live/all views, refresh, short default summaries, and Enter-to-expand task, path, process, lifecycle, and manager details.
 - Harden runtime cleanup with durable same-ID claims, fail-closed systemd/cgroup revalidation, symlink-safe contained paths, atomic quarantine and crash recovery, isolated candidate failures, and a configurable 60-minute grace period for unregistered runtimes.
 - Add an explicit non-prompting `claude-trusted` launch profile for headless Claude Code work paired with the broad `trusted` permission profile, and give `claude-minimal` accurate final-response relay instructions because minimal mode intentionally removes MCP tools.

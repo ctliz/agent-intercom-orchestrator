@@ -1,0 +1,112 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { getUnitStatus, getUserManagerHealth, launchUnit, stopUnit, waitForUnitRunning } from "../src/systemd.ts";
+import { stateFromUnit, unitRequiresStopFence } from "../src/workers.ts";
+
+const ok = (stdout = "") => ({ stdout, stderr: "", code: 0 });
+
+test("user-manager health distinguishes a draining queue, persistent backlog, and indeterminate timeout", async () => {
+  let reads = 0;
+  const healthy = await getUserManagerHealth({ async exec() {
+    reads += 1;
+    return reads === 1
+      ? ok("17 worker-a.service start running\n18 worker-b.service stop waiting\n")
+      : ok("");
+  } }, { settleMs: 1 });
+  assert.deepEqual(healthy, { responsive: true, settled: true, jobCount: 0, jobs: [] });
+
+  const stuck = await getUserManagerHealth({ async exec() {
+    return ok("17 worker-a.service start waiting\n18 worker-b.service stop waiting\n");
+  } }, { settleMs: 1 });
+  assert.equal(stuck.responsive, true);
+  assert.equal(stuck.settled, false);
+  assert.equal(stuck.persistentJobs?.length, 2);
+
+  const stalled = await getUserManagerHealth({ async exec() {
+    return { stdout: "", stderr: "", code: 143, killed: true };
+  } });
+  assert.equal(stalled.responsive, false);
+  assert.match(stalled.error ?? "", /timed out/);
+});
+
+test("launch is nonblocking and a killed submission is indeterminate", async () => {
+  const calls: string[][] = [];
+  await launchUnit({ async exec(_command, args) { calls.push(args); return ok(); } }, {
+    unit: "worker.service",
+    profile: { harness: "pi", command: "/usr/bin/true", mode: "persistent" },
+    args: [], cwd: "/tmp", maxRuntime: "2h", stopTimeoutSeconds: 5,
+  });
+  assert.ok(calls[0].includes("--no-block"));
+
+  await assert.rejects(launchUnit({ async exec() { return { stdout: "", stderr: "", code: 143, killed: true }; } }, {
+    unit: "worker.service",
+    profile: { harness: "pi", command: "/usr/bin/true", mode: "persistent" },
+    args: [], cwd: "/tmp", maxRuntime: "2h", stopTimeoutSeconds: 5,
+  }), /determine whether .* submitted/);
+});
+
+test("queued jobs and activation evidence survive status parsing", async () => {
+  const queued = await getUnitStatus({ async exec() { return ok(
+    "LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nResult=success\nExecMainStatus=0\nJob=77/start\nActiveEnterTimestampMonotonic=0\nInactiveEnterTimestampMonotonic=12\nExecMainStartTimestampMonotonic=0\n",
+  ); } }, "queued.service");
+  assert.equal(queued.verified, true);
+  assert.equal(queued.job, "77/start");
+  assert.equal(queued.inactiveEnterTimestampMonotonic, 12);
+  assert.equal(stateFromUnit(queued, "registering"), "provisioning");
+
+  const timedOut = await getUnitStatus({ async exec() { return { stdout: "", stderr: "", code: 143, killed: true }; } }, "unknown.service");
+  assert.equal(timedOut.verified, false);
+  assert.equal(stateFromUnit(timedOut, "registering"), "registering");
+});
+
+test("running verification waits through a queue and rejects an early crash", async () => {
+  let reads = 0;
+  const status = await waitForUnitRunning({ async exec() {
+    reads += 1;
+    return reads === 1
+      ? ok("LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nJob=88/start\n")
+      : ok("LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=4242\nJob=\nExecMainStartTimestampMonotonic=10\n");
+  } }, "worker.service", { timeoutMs: 100, intervalMs: 1, stableMs: 0 });
+  assert.equal(status.mainPid, 4242);
+
+  await assert.rejects(waitForUnitRunning({ async exec() {
+    return ok("LoadState=loaded\nActiveState=failed\nSubState=failed\nMainPID=0\nResult=exit-code\nExecMainStatus=1\nJob=\n");
+  } }, "failed.service", { timeoutMs: 50, intervalMs: 1 }), /failed before readiness/);
+});
+
+test("never-started inactive units are failures, while proven clean exits are stopped", () => {
+  assert.equal(stateFromUnit({ exists: true, activeState: "inactive", execMainStatus: 0 }, "registering"), "failed");
+  assert.equal(stateFromUnit({ exists: true, activeState: "inactive", execMainStatus: 0, execMainStartTimestampMonotonic: 10 }, "registering"), "stopped");
+});
+
+test("durable stop intent fences queued and late-active units without reviving terminal records", () => {
+  const worker: any = {
+    id: "worker-a", runId: "run-a", harness: "pi", backend: "systemd", role: "advisor", task: "review", cwd: "/tmp",
+    state: "stopped", owned: true, managerSessionId: "manager", createdAt: 1, updatedAt: 2, leaseExpiresAt: 3,
+    stopRequestedAt: 2, stopReason: "manager-requested", unit: "worker-a.service",
+  };
+  assert.equal(unitRequiresStopFence(worker, { exists: true, activeState: "inactive", job: "91/start" }), true);
+  assert.equal(unitRequiresStopFence(worker, { exists: true, activeState: "active", subState: "running", mainPid: 4242 }), true);
+  assert.equal(unitRequiresStopFence(worker, { exists: false, activeState: "inactive" }), false);
+  assert.equal(unitRequiresStopFence({ ...worker, state: "registering", stopRequestedAt: undefined, stopReason: undefined }, { exists: true, activeState: "active", mainPid: 4242 }), false);
+  assert.equal(unitRequiresStopFence(worker, { verified: false, exists: false, error: "timeout" }), false, "indeterminate status cannot authorize a stop conclusion");
+});
+
+test("stop re-verifies after a timed-out request and waits for the queued job to clear", async () => {
+  let shows = 0;
+  const calls: Array<{ command: string; args: string[] }> = [];
+  await stopUnit({ async exec(command, args) {
+    calls.push({ command, args });
+    if (command === "systemctl" && args.includes("stop")) return { stdout: "", stderr: "", code: 143, killed: true };
+    if (command === "systemctl" && args.includes("show")) {
+      shows += 1;
+      return shows === 1
+        ? ok("LoadState=loaded\nActiveState=inactive\nSubState=dead\nJob=90/stop\n")
+        : ok("LoadState=not-found\nActiveState=inactive\nSubState=dead\nJob=\n");
+    }
+    if (command === "systemd-cgls") return { stdout: "", stderr: "unit not found", code: 1 };
+    return ok();
+  } }, "worker.service", { timeoutMs: 100, intervalMs: 1, stableMs: 0 });
+  assert.equal(shows, 2);
+  assert.ok(calls.some(({ command, args }) => command === "systemctl" && args.includes("stop") && args.includes("--no-block")));
+});

@@ -591,7 +591,7 @@ intercom_send({
 })
 ```
 
-Pi, Codex, and Claude registration is not automatically awaited. If the first delivery reports that the target is not connected yet, wait briefly and retry. Use `intercom_list({})` only as a readiness diagnostic or to discover independently launched peers. Orchestrator-owned persistent OpenCode peers are the exception: spawn waits for run-specific plugin, Intercom, and session readiness before returning.
+Spawn first waits for the systemd job to clear and verifies a stable active unit with a nonzero main PID. Persistent Pi peers created by an interactive Pi manager then complete an invisible run-ID-keyed Intercom probe/ack before spawn reports `ready`. Headless/OpenCode managers do not expose that in-process control-event bridge, so their persistent Pi workers remain process-stable `registering` until a transport-independent readiness contract is available. Built-in persistent Codex and Claude profiles wait for the coordinated adapter's post-connect marker to write exact-run readiness health; an adapter exit or marker/version mismatch fails closed. Custom persistent adapter profiles report process-stable `registering` unless they adopt a compatible readiness contract. Persistent OpenCode peers retain their run-specific plugin, Intercom, and session handshake. If the first assignment delivery fails after spawn returned `ready`, inspect `agent_fleet status` and `agent_fleet logs`; it is a later disconnect, not normal registration delay. Use `intercom_list({})` only as a readiness diagnostic or to discover independently launched peers.
 
 For independent/manual sessions, still check that the process is alive, the reported cwd is correct, the identity is unique, and the worktree is intended:
 

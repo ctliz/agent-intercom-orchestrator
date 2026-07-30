@@ -1,6 +1,7 @@
 import { access } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { basename } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import type { CommandRunner, LaunchProfile, UnitStatus } from "./types.ts";
 import { expandHome, resolveProfileCommand } from "./config.ts";
 
@@ -59,9 +60,50 @@ function parseSystemctlShow(stdout: string): Record<string, string> {
   );
 }
 
+export type UserManagerHealth = {
+  responsive: boolean;
+  settled?: boolean;
+  jobCount?: number;
+  jobs?: string[];
+  persistentJobs?: string[];
+  error?: string;
+};
+
+export async function getUserManagerHealth(
+  runner: CommandRunner,
+  options: { settleMs?: number } = {},
+): Promise<UserManagerHealth> {
+  const readJobs = async (): Promise<{ jobs?: string[]; error?: string }> => {
+    const result = await runner.exec(
+      "systemctl",
+      ["--user", "list-jobs", "--no-legend", "--no-pager", "--plain"],
+      { timeout: 5000 },
+    );
+    if (result.killed) return { error: "systemctl list-jobs timed out" };
+    if (result.code !== 0) return { error: result.stderr.trim() || result.stdout.trim() || `systemctl list-jobs exited ${result.code}` };
+    return { jobs: result.stdout.split("\n").map((line) => line.trim()).filter(Boolean) };
+  };
+  const first = await readJobs();
+  if (!first.jobs) return { responsive: false, error: first.error };
+  if (first.jobs.length === 0) return { responsive: true, settled: true, jobCount: 0, jobs: [] };
+  await delay(options.settleMs ?? 250);
+  const second = await readJobs();
+  if (!second.jobs) return { responsive: false, error: second.error, jobCount: first.jobs.length, jobs: first.jobs };
+  const secondIds = new Set(second.jobs.map((line) => line.split(/\s+/, 1)[0]));
+  const persistentJobs = first.jobs.filter((line) => secondIds.has(line.split(/\s+/, 1)[0]));
+  return {
+    responsive: true,
+    settled: persistentJobs.length === 0,
+    jobCount: second.jobs.length,
+    jobs: second.jobs,
+    ...(persistentJobs.length ? { persistentJobs } : {}),
+  };
+}
+
 export async function systemdAvailable(runner: CommandRunner): Promise<boolean> {
   const result = await runner.exec("systemctl", ["--user", "show-environment"], { timeout: 5000 });
-  return result.code === 0;
+  if (result.killed || result.code !== 0) return false;
+  return (await getUserManagerHealth(runner)).responsive;
 }
 
 export async function resolveLaunchCommand(profile: LaunchProfile): Promise<string> {
@@ -113,7 +155,14 @@ export async function launchUnit(runner: CommandRunner, input: LaunchUnitInput):
     args.push(`--setenv=${key}=${value}`);
   }
   args.push(executable, ...input.args);
+  // Submission and readiness are separate phases. --no-block prevents a
+  // wedged user manager from holding this process indefinitely; callers must
+  // subsequently prove that the queued job completed and the unit is running.
+  args.splice(1, 0, "--no-block");
   const result = await runner.exec("systemd-run", args, { timeout: 15000 });
+  if (result.killed) {
+    throw new Error(`Could not determine whether ${input.unit} was submitted: systemd-run timed out`);
+  }
   if (result.code !== 0) {
     throw new Error(`Could not start ${input.unit}: ${result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`}`);
   }
@@ -127,22 +176,85 @@ export async function getUnitStatus(runner: CommandRunner, unit: string): Promis
       "show",
       unit,
       "--no-pager",
-      "--property=LoadState,ActiveState,SubState,MainPID,Result,ExecMainStatus",
+      "--property=LoadState,ActiveState,SubState,MainPID,Result,ExecMainStatus,Job,ActiveEnterTimestampMonotonic,InactiveEnterTimestampMonotonic,ExecMainStartTimestampMonotonic",
     ],
     { timeout: 5000 },
   );
-  if (result.code !== 0) return { exists: false };
   const values = parseSystemctlShow(result.stdout);
-  const mainPid = Number(values.MainPID);
+  if (result.killed) {
+    return { verified: false, exists: values.LoadState !== "not-found", error: "systemctl show timed out" };
+  }
+  if (result.code !== 0 && values.LoadState !== "not-found") {
+    return {
+      verified: false,
+      exists: false,
+      error: result.stderr.trim() || result.stdout.trim() || `systemctl show exited ${result.code}`,
+    };
+  }
+  const numeric = (value: string | undefined): number | undefined => {
+    const parsed = Number(value);
+    return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : undefined;
+  };
+  const mainPid = numeric(values.MainPID);
   const execMainStatus = Number(values.ExecMainStatus);
   return {
+    verified: true,
     exists: values.LoadState !== "not-found",
     activeState: values.ActiveState,
     subState: values.SubState,
-    ...(Number.isInteger(mainPid) && mainPid > 0 ? { mainPid } : {}),
+    ...(mainPid ? { mainPid } : {}),
     ...(values.Result ? { result: values.Result } : {}),
     ...(Number.isInteger(execMainStatus) ? { execMainStatus } : {}),
+    ...(values.Job ? { job: values.Job } : {}),
+    ...(numeric(values.ActiveEnterTimestampMonotonic) ? { activeEnterTimestampMonotonic: numeric(values.ActiveEnterTimestampMonotonic) } : {}),
+    ...(numeric(values.InactiveEnterTimestampMonotonic) ? { inactiveEnterTimestampMonotonic: numeric(values.InactiveEnterTimestampMonotonic) } : {}),
+    ...(numeric(values.ExecMainStartTimestampMonotonic) ? { execMainStartTimestampMonotonic: numeric(values.ExecMainStartTimestampMonotonic) } : {}),
   };
+}
+
+export function formatUnitStatus(status: UnitStatus): string {
+  const fields = [
+    `verified=${status.verified !== false}`,
+    `exists=${status.exists}`,
+    `state=${status.activeState ?? "unknown"}/${status.subState ?? "unknown"}`,
+    `pid=${status.mainPid ?? 0}`,
+    `job=${status.job || "none"}`,
+  ];
+  if (status.result) fields.push(`result=${status.result}`);
+  if (status.execMainStatus !== undefined) fields.push(`exit=${status.execMainStatus}`);
+  if (status.error) fields.push(`error=${status.error}`);
+  return fields.join(" ");
+}
+
+export async function waitForUnitRunning(
+  runner: CommandRunner,
+  unit: string,
+  options: { timeoutMs?: number; intervalMs?: number; stableMs?: number } = {},
+): Promise<UnitStatus> {
+  const deadline = Date.now() + (options.timeoutMs ?? 20_000);
+  const stableMs = options.stableMs ?? 750;
+  let runningSince: number | undefined;
+  let runningPid: number | undefined;
+  let last: UnitStatus = { verified: false, exists: false, error: "no status observed" };
+  while (Date.now() < deadline) {
+    last = await getUnitStatus(runner, unit);
+    if (last.verified !== false && !last.job && last.exists && last.activeState === "active" && Boolean(last.mainPid)) {
+      if (runningPid !== last.mainPid) {
+        runningPid = last.mainPid;
+        runningSince = Date.now();
+      }
+      if (Date.now() - runningSince! >= stableMs) return last;
+    } else {
+      runningPid = undefined;
+      runningSince = undefined;
+    }
+    if (last.verified !== false && !last.job && last.exists
+      && (last.activeState === "failed" || (last.result && last.result !== "success"))) {
+      throw new Error(`Worker unit ${unit} failed before readiness (${formatUnitStatus(last)})`);
+    }
+    await delay(options.intervalMs ?? 100);
+  }
+  throw new Error(`Timed out waiting for worker unit ${unit} to run (${formatUnitStatus(last)})`);
 }
 
 export async function readUnitProcessTree(runner: CommandRunner, unit: string): Promise<{ tree: string; pids: number[] }> {
@@ -182,15 +294,43 @@ export async function verifyUnitAbsentAndEmpty(
   return { absent: false, reason: `could not verify unit cgroup absence: ${processes.stderr.trim() || `exit ${processes.code}`}` };
 }
 
-export async function stopUnit(runner: CommandRunner, unit: string): Promise<void> {
+export async function stopUnit(
+  runner: CommandRunner,
+  unit: string,
+  options: { timeoutMs?: number; intervalMs?: number; stableMs?: number } = {},
+): Promise<void> {
   try {
-    const result = await runner.exec("systemctl", ["--user", "stop", unit], { timeout: 15000 });
-    if (result.code !== 0 && !/not loaded|not found/i.test(`${result.stdout}\n${result.stderr}`)) {
+    const result = await runner.exec("systemctl", ["--user", "stop", "--no-block", unit], { timeout: 15000 });
+    const missing = /not loaded|not found/i.test(`${result.stdout}\n${result.stderr}`);
+    if (!result.killed && result.code !== 0 && !missing) {
       throw new Error(`Could not stop ${unit}: ${result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`}`);
     }
+
+    const deadline = Date.now() + (options.timeoutMs ?? 20_000);
+    const stableMs = options.stableMs ?? 750;
+    let conclusiveSince: number | undefined;
+    let last: UnitStatus = { verified: false, exists: false, error: result.killed ? "systemctl stop timed out" : undefined };
+    while (Date.now() < deadline) {
+      last = await getUnitStatus(runner, unit);
+      const conclusive = last.verified !== false && !last.job
+        && (!last.exists || last.activeState === "inactive" || last.activeState === "failed");
+      if (conclusive) {
+        conclusiveSince ??= Date.now();
+        if (Date.now() - conclusiveSince >= stableMs) break;
+      } else {
+        conclusiveSince = undefined;
+      }
+      await delay(options.intervalMs ?? 100);
+    }
+    if (last.verified === false || last.job
+      || (last.exists && last.activeState !== "inactive" && last.activeState !== "failed")) {
+      throw new Error(`Could not conclusively stop ${unit} (${formatUnitStatus(last)})`);
+    }
+
     let remaining = await readUnitProcessTree(runner, unit);
     if (remaining.pids.length) {
-      await runner.exec("systemctl", ["--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit], { timeout: 5000 });
+      const killed = await runner.exec("systemctl", ["--user", "kill", "--kill-whom=all", "--signal=SIGKILL", unit], { timeout: 5000 });
+      if (killed.killed) throw new Error(`Could not determine whether ${unit} descendants were killed: systemctl timed out`);
       remaining = await readUnitProcessTree(runner, unit);
     }
     if (remaining.pids.length) {

@@ -51,6 +51,28 @@ function apiWorker(id: string, runId = `run-${id}`, state: WorkerRecord["state"]
   };
 }
 
+test("durable stop intent round-trips as a late-start fence", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-stop-fence-"));
+  const path = join(root, "workers.json");
+  try {
+    const store = new WorkerStore(path);
+    await store.mutate((state) => {
+      const worker = apiWorker("stop-fence", "run-stop-fence", "blocked");
+      worker.stateReason = "stop_in_progress";
+      worker.stopRequestedAt = 1234;
+      worker.stopReason = "manager-requested";
+      worker.unit = "agent-intercom-worker-stop-fence-run.service";
+      state.workers.push(worker);
+    });
+    const reloaded = await new WorkerStore(path).read();
+    assert.equal(reloaded.workers[0].stopRequestedAt, 1234);
+    assert.equal(reloaded.workers[0].stopReason, "manager-requested");
+    assert.equal(reloaded.workers[0].unit, "agent-intercom-worker-stop-fence-run.service");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("WorkerStore v1 migration maps every state, identity, owner, and audit field losslessly", async () => {
   const root = await mkdtemp(join(tmpdir(), "worker-store-v2-mapping-"));
   const path = join(root, "workers.json");

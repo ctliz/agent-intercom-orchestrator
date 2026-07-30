@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { access, chmod, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 function commandResult() {
@@ -166,6 +166,7 @@ test("stop patches the current worker record without clobbering concurrent metad
     const stopBlocked = new Promise<void>((resolve) => { releaseStop = resolve; });
     let stopStarted!: () => void;
     const stopEntered = new Promise<void>((resolve) => { stopStarted = resolve; });
+    let unitStopped = false;
     const pi: any = {
       on(name: string, handler: (...args: any[]) => any) { lifecycle.set(name, handler); },
       events: { on() { return () => {}; }, emit() {} },
@@ -178,7 +179,14 @@ test("stop patches the current worker record without clobbering concurrent metad
         if (command === "systemctl" && args[1] === "stop") {
           stopStarted();
           await stopBlocked;
+          unitStopped = true;
         }
+        if (command === "systemctl" && args.includes("show")) {
+          return unitStopped
+            ? { ...commandResult(), stdout: "LoadState=not-found\nActiveState=inactive\nSubState=dead\nJob=\n" }
+            : { ...commandResult(), stdout: "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nJob=\nExecMainStartTimestampMonotonic=10\n" };
+        }
+        if (command === "systemd-cgls") return { ...commandResult(), code: 1, stderr: "unit not found" };
         return commandResult();
       },
     };
@@ -295,9 +303,31 @@ test("concurrent spawns reserve a worker id before launching a systemd unit", as
     const lifecycle = new Map<string, (...args: any[]) => any>();
     const tools = new Map<string, any>();
     let launches = 0;
+    const eventListeners = new Map<string, Array<(payload: any) => void>>();
     const pi: any = {
       on(name: string, handler: (...args: any[]) => any) { lifecycle.set(name, handler); },
-      events: { on() { return () => {}; }, emit() {} },
+      events: {
+        on(name: string, handler: (payload: any) => void) {
+          const listeners = eventListeners.get(name) ?? [];
+          listeners.push(handler);
+          eventListeners.set(name, listeners);
+          return () => eventListeners.set(name, listeners.filter((candidate) => candidate !== handler));
+        },
+        emit(name: string, payload: any) {
+          if (name === "intercom:control:send" && payload?.control?.type === "agent-intercom.orchestrator/readiness-probe") {
+            queueMicrotask(() => {
+              for (const listener of eventListeners.get("intercom:control") ?? []) listener({
+                from: { id: payload.to },
+                control: {
+                  type: "agent-intercom.orchestrator/readiness-ack",
+                  version: 1,
+                  data: { requestId: payload.control.data.requestId, runId: payload.control.data.expectedRunId },
+                },
+              });
+            });
+          }
+        },
+      },
       registerTool(tool: any) { tools.set(tool.name, tool); },
       registerCommand() {},
       async exec(command: string, args: string[]) {
@@ -306,7 +336,7 @@ test("concurrent spawns reserve a worker id before launching a systemd unit", as
           await new Promise((resolve) => setTimeout(resolve, 30));
           return commandResult();
         }
-        if (command === "systemctl" && args.includes("show") && args.includes("--property=LoadState,ActiveState,SubState,MainPID,Result,ExecMainStatus")) {
+        if (command === "systemctl" && args.includes("show") && args.some((arg) => arg.startsWith("--property=LoadState,ActiveState,SubState,MainPID,Result,ExecMainStatus"))) {
           return { ...commandResult(), stdout: "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nResult=success\nExecMainStatus=0\n" };
         }
         return commandResult();
@@ -391,7 +421,7 @@ test("persistent OpenCode spawn persists resumable state before returning ready"
           }));
           return commandResult();
         }
-        if (command === "systemctl" && args.includes("show") && args.includes("--property=LoadState,ActiveState,SubState,MainPID,Result,ExecMainStatus")) {
+        if (command === "systemctl" && args.includes("show") && args.some((arg) => arg.startsWith("--property=LoadState,ActiveState,SubState,MainPID,Result,ExecMainStatus"))) {
           return { ...commandResult(), stdout: "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nResult=success\nExecMainStatus=0\n" };
         }
         return commandResult();
@@ -824,6 +854,7 @@ test("route previews automatic selection and explicit profile overrides without 
         "pi-peer": { harness: "pi", command: "/bin/true", mode: "persistent", maxRuntime: "12h" },
         "codex-missing": { harness: "codex", command: "missing-codex-command-for-profile-fallback", mode: "persistent", maxRuntime: "12h" },
         "codex-safe": { harness: "codex", command: "/bin/true", mode: "persistent", maxRuntime: "12h" },
+        "codex-custom": { harness: "codex", command: "/bin/true", mode: "persistent", maxRuntime: "12h" },
         "claude-safe": { harness: "claude", command: "missing-claude-command-for-routing-test", mode: "persistent", maxRuntime: "12h" },
         "claude-minimal": { harness: "claude", command: "missing-claude-minimal-for-routing-test", mode: "persistent", maxRuntime: "12h" },
         "opencode-run": { harness: "opencode", command: "/bin/true", mode: "one-shot", maxRuntime: "2h" },
@@ -847,8 +878,30 @@ test("route previews automatic selection and explicit profile overrides without 
       events: { on() { return () => {}; }, emit() {} },
       registerTool(tool: any) { tools.set(tool.name, tool); },
       registerCommand() {},
-      async exec(command: string) {
-        if (command === "systemd-run") launches += 1;
+      async exec(command: string, args: string[]) {
+        if (command === "systemd-run") {
+          launches += 1;
+          const environment = Object.fromEntries(args
+            .filter((arg) => arg.startsWith("--setenv="))
+            .map((arg) => {
+              const value = arg.slice("--setenv=".length);
+              const separator = value.indexOf("=");
+              return [value.slice(0, separator), value.slice(separator + 1)];
+            }));
+          if (environment.AGENT_INTERCOM_ADAPTER_HEALTH_PATH) {
+            await mkdir(dirname(environment.AGENT_INTERCOM_ADAPTER_HEALTH_PATH), { recursive: true });
+            await writeFile(environment.AGENT_INTERCOM_ADAPTER_HEALTH_PATH, JSON.stringify({
+              version: 1,
+              runId: environment.AGENT_INTERCOM_RUN_ID,
+              ready: true,
+              connected: true,
+              status: "idle",
+            }));
+          }
+        }
+        if (command === "systemctl" && args.includes("show")) {
+          return { ...commandResult(), stdout: "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nResult=success\nExecMainStatus=0\nJob=\nExecMainStartTimestampMonotonic=10\n" };
+        }
         return commandResult();
       },
     };
@@ -943,6 +996,15 @@ test("route previews automatic selection and explicit profile overrides without 
     assert.equal(fallbackSpawn.details.worker.instructions, undefined);
     assert.match(fallbackSpawn.details.routing.reasons.join(" "), /ignored harness-specific preset model and effort/);
     assert.equal(launches, 2);
+
+    const customSpawn = await fleet.execute("spawn-custom", {
+      action: "spawn", id: "custom-worker", profile: "codex-custom", task: "Use a custom adapter.", cwd: "/tmp", permissionProfile: "trusted",
+    }, new AbortController().signal, () => {}, ctx);
+    assert.equal(customSpawn.details.worker.state, "registering");
+    assert.equal(customSpawn.details.worker.backendDetails.readiness, "process-stable-unverified");
+    assert.match(customSpawn.content[0].text, /Launched custom-worker/);
+    assert.match(customSpawn.content[0].text, /did not produce a persistent readiness acknowledgment/);
+    assert.equal(launches, 3);
 
     assert.doesNotMatch(fleet.promptGuidelines.join("\n"), /Ralph loop|return_on|cannot wake the manager/i);
     assert.match(fleet.promptGuidelines.join("\n"), /Harnesses configured as explicit-only: opencode/);

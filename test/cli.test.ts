@@ -82,6 +82,69 @@ test("agent-intercom-fleet CLI hosts the same agent_fleet tool for non-Pi manage
   }
 });
 
+test("OpenCode manager CLI keeps persistent Pi process-stable instead of timing out without a control bridge", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-fleet-cli-pi-spawn-"));
+  try {
+    const orchestratorDir = join(agentDir, "intercom", "orchestrator");
+    const binDir = join(agentDir, "bin");
+    await mkdir(orchestratorDir, { recursive: true });
+    await mkdir(binDir, { recursive: true });
+    await writeFile(join(orchestratorDir, "config.json"), JSON.stringify({
+      profiles: { "pi-peer": { harness: "pi", command: process.execPath, mode: "persistent" } },
+      cleanupExpiredOnStart: false,
+    }));
+    await writeFile(join(binDir, "systemd-run"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    await writeFile(join(binDir, "systemctl"), `#!/bin/sh
+case "$*" in
+  *list-jobs*) exit 0 ;;
+  *show*) cat <<'EOF'
+LoadState=loaded
+ActiveState=active
+SubState=running
+MainPID=4242
+ExecMainStatus=0
+ExecMainCode=0
+ActiveEnterTimestampMonotonic=123
+InactiveEnterTimestampMonotonic=0
+Result=success
+Job=
+ControlGroup=/test
+EOF
+    exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+    const cli = new URL("../src/agent-fleet-cli.mjs", import.meta.url);
+    const result = await runChild(cli, {
+      ...process.env,
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      PI_CODING_AGENT_DIR: agentDir,
+      AGENT_INTERCOM_ORCHESTRATOR_DISABLED: "",
+      AGENT_INTERCOM_DISABLE_CLEANUP_TIMER: "1",
+      OPENCODE_INTERCOM_FLEET: "1",
+    }, JSON.stringify({
+      managerSessionId: "opencode-manager-test",
+      cwd: process.cwd(),
+      params: {
+        action: "spawn",
+        id: "cli-pi-worker",
+        harness: "pi",
+        profile: "pi-peer",
+        permissionProfile: "trusted",
+        role: "advisor",
+        task: "review",
+      },
+    }));
+    assert.equal(result.code, 0, result.stderr);
+    const response = JSON.parse(result.stdout);
+    assert.equal(response.ok, true);
+    assert.equal(response.result.details.worker.state, "registering");
+    assert.equal(response.result.details.worker.backendDetails.readiness, "process-stable-unverified");
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
 test("CLI renew records activity before startup cleanup can expire the worker", async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-fleet-renew-cli-"));
   try {
