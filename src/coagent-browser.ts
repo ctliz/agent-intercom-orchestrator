@@ -2,6 +2,8 @@ import { readFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Key, matchesKey, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import type { WorkerState } from "./types.ts";
+import { isLiveState } from "./workers.ts";
 
 type Worker = {
   id: string;
@@ -24,14 +26,17 @@ type Worker = {
 
 type WorkerFile = { workers?: Worker[] };
 
-const LIVE_STATES = new Set(["provisioning", "running", "idle", "needs_attention", "stopping"]);
 const STATE_PATH = join(getAgentDir(), "intercom", "orchestrator", "workers.json");
+
+function isWorkerLive(worker: Worker): boolean {
+  return isLiveState(worker.state as WorkerState);
+}
 
 async function readWorkers(): Promise<Worker[]> {
   try {
     const parsed = JSON.parse(await readFile(STATE_PATH, "utf8")) as WorkerFile;
     return [...(parsed.workers ?? [])].sort((a, b) => {
-      const liveDifference = Number(LIVE_STATES.has(b.state)) - Number(LIVE_STATES.has(a.state));
+      const liveDifference = Number(isWorkerLive(b)) - Number(isWorkerLive(a));
       return liveDifference || (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || a.id.localeCompare(b.id);
     });
   } catch (error) {
@@ -67,7 +72,7 @@ export default function coagentBrowser(pi: ExtensionAPI) {
       let refreshError: string | undefined;
 
       await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
-        const visibleWorkers = () => showAll ? workers : workers.filter((worker) => LIVE_STATES.has(worker.state));
+        const visibleWorkers = () => showAll ? workers : workers.filter(isWorkerLive);
         const clampSelection = () => {
           const visible = visibleWorkers();
           selected = Math.max(0, Math.min(selected, Math.max(0, visible.length - 1)));
@@ -93,7 +98,7 @@ export default function coagentBrowser(pi: ExtensionAPI) {
             const inner = Math.max(20, width - 4);
             const visible = visibleWorkers();
             clampSelection();
-            const liveCount = workers.filter((worker) => LIVE_STATES.has(worker.state)).length;
+            const liveCount = workers.filter(isWorkerLive).length;
             const border = theme.fg("border", "─".repeat(Math.max(1, width)));
             const lines: string[] = [border];
             const mode = showAll ? "all retained" : "live only";
@@ -113,11 +118,11 @@ export default function coagentBrowser(pi: ExtensionAPI) {
                 const prefix = active ? theme.fg("accent", "›") : " ";
                 const stateColor = worker.state === "failed" || worker.state === "lost"
                   ? "error"
-                  : LIVE_STATES.has(worker.state)
+                  : isWorkerLive(worker)
                     ? "success"
                     : "muted";
                 const row = `${prefix} ${theme.fg("accent", worker.id)}  ${theme.fg("warning", worker.harness)}/${theme.fg("muted", worker.role)}  ${theme.fg(stateColor, worker.state)}`;
-                const styled = active ? theme.bg("selectedBg", row) : row;
+                const styled = active ? theme.bold(row) : row;
                 lines.push(truncateToWidth(` ${styled}`, width));
               }
               if (visible.length > maxRows) lines.push(truncateToWidth(`  ${theme.fg("dim", `${selected + 1}/${visible.length}`)}`, width));
@@ -126,7 +131,7 @@ export default function coagentBrowser(pi: ExtensionAPI) {
               lines.push(border);
               const stateColor = worker.state === "failed" || worker.state === "lost"
                 ? "error"
-                : LIVE_STATES.has(worker.state)
+                : isWorkerLive(worker)
                   ? "success"
                   : "muted";
               lines.push(truncateToWidth(`  ${theme.fg("accent", theme.bold(worker.id))}  ${theme.fg(stateColor, worker.state)}`, width));
@@ -165,7 +170,7 @@ export default function coagentBrowser(pi: ExtensionAPI) {
             lines.push(border);
             lines.push(truncateToWidth(`  ${theme.fg("dim", `↑↓ select · enter ${expanded ? "collapse" : "expand"} · r refresh${refreshing ? "ing…" : ""} · a ${showAll ? "live only" : "show all"} · esc close · read-only`)}`, width));
             lines.push(border);
-            return lines;
+            return lines.map((line) => theme.bg("customMessageBg", truncateToWidth(line, width, "", true)));
           },
           handleInput(data: string): void {
             const visible = visibleWorkers();

@@ -16,7 +16,7 @@ test("coagent browser is compact by default and expands details on Enter", async
       id: "browser-worker",
       harness: "codex",
       role: "builder",
-      state: "running",
+      state: "ready",
       task: "Implement and verify the compact coworker browser without changing worker lifecycle state.",
       cwd: "/home/example/worktrees/browser-project",
       model: "gpt-5.6-sol",
@@ -40,9 +40,10 @@ test("coagent browser is compact by default and expands details on Enter", async
 
     let collapsed = "";
     let expanded = "";
+    const backgroundColors: string[] = [];
     const theme = {
       fg(_color: string, text: string) { return text; },
-      bg(_color: string, text: string) { return text; },
+      bg(color: string, text: string) { backgroundColors.push(color); return text; },
       bold(text: string) { return text; },
     };
     const ctx: any = {
@@ -62,6 +63,8 @@ test("coagent browser is compact by default and expands details on Enter", async
     };
 
     await commands.get("coagents").handler("", ctx);
+    assert.match(collapsed, /1 live/);
+    assert.match(collapsed, /browser-worker/);
     assert.match(collapsed, /cwd\s+browser-project/);
     assert.doesNotMatch(collapsed, /\/home\/example\/worktrees\/browser-project/);
     assert.match(collapsed, /enter expand details/);
@@ -69,6 +72,7 @@ test("coagent browser is compact by default and expands details on Enter", async
     assert.match(expanded, /intercom\s+browser-worker/);
     assert.match(expanded, /manager\s+manager-session-id/);
     assert.match(expanded, /enter collapse/);
+    assert.ok(backgroundColors.includes("customMessageBg"));
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
