@@ -374,6 +374,7 @@ export async function removeWorkerRuntimeAndRecord(
 export type LeaseHeartbeatResult = {
   renewed: WorkerRecord[];
   checkpointRequested: WorkerRecord[];
+  changed: boolean;
 };
 
 export function renewObservedWorkerLeases(
@@ -388,10 +389,11 @@ export function renewObservedWorkerLeases(
     .map((worker) => `${worker.id}\u0000${worker.runId}`));
   const renewed: WorkerRecord[] = [];
   const checkpointRequested: WorkerRecord[] = [];
+  let changed = false;
   for (const worker of state.workers) {
     if (!observedLiveRuns.has(`${worker.id}\u0000${worker.runId}`)) continue;
     if (worker.managerSessionId !== managerId || !worker.owned || !isLiveState(worker.state) || worker.stateReason === "stop_in_progress") continue;
-    initializeWorkerLifecycle(worker, config, now);
+    changed = initializeWorkerLifecycle(worker, config, now) || changed;
     const lastActivity = worker.lastWorkerActivityAt!;
     const idleDeadline = worker.idleDeadlineAt!;
     if (now < idleDeadline) {
@@ -400,6 +402,7 @@ export function renewObservedWorkerLeases(
         worker.leaseExpiresAt = nextLease;
         worker.updatedAt = now;
         renewed.push(structuredClone(worker));
+        changed = true;
       }
     }
     const warningAt = checkpointWarningAt(worker, config);
@@ -411,9 +414,10 @@ export function renewObservedWorkerLeases(
       worker.checkpointAttemptCount = (worker.checkpointAttemptCount ?? 0) + 1;
       worker.updatedAt = now;
       checkpointRequested.push(structuredClone(worker));
+      changed = true;
     }
   }
-  return { renewed, checkpointRequested };
+  return { renewed, checkpointRequested, changed };
 }
 
 export function recordIntercomWorkerActivity(
@@ -636,13 +640,17 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     });
   };
 
-  const updateStatus = async (ctx = currentCtx) => {
-    if (!ctx) return;
-    const state = await store.read();
-    const attached = workersAttachedToManager(state.workers, managerSessionId(ctx));
+  const publishStatus = (ctx: ExtensionContext, workers: WorkerRecord[]) => {
+    const attached = workersAttachedToManager(workers, managerSessionId(ctx));
     const running = attached.filter((worker) => isLiveState(worker.state)).length;
     const stale = attached.filter((worker) => cleanupReason(worker)).length;
     ctx.ui.setStatus(STATUS_KEY, running === 0 && stale === 0 ? undefined : `agents ${running}${stale ? ` · stale ${stale}` : ""}`);
+  };
+
+  const updateStatus = async (ctx = currentCtx) => {
+    if (!ctx) return;
+    const state = await store.read();
+    publishStatus(ctx, state.workers);
   };
 
   const recoverCleanupClaims = async () => {
@@ -653,9 +661,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     return recovery;
   };
 
-  const reconcile = async (): Promise<WorkerRecord[]> => {
+  const reconcile = async (managerId?: string, publish = true): Promise<WorkerRecord[]> => {
+    const isInScope = (worker: WorkerRecord) => managerId === undefined || worker.managerSessionId === managerId;
     let snapshot = await store.read();
-    for (const pending of snapshot.workers.filter((worker) => worker.state === "migration_pending")) {
+    for (const pending of snapshot.workers.filter((worker) => worker.state === "migration_pending" && isInScope(worker))) {
       const status = pending.unit ? await getUnitStatus(runner, pending.unit) : { exists: false };
       let resolution: "stopped" | "failed" | "lost" | "unreachable" | undefined;
       if (!status.exists) resolution = "lost";
@@ -674,6 +683,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     const observations = await Promise.all(
       snapshot.workers
         .filter((worker) => isLiveState(worker.state))
+        .filter(isInScope)
         .filter((worker) => typeof worker.unit === "string")
         .map(async (worker) => {
           const unit = worker.unit!;
@@ -686,24 +696,42 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           };
         }),
     );
-    const { workers, retireUnits } = await store.mutate((state) => {
+    const { workers, retireUnits } = await store.mutateConditionally((state) => {
       const retireUnits: string[] = [];
+      let changed = false;
       for (const observation of observations) {
         const worker = state.workers.find((candidate) => candidate.id === observation.id && workerIncarnation(candidate) === observation.runId && candidate.unit === observation.unit);
         if (!worker) continue;
         if (unitRequiresStopFence(worker, observation.status)) {
-          worker.lastError = `stopped or terminal worker record still has a live or queued unit (${formatUnitStatus(observation.status)})`;
-          worker.updatedAt = Date.now();
+          const lastError = `stopped or terminal worker record still has a live or queued unit (${formatUnitStatus(observation.status)})`;
+          if (worker.lastError !== lastError) {
+            worker.lastError = lastError;
+            worker.updatedAt = Date.now();
+            changed = true;
+          }
           retireUnits.push(observation.unit);
           continue;
         }
         const observedState = stateFromUnit(observation.status, worker.state);
         const nextState = observedState;
         if (observation.health?.runId === worker.runId) {
-          worker.backendDetails = observation.health;
-          if (observation.health.openCodeSessionId) worker.externalSessionId = observation.health.openCodeSessionId;
-          if (observation.health.error) worker.lastError = observation.health.error;
-          else if (observation.health.ready && nextState !== "failed") worker.lastError = undefined;
+          if (JSON.stringify(worker.backendDetails) !== JSON.stringify(observation.health)) {
+            worker.backendDetails = observation.health;
+            changed = true;
+          }
+          if (observation.health.openCodeSessionId && worker.externalSessionId !== observation.health.openCodeSessionId) {
+            worker.externalSessionId = observation.health.openCodeSessionId;
+            changed = true;
+          }
+          const nextError = observation.health.error
+            ? observation.health.error
+            : observation.health.ready && nextState !== "failed"
+              ? undefined
+              : worker.lastError;
+          if (worker.lastError !== nextError) {
+            worker.lastError = nextError;
+            changed = true;
+          }
         }
         if (nextState !== worker.state || observation.status.mainPid !== worker.mainPid) {
           worker.state = nextState;
@@ -713,15 +741,16 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           worker.mainPid = observation.status.mainPid;
           worker.updatedAt = Date.now();
           if (nextState === "failed") worker.lastError = observation.status.result || `service exited with ${observation.status.execMainStatus ?? "unknown status"}`;
+          changed = true;
         }
         if (observation.status.activeState === "active" && observation.status.subState === "exited") {
           retireUnits.push(observation.unit);
         }
       }
-      return { workers: structuredClone(state.workers), retireUnits };
+      return { value: { workers: structuredClone(state.workers), retireUnits }, changed };
     });
     await Promise.allSettled(retireUnits.map((unit) => stopUnit(runner, unit)));
-    await updateStatus();
+    if (publish) await updateStatus();
     return workers;
   };
 
@@ -951,10 +980,25 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     return { candidates, handled: candidates.filter((candidate) => handled.has(candidate)), errors };
   };
 
+  // Frequent manager heartbeats only observe their attached workers. Startup,
+  // explicit fleet actions, and the managerless cleanup timer keep global
+  // reconciliation, bounding detached-owner convergence without multiplying
+  // every live unit check across every idle Pi session.
   const runLifecycleHeartbeat = async (ctx: ExtensionContext) => {
-    const observedWorkers = await reconcile();
+    const sessionId = managerSessionId(ctx);
+    const snapshot = await store.read();
+    const attached = workersAttachedToManager(snapshot.workers, sessionId);
+    if (!attached.some((worker) => isLiveState(worker.state) || worker.state === "migration_pending")) {
+      publishStatus(ctx, snapshot.workers);
+      return { renewed: [], checkpointRequested: [], changed: false, checkpointRequests: [] };
+    }
+    const observedWorkers = await reconcile(sessionId, false);
     const now = Date.now();
-    const result = await store.mutate((state) => renewObservedWorkerLeases(state, observedWorkers, managerSessionId(ctx), config, now));
+    const result = await store.mutateConditionally((state) => {
+      const value = renewObservedWorkerLeases(state, observedWorkers, sessionId, config, now);
+      return { value, changed: value.changed };
+    });
+    publishStatus(ctx, observedWorkers);
     const checkpointRequests = result.checkpointRequested.flatMap((worker) => worker.intercomTarget ? [{
       workerId: worker.id,
       runId: worker.runId,
@@ -2038,7 +2082,6 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
             runId: request.runId,
           });
         }
-        await updateStatus(ctx);
       }).catch(() => undefined).finally(() => {
         heartbeatRunning = false;
       });

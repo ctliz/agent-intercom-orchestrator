@@ -146,6 +146,214 @@ test("reconciliation observes only live worker units and skips retained terminal
   }
 });
 
+test("periodic heartbeat reconciles only workers attached to its manager", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-scoped-heartbeat-test-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousSkipStartupCleanup = process.env.AGENT_INTERCOM_SKIP_STARTUP_CLEANUP;
+  const previousDisableCleanupTimer = process.env.AGENT_INTERCOM_DISABLE_CLEANUP_TIMER;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  process.env.AGENT_INTERCOM_SKIP_STARTUP_CLEANUP = "1";
+  process.env.AGENT_INTERCOM_DISABLE_CLEANUP_TIMER = "1";
+  try {
+    const orchestratorDir = join(agentDir, "intercom", "orchestrator");
+    const statePath = join(orchestratorDir, "workers.json");
+    await mkdir(orchestratorDir, { recursive: true });
+    const worker = (id: string, managerSessionId: string) => ({
+      id,
+      runId: `run-${id}`,
+      harness: "pi",
+      role: "reviewer",
+      task: "review",
+      cwd: "/tmp",
+      state: "running",
+      unit: `agent-intercom-worker-${id}.service`,
+      owned: true,
+      managerSessionId,
+      createdAt: 1,
+      updatedAt: 1,
+      leaseExpiresAt: Date.now() + 60_000,
+    });
+    const seedWorkers = [
+      worker("owned-a", "manager-a"),
+      worker("owned-b", "manager-a"),
+      ...Array.from({ length: 100 }, (_, index) => worker(`unrelated-${index}`, "manager-b")),
+    ];
+    await writeFile(statePath, JSON.stringify({ version: 1, workers: seedWorkers }));
+
+    const lifecycle = new Map<string, (...args: any[]) => any>();
+    const tools = new Map<string, any>();
+    const observedUnits: string[] = [];
+    let resolveLegacyStopping = false;
+    const pi: any = {
+      on(name: string, handler: (...args: any[]) => any) { lifecycle.set(name, handler); },
+      events: { on() { return () => {}; }, emit() {} },
+      registerTool(tool: any) { tools.set(tool.name, tool); },
+      registerCommand() {},
+      async exec(command: string, args: string[]) {
+        if (command === "systemctl" && args[1] === "show") {
+          observedUnits.push(args[2]);
+          if (args[2] === "agent-intercom-worker-legacy-stopping.service" && resolveLegacyStopping) {
+            return { ...commandResult(), code: 1 };
+          }
+          return {
+            ...commandResult(),
+            stdout: "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nResult=success\nExecMainStatus=0\n",
+          };
+        }
+        return commandResult();
+      },
+    };
+    const ctx: any = {
+      cwd: "/tmp",
+      mode: "rpc",
+      hasUI: false,
+      sessionManager: { getSessionId: () => "manager-a", getSessionFile: () => undefined },
+      ui: { setStatus() {}, notify() {} },
+    };
+    const extensionUrl = new URL(`../src/index.ts?scoped-heartbeat=${Date.now()}`, import.meta.url);
+    const { default: extension } = await import(extensionUrl.href);
+    extension(pi);
+    await lifecycle.get("session_start")?.({}, ctx);
+
+    assert.equal(observedUnits.length, 102, "startup reconciliation remains global");
+    await writeFile(statePath, JSON.stringify({
+      version: 1,
+      workers: [...seedWorkers, { ...worker("legacy-stopping", "manager-b"), state: "stopping" }],
+    }));
+    const { WorkerStore } = await import("../src/store.ts");
+    await new WorkerStore(statePath).migrate();
+    observedUnits.length = 0;
+    await tools.get("agent_fleet").execute(
+      "heartbeat-test",
+      { action: "_heartbeat" },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.deepEqual(observedUnits.sort(), [
+      "agent-intercom-worker-owned-a.service",
+      "agent-intercom-worker-owned-b.service",
+    ]);
+    assert.equal(
+      JSON.parse(await readFile(statePath, "utf8")).workers.find((candidate: any) => candidate.id === "legacy-stopping").state,
+      "migration_pending",
+      "another manager's migration remains untouched by the scoped heartbeat",
+    );
+
+    observedUnits.length = 0;
+    resolveLegacyStopping = true;
+    await tools.get("agent_fleet").execute(
+      "global-list-test",
+      { action: "list", all: true },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(observedUnits.length, 103, "explicit all-manager reconciliation remains global");
+    assert.ok(observedUnits.includes("agent-intercom-worker-legacy-stopping.service"));
+    assert.equal(
+      JSON.parse(await readFile(statePath, "utf8")).workers.find((candidate: any) => candidate.id === "legacy-stopping").state,
+      "lost",
+      "the global path still resolves an unattached migration",
+    );
+    await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    if (previousSkipStartupCleanup === undefined) delete process.env.AGENT_INTERCOM_SKIP_STARTUP_CLEANUP;
+    else process.env.AGENT_INTERCOM_SKIP_STARTUP_CLEANUP = previousSkipStartupCleanup;
+    if (previousDisableCleanupTimer === undefined) delete process.env.AGENT_INTERCOM_DISABLE_CLEANUP_TIMER;
+    else process.env.AGENT_INTERCOM_DISABLE_CLEANUP_TIMER = previousDisableCleanupTimer;
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("idle heartbeat with no attached live workers performs no unit checks or store write", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-idle-heartbeat-test-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousSkipStartupCleanup = process.env.AGENT_INTERCOM_SKIP_STARTUP_CLEANUP;
+  const previousDisableCleanupTimer = process.env.AGENT_INTERCOM_DISABLE_CLEANUP_TIMER;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  process.env.AGENT_INTERCOM_SKIP_STARTUP_CLEANUP = "1";
+  process.env.AGENT_INTERCOM_DISABLE_CLEANUP_TIMER = "1";
+  try {
+    const orchestratorDir = join(agentDir, "intercom", "orchestrator");
+    const statePath = join(orchestratorDir, "workers.json");
+    await mkdir(orchestratorDir, { recursive: true });
+    await writeFile(statePath, JSON.stringify({
+      version: 1,
+      workers: Array.from({ length: 63 }, (_, index) => ({
+        id: `unrelated-${index}`,
+        runId: `run-${index}`,
+        harness: "pi",
+        role: "reviewer",
+        task: "review",
+        cwd: "/tmp",
+        state: "running",
+        unit: `agent-intercom-worker-unrelated-${index}.service`,
+        owned: true,
+        managerSessionId: "manager-b",
+        createdAt: 1,
+        updatedAt: 1,
+        leaseExpiresAt: Date.now() + 60_000,
+      })),
+    }));
+
+    const lifecycle = new Map<string, (...args: any[]) => any>();
+    const tools = new Map<string, any>();
+    let unitChecks = 0;
+    const pi: any = {
+      on(name: string, handler: (...args: any[]) => any) { lifecycle.set(name, handler); },
+      events: { on() { return () => {}; }, emit() {} },
+      registerTool(tool: any) { tools.set(tool.name, tool); },
+      registerCommand() {},
+      async exec(command: string, args: string[]) {
+        if (command === "systemctl" && args[1] === "show") {
+          unitChecks += 1;
+          return {
+            ...commandResult(),
+            stdout: "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nResult=success\nExecMainStatus=0\n",
+          };
+        }
+        return commandResult();
+      },
+    };
+    const ctx: any = {
+      cwd: "/tmp",
+      mode: "rpc",
+      hasUI: false,
+      sessionManager: { getSessionId: () => "manager-a", getSessionFile: () => undefined },
+      ui: { setStatus() {}, notify() {} },
+    };
+    const extensionUrl = new URL(`../src/index.ts?idle-heartbeat=${Date.now()}`, import.meta.url);
+    const { default: extension } = await import(extensionUrl.href);
+    extension(pi);
+    await lifecycle.get("session_start")?.({}, ctx);
+
+    assert.equal(unitChecks, 63, "startup reconciliation remains global");
+    unitChecks = 0;
+    const before = await readFile(statePath, "utf8");
+    await tools.get("agent_fleet").execute(
+      "idle-heartbeat-test",
+      { action: "_heartbeat" },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(unitChecks, 0);
+    assert.equal(await readFile(statePath, "utf8"), before, "no-op heartbeat must not rewrite or advance the store");
+    await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    if (previousSkipStartupCleanup === undefined) delete process.env.AGENT_INTERCOM_SKIP_STARTUP_CLEANUP;
+    else process.env.AGENT_INTERCOM_SKIP_STARTUP_CLEANUP = previousSkipStartupCleanup;
+    if (previousDisableCleanupTimer === undefined) delete process.env.AGENT_INTERCOM_DISABLE_CLEANUP_TIMER;
+    else process.env.AGENT_INTERCOM_DISABLE_CLEANUP_TIMER = previousDisableCleanupTimer;
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
 test("stop patches the current worker record without clobbering concurrent metadata", async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-stop-patch-test-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
