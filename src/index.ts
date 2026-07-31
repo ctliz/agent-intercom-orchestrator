@@ -15,10 +15,10 @@ import { buildPermissionEnvironment, buildPermissionUnitProperties, registerWork
 import { resolvePiRuntime } from "./pi-runtime.ts";
 import { prepareWorkerRuntime, workerRuntimeRoot, workerSocketRuntimeRoot } from "./runtime.ts";
 import { INTERCOM_CONTROL_RECEIVED_EVENT, INTERCOM_CONTROL_REGISTER_EVENT, INTERCOM_CONTROL_SEND_EVENT, registerOwnedWorkerReadinessProbeType, registerOwnedWorkerReadinessResponder, WORKER_READINESS_ACK, WORKER_READINESS_PROBE, WorkerReadinessAckTracker } from "./readiness.ts";
-import { deleteOrphanRuntimeSafely, deleteTerminalRuntimeSafely, executeCleanupCandidatesIsolated, existingTerminalCachePaths, listRuntimeRoots, recoverStaleRuntimeCleanupClaims, removeFullRuntimePathsSafely, terminalWorkerAt } from "./runtime-cleanup.ts";
+import { captureCleanupUnitInventory, deleteOrphanRuntimeSafely, deleteTerminalRuntimeBatchSafely, deleteTerminalRuntimeSafely, executeCleanupCandidatesIsolated, existingTerminalCachePaths, listRuntimeRoots, recoverStaleRuntimeCleanupClaims, removeFullRuntimePathsSafely, terminalWorkerAt } from "./runtime-cleanup.ts";
 import { detectHarnessAvailability, formatRoutingDecision, inferHarnessFromModel, normalizeModelForHarness, roleInstructionsForHarness, roleRequiresSubagents, resolveHarnessRoute, type HarnessAvailability, type RoutingDecision } from "./routing.ts";
 import { WorkerStore } from "./store.ts";
-import { formatUnitStatus, getUnitStatus, getUserManagerHealth, launchUnit, listWorkerUnits, listWorkerUnitsForVerification, makeUnitName, parseDurationToSeconds, readUnitLogs, readUnitProcessTree, sanitizeUnitPart, stopUnit, systemdAvailable, waitForUnitRunning } from "./systemd.ts";
+import { formatUnitStatus, getUnitStatus, getUserManagerHealth, launchUnit, listWorkerUnits, makeUnitName, parseDurationToSeconds, readUnitLogs, readUnitProcessTree, sanitizeUnitPart, stopUnit, systemdAvailable, waitForUnitRunning } from "./systemd.ts";
 import type { CommandRunner, Effort, Harness, OrchestratorConfig, PermissionProfile, RolePreset, WorkerRecord, WorkerStateFile } from "./types.ts";
 import {
   boundedLeaseExpiry,
@@ -867,14 +867,14 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         }))
       : [];
     const registeredIds = new Set(migrated.workers.map((worker) => worker.id));
-    const loadedUnits = await listWorkerUnitsForVerification(runner);
+    const cleanupInventory = await captureCleanupUnitInventory(runner);
     const orphanCandidates: Array<Extract<CleanupCandidate, { kind: "orphan" }>> = [];
-    if (loadedUnits.verified) {
+    if (cleanupInventory.verified) {
       const cutoff = now - config.orphanRuntimeRetentionMinutes * 60_000;
       for (const runtime of await listRuntimeRoots(agentDir)) {
         if (registeredIds.has(runtime.workerId) || claimedIds.has(runtime.workerId)) continue;
         const prefix = `agent-intercom-worker-${sanitizeUnitPart(runtime.workerId)}-`;
-        if (loadedUnits.units.some((unit) => unit.startsWith(prefix))) continue;
+        if ([...cleanupInventory.units].some((unit) => unit.startsWith(prefix))) continue;
         const metadata = await lstat(runtime.path).catch((error) => {
           if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
           throw error;
@@ -891,35 +891,50 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     }
     const candidates: CleanupCandidate[] = [...liveCandidates, ...pruneCandidates, ...cacheCandidates, ...orphanCandidates];
     if (!execute) return { candidates, handled: [], errors: [] };
-    const result = await executeCleanupCandidatesIsolated(candidates, async (candidate) => {
-      if (candidate.kind === "stop") {
-        try {
-          await stopWorker(candidate.worker, {
-            reason: "idle-grace-expired",
-            expectedCheckpointDeadlineAt: candidate.worker.checkpointDeadlineAt,
-          });
-          return true;
-        } catch (error) {
-          if (/lifecycle changed|renewed before expired cleanup/.test(error instanceof Error ? error.message : String(error))) return false;
-          throw error;
-        }
+    const handled = new Set<CleanupCandidate>();
+    const errors: Array<{ candidate: CleanupCandidate; error: string }> = [];
+    const stopResult = await executeCleanupCandidatesIsolated(liveCandidates, async (candidate) => {
+      try {
+        await stopWorker(candidate.worker, {
+          reason: "idle-grace-expired",
+          expectedCheckpointDeadlineAt: candidate.worker.checkpointDeadlineAt,
+        });
+        return true;
+      } catch (error) {
+        if (/lifecycle changed|renewed before expired cleanup/.test(error instanceof Error ? error.message : String(error))) return false;
+        throw error;
       }
-      if (candidate.kind === "prune") return pruneTerminalWorker(candidate.worker, candidate.reason, now);
-      if (candidate.kind === "cache") {
+    });
+    for (const candidate of stopResult.executed) handled.add(candidate);
+    errors.push(...stopResult.errors);
+
+    const terminalCandidates = [...pruneCandidates, ...cacheCandidates];
+    const terminalResult = await deleteTerminalRuntimeBatchSafely({
+      store,
+      runner,
+      agentDir,
+      preMoveInventory: cleanupInventory,
+      candidates: terminalCandidates.map((candidate) => {
         const terminalAt = terminalWorkerAt(candidate.worker);
-        if (terminalAt === undefined) return false;
-        return deleteTerminalRuntimeSafely({
-          store,
-          runner,
-          agentDir,
+        if (terminalAt === undefined) throw new Error(`Worker ${candidate.worker.id} changed before runtime cleanup batching`);
+        return {
           workerId: candidate.worker.id,
           runId: workerIncarnation(candidate.worker),
           terminalAt,
-          action: "cache",
+          action: candidate.kind === "prune" ? "full" as const : "cache" as const,
           now,
-          eligible: (worker) => isTerminalState(worker.state),
-        });
-      }
+          ...(candidate.kind === "prune" && candidate.worker.unit ? { stopRecordedUnit: candidate.worker.unit } : {}),
+          eligible: (worker: WorkerRecord) => isTerminalState(worker.state)
+            && (candidate.kind !== "prune" || stoppedWorkerRetentionReason(worker, config, now) === candidate.reason),
+        };
+      }),
+    });
+    terminalResult.deleted.forEach((deleted, index) => {
+      if (deleted) handled.add(terminalCandidates[index]);
+    });
+    errors.push(...terminalResult.errors.map(({ index, error }) => ({ candidate: terminalCandidates[index], error })));
+
+    const orphanResult = await executeCleanupCandidatesIsolated(orphanCandidates, async (candidate) => {
       return deleteOrphanRuntimeSafely({
         store,
         runner,
@@ -930,8 +945,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         now,
       });
     });
+    for (const candidate of orphanResult.executed) handled.add(candidate);
+    errors.push(...orphanResult.errors);
     await updateStatus();
-    return { candidates, handled: result.executed, errors: result.errors };
+    return { candidates, handled: candidates.filter((candidate) => handled.has(candidate)), errors };
   };
 
   const runLifecycleHeartbeat = async (ctx: ExtensionContext) => {

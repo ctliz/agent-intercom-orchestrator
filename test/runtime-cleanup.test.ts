@@ -6,6 +6,7 @@ import test from "node:test";
 import { DEFAULT_CONFIG, mergeConfig, readConfig, writeConfigDefaults } from "../src/config.ts";
 import {
   deleteOrphanRuntimeSafely,
+  deleteTerminalRuntimeBatchSafely,
   deleteTerminalRuntimeSafely,
   executeCleanupCandidatesIsolated,
   recoverRuntimeCleanupClaims,
@@ -68,6 +69,426 @@ test("cleanup execution isolates one candidate failure and continues", async () 
   });
   assert.deepEqual(result.executed, ["good"]);
   assert.deepEqual(result.errors, [{ candidate: "bad", error: "unsafe runtime path" }]);
+});
+
+test("batch cleanup bounds verified unit enumeration for 500 unit-less expired workers", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-intercom-cleanup-scale-"));
+  const agentDir = join(root, "agent");
+  const orchestrator = join(agentDir, "intercom", "orchestrator");
+  const store = new WorkerStore(join(orchestrator, "workers.json"));
+  const records = Array.from({ length: 500 }, (_, index) => worker({
+    id: `expired-${index}`,
+    runId: `run-${index}`,
+    unit: undefined,
+  }));
+  let listCalls = 0;
+  let showCalls = 0;
+  const runner: CommandRunner = {
+    async exec(command, args) {
+      if (command === "systemctl" && args.includes("list-units")) {
+        listCalls += 1;
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      if (command === "systemctl") showCalls += 1;
+      return { stdout: "", stderr: "Unit not found", code: 1 };
+    },
+  };
+  try {
+    await mkdir(orchestrator, { recursive: true });
+    for (const record of records) {
+      const runtime = workerRuntimeRoot(record.id, agentDir);
+      await mkdir(runtime, { recursive: true });
+      await writeFile(join(runtime, "state"), "expired");
+    }
+    await store.write({ version: 1, workers: records });
+    const result = await deleteTerminalRuntimeBatchSafely({
+      store,
+      runner,
+      agentDir,
+      candidates: records.map((record) => ({
+        workerId: record.id,
+        runId: record.runId,
+        terminalAt: record.stoppedAt!,
+        action: "full",
+        eligible: () => true,
+      })),
+    });
+    assert.equal(result.deleted.filter(Boolean).length, 500);
+    assert.deepEqual(result.errors, []);
+    assert.ok(listCalls <= 12, `expected at most 12 list-units calls, received ${listCalls}`);
+    assert.equal(listCalls, 10, "500 candidates must recapture both inventories at each 100-candidate boundary");
+    assert.equal(showCalls, 0);
+    assert.equal((await store.read()).workers.length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("post-move inventory prefix hit blocks deletion, releases ownership, and remains recoverable", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-intercom-cleanup-post-move-unit-"));
+  const agentDir = join(root, "agent");
+  const orchestrator = join(agentDir, "intercom", "orchestrator");
+  const store = new WorkerStore(join(orchestrator, "workers.json"));
+  const record = worker({ unit: undefined });
+  const runtime = workerRuntimeRoot(record.id, agentDir);
+  let listCalls = 0;
+  const runner: CommandRunner = {
+    async exec(command, args) {
+      if (command === "systemctl" && args.includes("list-units")) {
+        listCalls += 1;
+        return {
+          stdout: listCalls === 2 ? "agent-intercom-worker-retained-worker-out-of-band.service loaded active running\n" : "",
+          stderr: "",
+          code: 0,
+        };
+      }
+      return { stdout: "", stderr: "Unit not found", code: 1 };
+    },
+  };
+  try {
+    await mkdir(runtime, { recursive: true });
+    await writeFile(join(runtime, "state"), "recoverable");
+    await store.write({ version: 1, workers: [record] });
+    const result = await deleteTerminalRuntimeBatchSafely({
+      store,
+      runner,
+      agentDir,
+      candidates: [{
+        workerId: record.id,
+        runId: record.runId,
+        terminalAt: record.stoppedAt!,
+        action: "full",
+        eligible: () => true,
+      }],
+    });
+    assert.deepEqual(result.deleted, [false]);
+    const blocked = (await store.read()).runtimeCleanupClaims?.[0];
+    assert.equal(blocked?.phase, "moved");
+    assert.equal(blocked?.ownerPid, 0);
+    await assert.rejects(access(runtime));
+    const recovered = await recoverRuntimeCleanupClaims({ store, runner: absentRunner, agentDir });
+    assert.equal(recovered.completed, 1);
+    assert.equal((await store.read()).workers.length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("post-move chunk recapture catches a cross-process unit after 100 candidates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-intercom-cleanup-post-move-chunk-"));
+  const agentDir = join(root, "agent");
+  const orchestrator = join(agentDir, "intercom", "orchestrator");
+  const store = new WorkerStore(join(orchestrator, "workers.json"));
+  const records = Array.from({ length: 101 }, (_, index) => worker({
+    id: `chunked-${index}`,
+    runId: `run-${index}`,
+    unit: undefined,
+  }));
+  let listCalls = 0;
+  const runner: CommandRunner = {
+    async exec(command, args) {
+      if (command === "systemctl" && args.includes("list-units")) {
+        listCalls += 1;
+        return {
+          stdout: listCalls === 4 ? "agent-intercom-worker-chunked-100-out-of-band.service loaded active running\n" : "",
+          stderr: "",
+          code: 0,
+        };
+      }
+      return { stdout: "", stderr: "Unit not found", code: 1 };
+    },
+  };
+  try {
+    await mkdir(orchestrator, { recursive: true });
+    await store.write({ version: 1, workers: records });
+    const result = await deleteTerminalRuntimeBatchSafely({
+      store,
+      runner,
+      agentDir,
+      candidates: records.map((record) => ({
+        workerId: record.id,
+        runId: record.runId,
+        terminalAt: record.stoppedAt!,
+        action: "full",
+        eligible: () => true,
+      })),
+    });
+    assert.equal(listCalls, 4);
+    assert.equal(result.deleted.filter(Boolean).length, 100);
+    assert.equal(result.deleted[100], false);
+    const state = await store.read();
+    assert.deepEqual(state.workers.map(({ id }) => id), ["chunked-100"]);
+    assert.equal(state.runtimeCleanupClaims?.[0].workerId, "chunked-100");
+    assert.equal(state.runtimeCleanupClaims?.[0].phase, "moved");
+    assert.equal(state.runtimeCleanupClaims?.[0].ownerPid, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("pre-move chunk recapture blocks a cross-process unit after 100 candidates", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-intercom-cleanup-pre-move-chunk-"));
+  const agentDir = join(root, "agent");
+  const orchestrator = join(agentDir, "intercom", "orchestrator");
+  const store = new WorkerStore(join(orchestrator, "workers.json"));
+  const records = Array.from({ length: 101 }, (_, index) => worker({
+    id: `pre-chunked-${index}`,
+    runId: `run-${index}`,
+    unit: undefined,
+  }));
+  let listCalls = 0;
+  const runner: CommandRunner = {
+    async exec(command, args) {
+      if (command === "systemctl" && args.includes("list-units")) {
+        listCalls += 1;
+        return {
+          stdout: listCalls === 2 ? "agent-intercom-worker-pre-chunked-100-out-of-band.service loaded active running\n" : "",
+          stderr: "",
+          code: 0,
+        };
+      }
+      return { stdout: "", stderr: "Unit not found", code: 1 };
+    },
+  };
+  try {
+    await mkdir(orchestrator, { recursive: true });
+    await store.write({ version: 1, workers: records });
+    const result = await deleteTerminalRuntimeBatchSafely({
+      store,
+      runner,
+      agentDir,
+      candidates: records.map((record) => ({
+        workerId: record.id,
+        runId: record.runId,
+        terminalAt: record.stoppedAt!,
+        action: "full",
+        eligible: () => true,
+      })),
+    });
+    assert.equal(listCalls, 3);
+    assert.equal(result.deleted.filter(Boolean).length, 100);
+    assert.equal(result.deleted[100], false);
+    const state = await store.read();
+    assert.deepEqual(state.workers.map(({ id }) => id), ["pre-chunked-100"]);
+    assert.equal(state.runtimeCleanupClaims?.length ?? 0, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stale post-move inventory is recaptured at a candidate boundary", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-intercom-cleanup-stale-inventory-"));
+  const agentDir = join(root, "agent");
+  const orchestrator = join(agentDir, "intercom", "orchestrator");
+  const store = new WorkerStore(join(orchestrator, "workers.json"));
+  const record = worker({ unit: undefined });
+  let listCalls = 0;
+  const times = [1_000, 1_000, 1_000, 7_001, 7_001, 7_001];
+  const runner: CommandRunner = {
+    async exec(command, args) {
+      if (command === "systemctl" && args.includes("list-units")) listCalls += 1;
+      return { stdout: "", stderr: "", code: 0 };
+    },
+  };
+  try {
+    await mkdir(orchestrator, { recursive: true });
+    await store.write({ version: 1, workers: [record] });
+    const result = await deleteTerminalRuntimeBatchSafely({
+      store,
+      runner,
+      agentDir,
+      inventoryNow: () => times.shift() ?? 7_001,
+      candidates: [{
+        workerId: record.id,
+        runId: record.runId,
+        terminalAt: record.stoppedAt!,
+        action: "full",
+        eligible: () => true,
+      }],
+    });
+    assert.deepEqual(result.deleted, [true]);
+    assert.equal(listCalls, 3);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("unverified batch inventory fails closed with bounded chunk recaptures", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-intercom-cleanup-unverified-inventory-"));
+  const agentDir = join(root, "agent");
+  const orchestrator = join(agentDir, "intercom", "orchestrator");
+  const store = new WorkerStore(join(orchestrator, "workers.json"));
+  const records = Array.from({ length: 201 }, (_, index) => worker({
+    id: `unverified-${index}`,
+    runId: `run-${index}`,
+    unit: undefined,
+  }));
+  let listCalls = 0;
+  const runner: CommandRunner = {
+    async exec(command, args) {
+      if (command === "systemctl" && args.includes("list-units")) listCalls += 1;
+      return { stdout: "", stderr: "Failed to connect to bus", code: 1 };
+    },
+  };
+  try {
+    await mkdir(orchestrator, { recursive: true });
+    await store.write({ version: 1, workers: records });
+    const result = await deleteTerminalRuntimeBatchSafely({
+      store,
+      runner,
+      agentDir,
+      candidates: records.map((record) => ({
+        workerId: record.id,
+        runId: record.runId,
+        terminalAt: record.stoppedAt!,
+        action: "full",
+        eligible: () => true,
+      })),
+    });
+    assert.equal(result.deleted.some(Boolean), false);
+    assert.equal(listCalls, 3);
+    const state = await store.read();
+    assert.equal(state.workers.length, 201);
+    assert.equal(state.runtimeCleanupClaims?.length ?? 0, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("inventory-proven recorded unit absence still requires targeted cgroup verification", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-intercom-cleanup-cgroup-inventory-"));
+  const agentDir = join(root, "agent");
+  const orchestrator = join(agentDir, "intercom", "orchestrator");
+  const store = new WorkerStore(join(orchestrator, "workers.json"));
+  const record = worker();
+  let showCalls = 0;
+  let cgroupCalls = 0;
+  const runner: CommandRunner = {
+    async exec(command, args) {
+      if (command === "systemctl" && args.includes("list-units")) return { stdout: "", stderr: "", code: 0 };
+      if (command === "systemctl") showCalls += 1;
+      if (command === "systemd-cgls") {
+        cgroupCalls += 1;
+        return { stdout: "Control group:\n└─4242 worker\n", stderr: "", code: 0 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+  };
+  try {
+    await mkdir(orchestrator, { recursive: true });
+    await store.write({ version: 1, workers: [record] });
+    const result = await deleteTerminalRuntimeBatchSafely({
+      store,
+      runner,
+      agentDir,
+      candidates: [{
+        workerId: record.id,
+        runId: record.runId,
+        terminalAt: record.stoppedAt!,
+        action: "full",
+        eligible: () => true,
+      }],
+    });
+    assert.deepEqual(result.deleted, [false]);
+    assert.equal(showCalls, 0);
+    assert.equal(cgroupCalls, 1);
+    assert.equal((await store.read()).workers.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("verified prefix absence skips the recorded-unit stop but checks its cgroup in both batch phases", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-intercom-cleanup-skip-stop-"));
+  const agentDir = join(root, "agent");
+  const orchestrator = join(agentDir, "intercom", "orchestrator");
+  const store = new WorkerStore(join(orchestrator, "workers.json"));
+  const record = worker();
+  let stopCalls = 0;
+  let showCalls = 0;
+  let cgroupCalls = 0;
+  const runner: CommandRunner = {
+    async exec(command, args) {
+      if (command === "systemctl" && args.includes("list-units")) return { stdout: "", stderr: "", code: 0 };
+      if (command === "systemctl" && args.includes("stop")) stopCalls += 1;
+      else if (command === "systemctl") showCalls += 1;
+      if (command === "systemd-cgls") {
+        cgroupCalls += 1;
+        return { stdout: "", stderr: "Unit not found", code: 1 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+  };
+  try {
+    await mkdir(orchestrator, { recursive: true });
+    await store.write({ version: 1, workers: [record] });
+    const result = await deleteTerminalRuntimeBatchSafely({
+      store,
+      runner,
+      agentDir,
+      candidates: [{
+        workerId: record.id,
+        runId: record.runId,
+        terminalAt: record.stoppedAt!,
+        action: "full",
+        stopRecordedUnit: record.unit,
+        eligible: () => true,
+      }],
+    });
+    assert.deepEqual(result.deleted, [true]);
+    assert.equal(stopCalls, 0);
+    assert.equal(showCalls, 0);
+    assert.equal(cgroupCalls, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("single-candidate cleanup without an inventory retains both live unit fences", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agent-intercom-cleanup-single-live-fence-"));
+  const agentDir = join(root, "agent");
+  const orchestrator = join(agentDir, "intercom", "orchestrator");
+  const store = new WorkerStore(join(orchestrator, "workers.json"));
+  const record = worker();
+  let listCalls = 0;
+  let showCalls = 0;
+  let cgroupCalls = 0;
+  const runner: CommandRunner = {
+    async exec(command, args) {
+      if (command === "systemctl" && args.includes("list-units")) {
+        listCalls += 1;
+        return { stdout: "", stderr: "", code: 0 };
+      }
+      if (command === "systemctl") {
+        showCalls += 1;
+        return { stdout: "LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\n", stderr: "Unit not found", code: 1 };
+      }
+      if (command === "systemd-cgls") {
+        cgroupCalls += 1;
+        return { stdout: "", stderr: "Unit not found", code: 1 };
+      }
+      return { stdout: "", stderr: "", code: 0 };
+    },
+  };
+  try {
+    await mkdir(orchestrator, { recursive: true });
+    await store.write({ version: 1, workers: [record] });
+    assert.equal(await deleteTerminalRuntimeSafely({
+      store,
+      runner,
+      agentDir,
+      workerId: record.id,
+      runId: record.runId,
+      terminalAt: record.stoppedAt!,
+      action: "full",
+      eligible: () => true,
+    }), true);
+    assert.equal(listCalls, 2);
+    assert.equal(showCalls, 2);
+    assert.equal(cgroupCalls, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("legacy config migration persists explicit orphan retention", async () => {

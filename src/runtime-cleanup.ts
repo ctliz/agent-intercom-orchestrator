@@ -2,7 +2,14 @@ import { randomUUID } from "node:crypto";
 import { lstat, mkdir, readdir, rename, rm } from "node:fs/promises";
 import { isAbsolute, join, relative } from "node:path";
 import { WorkerStore } from "./store.ts";
-import { listWorkerUnitsForVerification, sanitizeUnitPart, verifyUnitAbsentAndEmpty } from "./systemd.ts";
+import {
+  getWorkerUnitMutationGeneration,
+  listWorkerUnitsForVerification,
+  sanitizeUnitPart,
+  stopUnit,
+  verifyUnitAbsentAndEmpty,
+  verifyUnitCgroupEmpty,
+} from "./systemd.ts";
 import type { CommandRunner, OrchestratorConfig, RuntimeCleanupClaim, WorkerRecord, WorkerStateFile } from "./types.ts";
 import { workerRuntimeRoot } from "./runtime.ts";
 import { isTerminalState, validateWorkerId } from "./workers.ts";
@@ -15,6 +22,66 @@ export const TERMINAL_CACHE_PATHS = [
   ["home", ".cache", "pnpm"],
   ["home", ".local", "share", "pnpm", "store"],
 ] as const;
+
+export const CLEANUP_UNIT_INVENTORY_MAX_AGE_MS = 5_000;
+export const CLEANUP_UNIT_INVENTORY_CHUNK_SIZE = 100;
+
+export type CleanupUnitInventory = {
+  verified: boolean;
+  units: ReadonlySet<string>;
+  capturedAt: number;
+  generation: number;
+  reason?: string;
+};
+
+export async function captureCleanupUnitInventory(
+  runner: CommandRunner,
+  now: () => number = Date.now,
+): Promise<CleanupUnitInventory> {
+  const generation = getWorkerUnitMutationGeneration();
+  const loaded = await listWorkerUnitsForVerification(runner);
+  const capturedAt = now();
+  const currentGeneration = getWorkerUnitMutationGeneration();
+  if (generation !== currentGeneration) {
+    return {
+      verified: false,
+      units: new Set<string>(),
+      capturedAt,
+      generation: currentGeneration,
+      reason: "worker unit state changed during inventory capture",
+    };
+  }
+  return {
+    verified: loaded.verified,
+    units: new Set(loaded.units),
+    capturedAt,
+    generation,
+    ...(loaded.reason ? { reason: loaded.reason } : {}),
+  };
+}
+
+export function cleanupUnitInventoryIsUsable(
+  inventory: CleanupUnitInventory,
+  now = Date.now(),
+): boolean {
+  return inventory.verified
+    && inventory.generation === getWorkerUnitMutationGeneration()
+    && now >= inventory.capturedAt
+    && now - inventory.capturedAt <= CLEANUP_UNIT_INVENTORY_MAX_AGE_MS;
+}
+
+export function cleanupInventoryProvesPrefixAbsent(
+  inventory: CleanupUnitInventory,
+  workerId: string,
+  now = Date.now(),
+): boolean {
+  if (!cleanupUnitInventoryIsUsable(inventory, now)) return false;
+  const prefix = `agent-intercom-worker-${sanitizeUnitPart(workerId)}-`;
+  for (const unit of inventory.units) {
+    if (unit.startsWith(prefix)) return false;
+  }
+  return true;
+}
 
 export function terminalWorkerAt(worker: WorkerRecord): number | undefined {
   if (!worker.owned || !isTerminalState(worker.state)) return undefined;
@@ -204,11 +271,28 @@ function selectedEntries(claim: RuntimeCleanupClaim, agentDir: string): Array<{ 
   return expected.filter((entry) => indexes.has(entry.index)).map((entry) => ({ ...entry, quarantine: join(quarantinePath(agentDir, claim.token), String(entry.index)) }));
 }
 
-async function unitPrefixIsClear(runner: CommandRunner, workerId: string): Promise<boolean> {
+async function unitPrefixIsClear(
+  runner: CommandRunner,
+  workerId: string,
+  inventory?: CleanupUnitInventory,
+  now = Date.now(),
+): Promise<boolean> {
+  if (inventory) return cleanupInventoryProvesPrefixAbsent(inventory, workerId, now);
   const loaded = await listWorkerUnitsForVerification(runner);
   if (!loaded.verified) return false;
   const prefix = `agent-intercom-worker-${sanitizeUnitPart(workerId)}-`;
   return !loaded.units.some((unit) => unit.startsWith(prefix));
+}
+
+async function recordedUnitIsAbsentAndEmpty(
+  runner: CommandRunner,
+  unit: string,
+  inventory?: CleanupUnitInventory,
+  now = Date.now(),
+): Promise<boolean> {
+  if (!inventory) return (await verifyUnitAbsentAndEmpty(runner, unit)).absent;
+  if (!cleanupUnitInventoryIsUsable(inventory, now) || inventory.units.has(unit)) return false;
+  return (await verifyUnitCgroupEmpty(runner, unit)).absent;
 }
 
 async function removeClaim(store: WorkerStore, token: string): Promise<void> {
@@ -372,11 +456,15 @@ async function deleteMovedClaim(input: {
   token: string;
   quarantine: string;
   removePath: (path: string) => Promise<void>;
+  inventory?: CleanupUnitInventory;
+  now?: number;
 }): Promise<boolean> {
   const snapshot = await input.store.read();
   const current = snapshot.runtimeCleanupClaims?.find((claim) => claim.token === input.token);
   if (!current || current.phase !== "moved") return false;
-  if (!(await unitPrefixIsClear(input.runner, current.workerId)) || (current.unit && !(await verifyUnitAbsentAndEmpty(input.runner, current.unit)).absent)) {
+  const now = input.now ?? Date.now();
+  if (!(await unitPrefixIsClear(input.runner, current.workerId, input.inventory, now))
+    || (current.unit && !(await recordedUnitIsAbsentAndEmpty(input.runner, current.unit, input.inventory, now)))) {
     await input.store.mutateConditionally((state) => {
       const claim = claims(state).find((candidate) => candidate.token === input.token);
       if (!claim || claim.ownerPid === 0) return { value: undefined, changed: false };
@@ -406,7 +494,7 @@ async function deleteMovedClaim(input: {
   }
 }
 
-export async function deleteTerminalRuntimeSafely(input: {
+export type TerminalRuntimeCleanupInput = {
   store: WorkerStore;
   runner: CommandRunner;
   agentDir: string;
@@ -418,7 +506,19 @@ export async function deleteTerminalRuntimeSafely(input: {
   now?: number;
   removePath?: (path: string) => Promise<void>;
   renamePath?: (source: string, destination: string) => Promise<void>;
-}): Promise<boolean> {
+};
+
+type PreparedRuntimeCleanup = {
+  token: string;
+  quarantine: string;
+  removePath: (path: string) => Promise<void>;
+};
+
+async function prepareTerminalRuntimeCleanup(
+  input: TerminalRuntimeCleanupInput,
+  inventory?: CleanupUnitInventory,
+  inventoryNow = Date.now(),
+): Promise<PreparedRuntimeCleanup | undefined> {
   const now = input.now ?? Date.now();
   validateWorkerId(input.workerId);
   const removePath = input.removePath ?? (async (path: string) => rm(path, { recursive: true, force: true }));
@@ -430,17 +530,19 @@ export async function deleteTerminalRuntimeSafely(input: {
     claims(state).push({ token, workerId: input.workerId, runId: input.runId, terminalAt: input.terminalAt, unit: worker.unit, action: input.action, claimedAt: now, ownerPid: process.pid, phase: "claimed", pathIndexes: [] });
     return { value: true, changed: true };
   });
-  if (!claimed) return false;
+  if (!claimed) return undefined;
   const quarantine = await prepareQuarantine(input.agentDir, token).catch(async (error) => {
     await removeClaim(input.store, token).catch(() => undefined);
     throw error;
   });
   const workerUnit = (await input.store.read()).runtimeCleanupClaims?.find((claim) => claim.token === token)?.unit;
-  const verified = workerUnit ? await verifyUnitAbsentAndEmpty(input.runner, workerUnit) : { absent: true };
-  if (!verified.absent || !(await unitPrefixIsClear(input.runner, input.workerId))) {
+  const recordedUnitClear = workerUnit
+    ? await recordedUnitIsAbsentAndEmpty(input.runner, workerUnit, inventory, inventoryNow)
+    : true;
+  if (!recordedUnitClear || !(await unitPrefixIsClear(input.runner, input.workerId, inventory, inventoryNow))) {
     await removeClaim(input.store, token);
     await removePath(quarantine);
-    return false;
+    return undefined;
   }
   try {
     const moved = await transitionToMoved({
@@ -456,13 +558,350 @@ export async function deleteTerminalRuntimeSafely(input: {
     if (!moved) {
       await removeClaim(input.store, token);
       await removePath(quarantine);
-      return false;
+      return undefined;
     }
   } catch (error) {
     await recoverRuntimeCleanupClaims({ store: input.store, runner: input.runner, agentDir: input.agentDir, forceToken: token, removePath }).catch(() => undefined);
     throw error;
   }
-  return deleteMovedClaim({ store: input.store, runner: input.runner, token, quarantine, removePath });
+  return { token, quarantine, removePath };
+}
+
+export async function deleteTerminalRuntimeSafely(input: TerminalRuntimeCleanupInput): Promise<boolean> {
+  const prepared = await prepareTerminalRuntimeCleanup(input);
+  if (!prepared) return false;
+  return deleteMovedClaim({
+    store: input.store,
+    runner: input.runner,
+    token: prepared.token,
+    quarantine: prepared.quarantine,
+    removePath: prepared.removePath,
+  });
+}
+
+export type TerminalRuntimeCleanupBatchCandidate = Omit<TerminalRuntimeCleanupInput, "store" | "runner" | "agentDir"> & {
+  stopRecordedUnit?: string;
+};
+
+export async function deleteTerminalRuntimeBatchSafely(input: {
+  store: WorkerStore;
+  runner: CommandRunner;
+  agentDir: string;
+  candidates: TerminalRuntimeCleanupBatchCandidate[];
+  preMoveInventory?: CleanupUnitInventory;
+  inventoryNow?: () => number;
+}): Promise<{ deleted: boolean[]; errors: Array<{ index: number; error: string }> }> {
+  const deleted = input.candidates.map(() => false);
+  const errors: Array<{ index: number; error: string }> = [];
+  const inventoryNow = input.inventoryNow ?? Date.now;
+  let preMoveInventory = input.preMoveInventory ?? await captureCleanupUnitInventory(input.runner, inventoryNow);
+  let chunkRemaining = CLEANUP_UNIT_INVENTORY_CHUNK_SIZE;
+  const releaseOwners = async (tokens: ReadonlySet<string>): Promise<void> => {
+    await input.store.mutateConditionally((state) => {
+      let changed = false;
+      for (const claim of claims(state)) {
+        if (tokens.has(claim.token) && claim.ownerPid !== 0) {
+          claim.ownerPid = 0;
+          changed = true;
+        }
+      }
+      return { value: undefined, changed };
+    }).catch(() => undefined);
+  };
+
+  const currentInventory = async (): Promise<{ inventory: CleanupUnitInventory; now: number }> => {
+    let now = inventoryNow();
+    if (chunkRemaining === 0
+      || (preMoveInventory.verified && !cleanupUnitInventoryIsUsable(preMoveInventory, now))) {
+      preMoveInventory = await captureCleanupUnitInventory(input.runner, inventoryNow);
+      now = inventoryNow();
+      chunkRemaining = CLEANUP_UNIT_INVENTORY_CHUNK_SIZE;
+    }
+    chunkRemaining -= 1;
+    return { inventory: preMoveInventory, now };
+  };
+
+  const stopped = new Set<number>();
+  for (const [index, candidate] of input.candidates.entries()) {
+    try {
+      if (candidate.stopRecordedUnit) {
+        const current = await currentInventory();
+        if (!cleanupInventoryProvesPrefixAbsent(current.inventory, candidate.workerId, current.now)
+          || current.inventory.units.has(candidate.stopRecordedUnit)) {
+          await stopUnit(input.runner, candidate.stopRecordedUnit);
+        }
+      }
+      stopped.add(index);
+    } catch (error) {
+      errors.push({ index, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  const requests = input.candidates.map((candidate, index) => ({
+    candidate,
+    index,
+    token: `${candidate.action}-${candidate.workerId}-${randomUUID()}`,
+  })).filter(({ index }) => stopped.has(index));
+  const admitted = await input.store.mutateConditionally((state) => {
+    const accepted: Array<{ index: number; token: string; unit?: string }> = [];
+    let changed = false;
+    for (const { candidate, index, token } of requests) {
+      const worker = state.workers.find((current) => current.id === candidate.workerId && current.runId === candidate.runId);
+      if (!worker || terminalWorkerAt(worker) !== candidate.terminalAt || worker.mainPid || !candidate.eligible(worker)) continue;
+      if (claims(state).some((claim) => claim.workerId === candidate.workerId)) continue;
+      claims(state).push({
+        token,
+        workerId: candidate.workerId,
+        runId: candidate.runId,
+        terminalAt: candidate.terminalAt,
+        unit: worker.unit,
+        action: candidate.action,
+        claimedAt: candidate.now ?? Date.now(),
+        ownerPid: process.pid,
+        phase: "claimed",
+        pathIndexes: [],
+      });
+      accepted.push({ index, token, ...(worker.unit ? { unit: worker.unit } : {}) });
+      changed = true;
+    }
+    return { value: accepted, changed };
+  });
+
+  const quarantines = new Map<string, string>();
+  const rejected = new Set<string>();
+  for (const claim of admitted) {
+    try {
+      quarantines.set(claim.token, await prepareQuarantine(input.agentDir, claim.token));
+      const current = await currentInventory();
+      const unitClear = claim.unit
+        ? await recordedUnitIsAbsentAndEmpty(input.runner, claim.unit, current.inventory, current.now)
+        : true;
+      if (!unitClear || !(await unitPrefixIsClear(
+        input.runner,
+        input.candidates[claim.index].workerId,
+        current.inventory,
+        current.now,
+      ))) rejected.add(claim.token);
+    } catch (error) {
+      rejected.add(claim.token);
+      errors.push({ index: claim.index, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+  if (rejected.size) {
+    await input.store.mutateConditionally((state) => {
+      const before = claims(state).length;
+      state.runtimeCleanupClaims = claims(state).filter((claim) => !rejected.has(claim.token));
+      return { value: undefined, changed: claims(state).length !== before };
+    });
+    for (const token of rejected) {
+      const quarantine = quarantines.get(token);
+      if (quarantine) await rm(quarantine, { recursive: true, force: true });
+    }
+  }
+
+  const movable = admitted.filter(({ token }) => !rejected.has(token));
+  const invalid = new Set<string>();
+  const moveFailures = new Set<string>();
+  let movementError: unknown;
+  if (movable.length) {
+    await input.store.transaction(async (state, persist) => {
+      const moving: Array<{ index: number; token: string }> = [];
+      for (const item of movable) {
+        const claim = claims(state).find((candidate) => candidate.token === item.token);
+        const candidate = input.candidates[item.index];
+        const worker = claim?.runId
+          ? state.workers.find((current) => current.id === claim.workerId && current.runId === claim.runId)
+          : undefined;
+        if (!claim || claim.phase !== "claimed"
+          || !worker || terminalWorkerAt(worker) !== claim.terminalAt || worker.mainPid || !candidate.eligible(worker)) {
+          invalid.add(item.token);
+          continue;
+        }
+        try {
+          const existing: number[] = [];
+          for (const entry of expectedEntries(claim, input.agentDir)) {
+            try {
+              await assertContainedPath(entry.base, entry.path);
+              if (await pathExists(entry.path)) existing.push(entry.index);
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+            }
+          }
+          claim.pathIndexes = existing;
+          claim.phase = "moving";
+          moving.push({ index: item.index, token: claim.token });
+        } catch (error) {
+          invalid.add(item.token);
+          errors.push({ index: item.index, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      if (moving.length) await persist();
+      for (const item of moving) {
+        try {
+          const movingClaim = claims(state).find((claim) => claim.token === item.token && claim.phase === "moving");
+          if (!movingClaim) throw new Error(`Cleanup claim ${item.token} was not durably published as moving`);
+          for (const entry of selectedEntries(movingClaim, input.agentDir)) await rename(entry.path, entry.quarantine);
+          movingClaim.phase = "moved";
+        } catch (error) {
+          moveFailures.add(item.token);
+          errors.push({ index: item.index, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      if (moving.length) await persist();
+    }).catch((error) => { movementError = error; });
+  }
+  if (movementError) {
+    for (const item of movable) {
+      const claim = (await input.store.read()).runtimeCleanupClaims?.find((candidate) => candidate.token === item.token);
+      if (claim) {
+        await recoverOneClaim({
+          store: input.store,
+          runner: input.runner,
+          agentDir: input.agentDir,
+          claim,
+          force: true,
+          removePath: async (path) => rm(path, { recursive: true, force: true }),
+        }).catch(() => undefined);
+      }
+      errors.push({ index: item.index, error: movementError instanceof Error ? movementError.message : String(movementError) });
+    }
+    await releaseOwners(new Set(movable.map(({ token }) => token)));
+    return { deleted, errors };
+  }
+
+  if (invalid.size) {
+    await input.store.mutateConditionally((state) => {
+      const before = claims(state).length;
+      state.runtimeCleanupClaims = claims(state).filter((claim) => !invalid.has(claim.token));
+      return { value: undefined, changed: claims(state).length !== before };
+    });
+    for (const token of invalid) {
+      const quarantine = quarantines.get(token);
+      if (quarantine) await rm(quarantine, { recursive: true, force: true });
+    }
+  }
+  for (const token of moveFailures) {
+    const claim = (await input.store.read()).runtimeCleanupClaims?.find((candidate) => candidate.token === token);
+    if (claim) {
+      await recoverOneClaim({
+        store: input.store,
+        runner: input.runner,
+        agentDir: input.agentDir,
+        claim,
+        force: true,
+        removePath: async (path) => rm(path, { recursive: true, force: true }),
+      }).catch(async () => {
+        await input.store.mutateConditionally((state) => {
+          const current = claims(state).find((candidate) => candidate.token === token);
+          if (!current || current.ownerPid === 0) return { value: undefined, changed: false };
+          current.ownerPid = 0;
+          return { value: undefined, changed: true };
+        }).catch(() => undefined);
+      });
+    }
+  }
+
+  const moved = movable.filter(({ token }) => !invalid.has(token) && !moveFailures.has(token));
+  if (moved.length === 0) return { deleted, errors };
+
+  let postMoveInventory = await captureCleanupUnitInventory(input.runner, inventoryNow);
+  chunkRemaining = CLEANUP_UNIT_INVENTORY_CHUNK_SIZE;
+  const currentPostMoveInventory = async (): Promise<{ inventory: CleanupUnitInventory; now: number }> => {
+    let now = inventoryNow();
+    if (chunkRemaining === 0
+      || (postMoveInventory.verified && !cleanupUnitInventoryIsUsable(postMoveInventory, now))) {
+      postMoveInventory = await captureCleanupUnitInventory(input.runner, inventoryNow);
+      now = inventoryNow();
+      chunkRemaining = CLEANUP_UNIT_INVENTORY_CHUNK_SIZE;
+    }
+    chunkRemaining -= 1;
+    return { inventory: postMoveInventory, now };
+  };
+
+  const readyToDelete = new Set<string>();
+  const blocked = new Set<string>();
+  for (const item of moved) {
+    try {
+      const current = await currentPostMoveInventory();
+      const workerId = input.candidates[item.index].workerId;
+      const prefixClear = await unitPrefixIsClear(input.runner, workerId, current.inventory, current.now);
+      const unitClear = item.unit
+        ? await recordedUnitIsAbsentAndEmpty(input.runner, item.unit, current.inventory, current.now)
+        : true;
+      (prefixClear && unitClear ? readyToDelete : blocked).add(item.token);
+    } catch (error) {
+      blocked.add(item.token);
+      errors.push({ index: item.index, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  const transitioned = await input.store.mutateConditionally((state) => {
+    let changed = false;
+    const deleting: string[] = [];
+    for (const claim of claims(state)) {
+      if (readyToDelete.has(claim.token) && claim.phase === "moved") {
+        claim.phase = "deleting";
+        deleting.push(claim.token);
+        changed = true;
+      } else if (blocked.has(claim.token) && claim.ownerPid !== 0) {
+        claim.ownerPid = 0;
+        changed = true;
+      }
+    }
+    return { value: deleting, changed };
+  }).catch(async (error) => {
+    await releaseOwners(new Set(moved.map(({ token }) => token)));
+    for (const item of moved) errors.push({ index: item.index, error: error instanceof Error ? error.message : String(error) });
+    return [] as string[];
+  });
+  const deleting = new Set(transitioned);
+
+  const removed = new Set<string>();
+  const removeFailed = new Set<string>();
+  for (const item of moved) {
+    if (!deleting.has(item.token)) continue;
+    try {
+      const removePath = input.candidates[item.index].removePath
+        ?? (async (path: string) => rm(path, { recursive: true, force: true }));
+      await removePath(quarantines.get(item.token)!);
+      removed.add(item.token);
+    } catch (error) {
+      removeFailed.add(item.token);
+      errors.push({ index: item.index, error: error instanceof Error ? error.message : String(error) });
+    }
+  }
+
+  let finalized = new Set<string>();
+  if (removed.size || removeFailed.size) {
+    const completedTokens = await input.store.mutateConditionally((state) => {
+      let changed = false;
+      for (const claim of claims(state)) {
+        if (removeFailed.has(claim.token) && claim.ownerPid !== 0) {
+          claim.ownerPid = 0;
+          changed = true;
+        }
+      }
+      const completed = claims(state).filter((claim) => removed.has(claim.token) && claim.phase === "deleting");
+      if (completed.length) {
+        const fullRuns = new Set(completed.filter((claim) => claim.action === "full").map((claim) => `${claim.workerId}\u0000${claim.runId}`));
+        state.workers = state.workers.filter((worker) => !fullRuns.has(`${worker.id}\u0000${worker.runId}`));
+        state.runtimeCleanupClaims = claims(state).filter((claim) => !removed.has(claim.token));
+        changed = true;
+      }
+      return { value: completed.map((claim) => claim.token), changed };
+    }).catch(async (error) => {
+      await releaseOwners(new Set([...removed, ...removeFailed]));
+      for (const item of moved) {
+        if (removed.has(item.token) || removeFailed.has(item.token)) {
+          errors.push({ index: item.index, error: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      return [] as string[];
+    });
+    finalized = new Set(completedTokens);
+  }
+  for (const item of moved) if (finalized.has(item.token)) deleted[item.index] = true;
+  return { deleted, errors };
 }
 
 export async function deleteOrphanRuntimeSafely(input: {

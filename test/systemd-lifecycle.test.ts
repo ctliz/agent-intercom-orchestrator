@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getUnitStatus, getUserManagerHealth, launchUnit, stopUnit, waitForUnitRunning } from "../src/systemd.ts";
+import { getUnitStatus, getUserManagerHealth, getWorkerUnitMutationGeneration, launchUnit, stopUnit, waitForUnitRunning } from "../src/systemd.ts";
 import { stateFromUnit, unitRequiresStopFence } from "../src/workers.ts";
 
 const ok = (stdout = "") => ({ stdout, stderr: "", code: 0 });
@@ -31,18 +31,32 @@ test("user-manager health distinguishes a draining queue, persistent backlog, an
 
 test("launch is nonblocking and a killed submission is indeterminate", async () => {
   const calls: string[][] = [];
+  const beforeLaunch = getWorkerUnitMutationGeneration();
   await launchUnit({ async exec(_command, args) { calls.push(args); return ok(); } }, {
     unit: "worker.service",
     profile: { harness: "pi", command: "/usr/bin/true", mode: "persistent" },
     args: [], cwd: "/tmp", maxRuntime: "2h", stopTimeoutSeconds: 5,
   });
   assert.ok(calls[0].includes("--no-block"));
+  assert.ok(getWorkerUnitMutationGeneration() > beforeLaunch);
 
   await assert.rejects(launchUnit({ async exec() { return { stdout: "", stderr: "", code: 143, killed: true }; } }, {
     unit: "worker.service",
     profile: { harness: "pi", command: "/usr/bin/true", mode: "persistent" },
     args: [], cwd: "/tmp", maxRuntime: "2h", stopTimeoutSeconds: 5,
   }), /determine whether .* submitted/);
+});
+
+test("stop attempts invalidate cleanup unit inventories", async () => {
+  const beforeStop = getWorkerUnitMutationGeneration();
+  await stopUnit({ async exec(command, args) {
+    if (command === "systemctl" && args.includes("show")) {
+      return ok("LoadState=not-found\nActiveState=inactive\nSubState=dead\nMainPID=0\nJob=\n");
+    }
+    if (command === "systemd-cgls") return { stdout: "", stderr: "Unit not found", code: 1 };
+    return ok();
+  } }, "worker.service", { timeoutMs: 50, intervalMs: 1, stableMs: 0 });
+  assert.ok(getWorkerUnitMutationGeneration() > beforeStop);
 });
 
 test("queued jobs and activation evidence survive status parsing", async () => {
