@@ -5,6 +5,16 @@ import { setTimeout as delay } from "node:timers/promises";
 import type { CommandRunner, LaunchProfile, UnitStatus } from "./types.ts";
 import { expandHome, resolveProfileCommand } from "./config.ts";
 
+let workerUnitMutationGeneration = 0;
+
+export function getWorkerUnitMutationGeneration(): number {
+  return workerUnitMutationGeneration;
+}
+
+function markWorkerUnitMutation(): void {
+  workerUnitMutationGeneration += 1;
+}
+
 export function sanitizeUnitPart(value: string, fallback = "worker"): string {
   const sanitized = value
     .toLowerCase()
@@ -126,6 +136,7 @@ export interface LaunchUnitInput {
 }
 
 export async function launchUnit(runner: CommandRunner, input: LaunchUnitInput): Promise<void> {
+  markWorkerUnitMutation();
   const executable = await resolveLaunchCommand(input.profile);
   const unitBase = input.unit.endsWith(".service") ? input.unit.slice(0, -8) : input.unit;
   const environment: Record<string, string> = {
@@ -280,6 +291,13 @@ export async function verifyUnitAbsentAndEmpty(
     }
     return { absent: false, reason: `unit is still loaded (${values.ActiveState || "unknown"}/${values.SubState || "unknown"})` };
   }
+  return verifyUnitCgroupEmpty(runner, unit);
+}
+
+export async function verifyUnitCgroupEmpty(
+  runner: CommandRunner,
+  unit: string,
+): Promise<{ absent: boolean; reason?: string }> {
   const processes = await runner.exec("systemd-cgls", ["--user-unit", unit, "--no-pager", "--full"], { timeout: 5000 });
   if (processes.code === 0) {
     const pids = [...processes.stdout.matchAll(/[├└]─(\d+)\s/g)]
@@ -299,6 +317,7 @@ export async function stopUnit(
   unit: string,
   options: { timeoutMs?: number; intervalMs?: number; stableMs?: number } = {},
 ): Promise<void> {
+  markWorkerUnitMutation();
   try {
     const result = await runner.exec("systemctl", ["--user", "stop", "--no-block", unit], { timeout: 15000 });
     const missing = /not loaded|not found/i.test(`${result.stdout}\n${result.stderr}`);
