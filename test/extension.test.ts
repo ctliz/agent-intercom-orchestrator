@@ -9,6 +9,48 @@ function commandResult() {
   return { stdout: "", stderr: "", code: 0, killed: false };
 }
 
+test("owned Boss participants cannot register /boss or agent_fleet when orchestration is disabled", async () => {
+  const keys = [
+    "AGENT_INTERCOM_ORCHESTRATOR_DISABLED",
+    "AGENT_INTERCOM_BOSS_RUN_ID",
+    "AGENT_INTERCOM_BOSS_ROLE",
+    "AGENT_INTERCOM_BOSS_CONTROLLER_TARGET",
+    "AGENT_INTERCOM_BOSS_MANAGER_TARGET",
+    "AGENT_INTERCOM_BOSS_TEAM_TARGETS",
+    "AGENT_INTERCOM_BOSS_VISIBILITY",
+  ] as const;
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    process.env.AGENT_INTERCOM_ORCHESTRATOR_DISABLED = "1";
+    process.env.AGENT_INTERCOM_BOSS_RUN_ID = "boss-00000000-0000-4000-8000-123456789abc";
+    process.env.AGENT_INTERCOM_BOSS_CONTROLLER_TARGET = "controller-exact-target";
+    process.env.AGENT_INTERCOM_BOSS_MANAGER_TARGET = "boss-manager-123456789abc";
+    process.env.AGENT_INTERCOM_BOSS_TEAM_TARGETS = JSON.stringify(["boss-manager-123456789abc", "boss-worker-123456789abc", "boss-scout-123456789abc", "boss-adversary-123456789abc"]);
+    process.env.AGENT_INTERCOM_BOSS_VISIBILITY = "team-only";
+    for (const role of ["manager", "worker", "scout", "adversary"] as const) {
+      process.env.AGENT_INTERCOM_BOSS_ROLE = role;
+      const tools = new Map<string, unknown>();
+      const commands = new Map<string, unknown>();
+      const pi: any = {
+        on() {},
+        events: { on() { return () => {}; }, emit() {} },
+        registerTool(tool: any) { tools.set(tool.name, tool); },
+        registerCommand(name: string, command: any) { commands.set(name, command); },
+      };
+      const { default: extension } = await import(new URL(`../src/index.ts?disabled-boss=${role}-${Date.now()}`, import.meta.url).href);
+      extension(pi);
+      assert.equal(tools.has("agent_fleet"), false, `${role} must not own agent_fleet`);
+      assert.equal(commands.has("boss"), false, `${role} must not own /boss`);
+    }
+  } finally {
+    for (const key of keys) {
+      const value = previous[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 test("reconciliation retires completed one-shot units after preserving their completed state", async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-retire-test-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;

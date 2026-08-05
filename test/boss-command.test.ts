@@ -21,6 +21,10 @@ test("Boss command parser is exact and defaults to status", () => {
   });
   assert.throws(() => parseBossCommand("create"), /requires one explicit goal/);
   assert.throws(() => parseBossCommand("resume short"), /8-128/);
+  for (const action of ["resume", "pause", "cancel", "proof", "approve", "reject"] as const) {
+    assert.throws(() => parseBossCommand(action), /Boss run id must be 8-128/, `${action} must require an exact run id`);
+  }
+  assert.throws(() => parseBossCommand("status boss-run_123 unexpected-detail-token"), /Boss run id must be 8-128/);
   assert.throws(() => parseBossCommand("unknown"), /Unknown \/boss action/);
 });
 
