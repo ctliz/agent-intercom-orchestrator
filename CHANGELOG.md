@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add an LLM-callable `boss` tool for top-level Pi Controllers, sharing the exact `/boss` lifecycle implementation and returning exact run/status data while remaining unavailable to orchestration-disabled Boss participants.
 - Scope each manager's periodic lifecycle heartbeat to its attached workers, avoid no-op worker-store commits, and fast-path managers with no live workers; startup, explicit cross-manager actions, and the persistent 15-minute cleanup timer retain global reconciliation and fail-closed convergence.
 - Replace the legacy `/agents` text editor with the compact graphical browser, scoped to the current Pi by default with `/agents history` and `/agents all` views; keep it aligned with the canonical worker lifecycle and render it on an opaque padded background so chat text cannot bleed through it.
 - Make worker startup fail closed across systemd submission, queued activation, stable PID verification, and exact-run Intercom readiness; add durable stop fencing, late-unit reconciliation, honest unverified adapter states, user-manager backlog protection, and serialized systemd integration tests.
