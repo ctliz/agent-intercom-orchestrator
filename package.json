@@ -59,20 +59,14 @@
     ]
   },
   "dependencies": {
-    "@dataforxyz/agent-intercom-core": "git+https://github.com/dataforxyz/agent-intercom-core.git#8316cbab548f422ad11c78ed887fabeef94817c1"
-  },
-  "peerDependencies": {
+    "@dataforxyz/agent-intercom-core": "git+https://github.com/dataforxyz/agent-intercom-core.git#8316cbab548f422ad11c78ed887fabeef94817c1",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "typebox": "^1.1.24"
   },
   "devDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
     "@types/node": "^22.15.0",
-    "typebox": "^1.1.24",
     "typescript": "^5.9.3"
   },
   "publishConfig": {
