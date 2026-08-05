@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import type { TrustedLocalBossAssignmentRole } from "./boss-trusted-local.ts";
 
 // Trusted-local team policy is currently implemented by the Pi Intercom adapter.
@@ -36,6 +37,64 @@ export function buildTrustedLocalBossTeamEnvironment(identity: TrustedLocalBossT
     AGENT_INTERCOM_BOSS_VISIBILITY: "team-only",
     AGENT_INTERCOM_ORCHESTRATOR_DISABLED: "1",
   };
+}
+
+export function trustedLocalBossRalphLoopName(identity: Pick<TrustedLocalBossTeamIdentity, "bossRunId" | "role">): string {
+  return `boss-${identity.bossRunId.slice(-12)}-${identity.role}`;
+}
+
+export function buildTrustedLocalBossRalphEnvironment(identity: TrustedLocalBossTeamIdentity, privateRuntimeRoot: string): Record<string, string> {
+  return {
+    PI_RALPH_STATE_ROOT: join(privateRuntimeRoot, "boss-ralph", identity.bossRunId, identity.role),
+  };
+}
+
+export function buildTrustedLocalBossParticipantPrompt(identity: TrustedLocalBossTeamIdentity, goal: string): string {
+  const loopName = trustedLocalBossRalphLoopName(identity);
+  const reporting = identity.role === "manager"
+    ? [
+      "At the start of every Ralph iteration, call intercom_team and verify the exact Worker and Scout are live and ready for this run.",
+      "Every iteration, send bounded progress nudges to both Worker and Scout with intercom_send; never passively wait for updates.",
+      "Escalation is bounded: after one missing or stale update, nudge the participant; after two consecutive stale checks, report the blocker to the Controller and reassign other unblocked work.",
+      "Integrate evidence, assign the next bounded work, and report a concise team summary to the Controller every iteration.",
+    ]
+    : identity.role === "adversary"
+      ? [
+        "At the start of every Ralph iteration, check exact team identity with intercom_team before reviewing any proof revision.",
+        "Report findings, blockers, and the exact proof revision to the Controller during every productive iteration.",
+      ]
+      : [
+        "At the start of every Ralph iteration, check exact team readiness with intercom_team.",
+        "Report concrete progress, verification evidence, and blockers to the Manager with intercom_send during every iteration.",
+        "Do not wait for a status request before reporting progress.",
+      ];
+  const checklist = identity.role === "manager"
+    ? ["Check exact team liveness and readiness", "Nudge Worker and Scout and review their latest evidence", "Assign or execute the next unblocked work and report to the Controller"]
+    : identity.role === "worker"
+      ? ["Take the next bounded implementation item", "Verify the change with concrete evidence", "Report progress and blockers to the Manager"]
+      : identity.role === "scout"
+        ? ["Investigate the next dependency, risk, or verification gap", "Capture concrete evidence", "Report findings and blockers to the Manager"]
+        : ["Wait for and inspect the exact proof revision", "Challenge claims against concrete evidence", "Report an exact-revision advisory decision to the Controller"];
+  const taskContent = [
+    `# Trusted-local Boss ${identity.role} loop`,
+    "",
+    "## Goal",
+    `- ${goal}`,
+    "",
+    "## Checklist",
+    ...checklist.map((item) => `- [ ] ${item}`),
+    "",
+    "## Iteration protocol",
+    ...reporting.map((item) => `- ${item}`),
+    "- Update this Ralph task file with progress and verification evidence before ending each iteration.",
+  ].join("\n");
+  return [
+    `Immediately start the isolated Ralph loop named ${loopName} with ralph_start.`,
+    `Use taskContent exactly as follows: ${JSON.stringify(taskContent)}.`,
+    "Set itemsPerIteration=3, reflectEvery=5, maxIterations=100, and endInstructions to report final evidence and blockers to the Manager and Controller.",
+    ...reporting,
+    "After productive work, call ralph_done so the next supervised iteration starts; do not use it to poll or wait.",
+  ].join("\n");
 }
 
 /** Returns no Boss metadata for ordinary fleet spawns. */

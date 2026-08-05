@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossTeamEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets } from "../src/boss-team-environment.ts";
+import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossRalphEnvironment, buildTrustedLocalBossTeamEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, trustedLocalBossRalphLoopName } from "../src/boss-team-environment.ts";
 import { buildWorkerEnvironment } from "../src/workers.ts";
 
 test("Boss team environment binds every role to one deterministic Pi team including prospective adversary", () => {
@@ -35,6 +35,9 @@ test("Boss team environment binds every role to one deterministic Pi team includ
     assert.equal(JSON.parse(environment.AGENT_INTERCOM_BOSS_TEAM_TARGETS).includes("controller-exact-target"), false);
     assert.equal(environment.AGENT_INTERCOM_BOSS_VISIBILITY, "team-only");
     assert.equal(environment.AGENT_INTERCOM_ORCHESTRATOR_DISABLED, "1");
+    assert.deepEqual(buildTrustedLocalBossRalphEnvironment({ bossRunId, role, controllerTarget: "controller-exact-target" }, "/run/private-worker"), {
+      PI_RALPH_STATE_ROOT: `/run/private-worker/boss-ralph/${bossRunId}/${role}`,
+    });
     for (const harness of ["pi", "codex", "claude", "opencode"] as const) {
       const ordinary = {
         ...buildWorkerEnvironment(harness, targets[1], role, undefined, {
@@ -49,5 +52,36 @@ test("Boss team environment binds every role to one deterministic Pi team includ
       assert.equal(launched.AGENT_INTERCOM_BOSS_CONTROLLER_TARGET, launched.AGENT_INTERCOM_MANAGER_TARGET, `${harness} Boss Controller target must be the adapter's exact stable manager target`);
       assert.equal(launched.AGENT_INTERCOM_ORCHESTRATOR_DISABLED, "1", `${harness} Boss ${role} must remain unable to orchestrate`);
     }
+  }
+});
+
+test("Boss Ralph prompts use deterministic role loops and active bounded supervision", () => {
+  const bossRunId = "boss-00000000-0000-4000-8000-123456789abc";
+  const controllerTarget = "controller-exact-target";
+  const goal = "ship a verified bounded change";
+  const names = new Set<string>();
+
+  for (const role of ["manager", "worker", "scout", "adversary"] as const) {
+    const identity = { bossRunId, role, controllerTarget };
+    const name = trustedLocalBossRalphLoopName(identity);
+    const prompt = buildTrustedLocalBossParticipantPrompt(identity, goal);
+    names.add(name);
+    assert.equal(name, `boss-123456789abc-${role}`);
+    assert.match(prompt, new RegExp(`Immediately start the isolated Ralph loop named ${name}`));
+    assert.match(prompt, /itemsPerIteration=3, reflectEvery=5, maxIterations=100/);
+    assert.match(prompt, /call ralph_done/);
+    assert.match(prompt, /intercom_team/);
+  }
+  assert.equal(names.size, 4, "every role must have isolated deterministic loop state");
+
+  const manager = buildTrustedLocalBossParticipantPrompt({ bossRunId, role: "manager", controllerTarget }, goal);
+  assert.match(manager, /Every iteration, send bounded progress nudges to both Worker and Scout with intercom_send/);
+  assert.match(manager, /after two consecutive stale checks, report the blocker to the Controller/);
+  assert.match(manager, /report a concise team summary to the Controller every iteration/);
+
+  for (const role of ["worker", "scout"] as const) {
+    const prompt = buildTrustedLocalBossParticipantPrompt({ bossRunId, role, controllerTarget }, goal);
+    assert.match(prompt, /Report concrete progress, verification evidence, and blockers to the Manager with intercom_send during every iteration/);
+    assert.match(prompt, /Do not wait for a status request before reporting progress/);
   }
 });

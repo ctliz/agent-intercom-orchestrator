@@ -30,6 +30,8 @@ export const SAFE_PI_MANAGER_TOOLS = [
   "bash",
 ];
 
+export const SAFE_PI_BOSS_RALPH_TOOLS = ["ralph_start", "ralph_done"] as const;
+
 const SENSITIVE_HOME_PATHS = [
   "~/.ssh",
   "~/.aws",
@@ -569,6 +571,16 @@ export function buildPermissionEnvironment(profileName: string, profile: Permiss
 export function applyPiPermissionArgs(args: string[], profile: PermissionProfile): string[] {
   if (!profile.piTools?.length) return args;
   return [...args, "--tools", [...new Set(profile.piTools)].join(",")];
+}
+
+export function addPiTools(args: string[], tools: readonly string[]): string[] {
+  if (!tools.length) return args;
+  const toolIndex = args.lastIndexOf("--tools");
+  if (toolIndex < 0 || toolIndex + 1 >= args.length) return [...args, "--tools", [...new Set(tools)].join(",")];
+  const configured = args[toolIndex + 1].split(",").map((tool) => tool.trim()).filter(Boolean);
+  const next = [...args];
+  next[toolIndex + 1] = [...new Set([...configured, ...tools])].join(",");
+  return next;
 }
 
 export type CodexNativeSandbox = "read-only" | "workspace-write" | "danger-full-access";
