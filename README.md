@@ -63,6 +63,24 @@ agent_fleet({ action: "list" }) // live and recently terminal workers owned by t
 agent_fleet({ action: "history" }) // full retained history for this manager
 ```
 
+## Trusted-local Boss runs
+
+A top-level Pi Controller can create and manage a concurrent logical Boss team through the LLM-callable `boss` tool:
+
+```typescript
+boss({ action: "create", goal: "Implement and verify the requested feature" })
+boss({ action: "status" })
+boss({ action: "status", bossRunId: "<exact-run-id>" })
+boss({ action: "pause", bossRunId: "<exact-run-id>", note: "Hold while CI is investigated" })
+boss({ action: "resume", bossRunId: "<exact-run-id>" })
+boss({ action: "proof", bossRunId: "<exact-run-id>" })
+boss({ action: "cancel", bossRunId: "<exact-run-id>" })
+```
+
+The interactive `/boss` command remains available for direct user control. The tool uses the calling top-level Pi session as the exact creating Controller, returns exact run IDs and status to the model, and is absent from Manager, Worker, Scout, and Adversary participants because they launch with orchestration disabled. Only the creating Controller can inspect or mutate its runs.
+
+**TRUSTED LOCAL MODE — same-user agents and local files are trusted; evidence is advisory, not tamper-proof.** Team metadata provides logical trusted-local scoping, not hostile-agent-resistant authority.
+
 Pi, Codex, Claude, and OpenCode coworkers launch in transient systemd user services with `KillMode=control-group`, a maximum runtime, an activity-bounded lease, and an owned worker record. Stopping the unit stops the harness, MCP servers, Playwright browsers, sidecars, and every descendant that remains in its cgroup; stop escalates, verifies that the cgroup is empty, and resets failed unit state even when escalation reports surviving descendants. Worker IDs are reserved atomically before launch, lifecycle actions patch the current run inside the store lock, and dead-process locks are reclaimed without stealing live mutations. Manager heartbeats no longer renew idle workers merely because their processes exist: only manager-received worker Intercom traffic or an explicit `renew` extends the lease, and renewal is capped at the configured idle deadline. The manager requests a save/commit/handoff checkpoint before that deadline, preserves a grace period for recovery or adoption, and installs a persistent systemd user cleanup timer so exact expired owned cgroups are stopped even when no manager is running. Legacy live records receive a complete idle window when first migrated. `agent_fleet({ action: "status", id: "..." })` includes the current cgroup process tree and lifecycle deadlines. Pi coworkers are independent RPC-mode Pi sessions with their own transcript, model, thinking effort, session name, and Intercom identity—not child subagents. When the built-in `pi-peer` command is unchanged, the orchestrator verifies Pi's active package entry point and launches workers with that same concrete runtime, avoiding an unpinned `npx` wrapper bootstrap and manager/worker version drift. Configure a custom Pi profile or override `pi-peer.command` when wrapper-provided environment or flags must be preserved. The persistent OpenCode profile owns a headless server plus an initialized session and retries early port-bind/startup exits on a fresh ephemeral port; `opencode-run` remains available for one-shot work.
 
 Spawn submission is not treated as readiness. The orchestrator first verifies that the systemd start job has cleared, the exact unit remains active with a nonzero `MainPID`, and the process stays stable across a bounded interval. Persistent Pi peers created by an interactive Pi manager additionally complete an invisible Intercom probe/ack bound to the exact run ID. Headless/OpenCode managers currently lack the in-process control-event bridge, so their persistent Pi workers remain honestly process-stable `registering` rather than being falsely marked ready. Built-in persistent Codex and Claude profiles wrap the coordinated adapters and wait for their post-connect marker to produce run-ID-keyed health; a marker change or adapter exit fails closed. Custom persistent adapter profiles preserve compatibility by reporting process-stable `registering` unless they adopt a future explicit readiness contract. Persistent OpenCode peers retain their plugin/session health handshake. A durable stop intent fences the exact unit, and reconciliation stops a queued unit that materializes after the manager requested stop. `doctor` reports user-manager responsiveness and queued jobs; spawn refuses submission while that manager is unresponsive or excessively backlogged.

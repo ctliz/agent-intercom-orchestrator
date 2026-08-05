@@ -9,7 +9,7 @@ function commandResult() {
   return { stdout: "", stderr: "", code: 0, killed: false };
 }
 
-test("owned Boss participants cannot register /boss or agent_fleet when orchestration is disabled", async () => {
+test("owned Boss participants cannot register /boss, boss, or agent_fleet when orchestration is disabled", async () => {
   const keys = [
     "AGENT_INTERCOM_ORCHESTRATOR_DISABLED",
     "AGENT_INTERCOM_BOSS_RUN_ID",
@@ -40,6 +40,7 @@ test("owned Boss participants cannot register /boss or agent_fleet when orchestr
       const { default: extension } = await import(new URL(`../src/index.ts?disabled-boss=${role}-${Date.now()}`, import.meta.url).href);
       extension(pi);
       assert.equal(tools.has("agent_fleet"), false, `${role} must not own agent_fleet`);
+      assert.equal(tools.has("boss"), false, `${role} must not own boss`);
       assert.equal(commands.has("boss"), false, `${role} must not own /boss`);
     }
   } finally {
@@ -1038,6 +1039,18 @@ test("extension registers discovery tools and interactive configuration commands
     await lifecycle.get("session_start")?.({}, ctx);
 
     assert.ok(tools.has("agent_fleet"));
+    assert.ok(tools.has("boss"));
+    assert.match(tools.get("boss").promptGuidelines.join("\n"), /do not ask the user to type \/boss/i);
+    assert.match(JSON.stringify(tools.get("boss").parameters), /bossRunId/);
+    const bossStatus = await tools.get("boss").execute(
+      "boss-status-test",
+      { action: "status" },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.match(bossStatus.content[0].text, /TRUSTED LOCAL MODE/);
+    assert.match(bossStatus.content[0].text, /No Boss runs are owned by this Controller/);
     assert.match(tools.get("agent_fleet").promptGuidelines.join("\n"), /returned intercomTarget/);
     assert.match(tools.get("agent_fleet").promptGuidelines.join("\n"), /progress\/status checkpoints/);
     assert.match(tools.get("agent_fleet").promptGuidelines.join("\n"), /create the feature worktree before spawning/i);

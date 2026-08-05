@@ -1892,6 +1892,218 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     },
   });
 
+  async function executeTrustedLocalBoss(args: string, ctx: ExtensionContext) {
+    if (!config) await loadConfig();
+    await synchronizeTrustedLocalBossWorkers();
+    const request = parseBossCommand(args);
+    let result = await trustedLocalBossStore.execute(request, managerSessionId(ctx));
+
+    if (request.action === "proof" && result.run) {
+      const reviewer = result.run.assignments.find((assignment) => assignment.role === "adversary");
+      if (reviewer?.state === "requested") {
+        const reviewerParams: FleetParams = {
+          action: "spawn",
+          id: `boss-adversary-${result.run.bossRunId.slice(-12)}`,
+          role: "challenger",
+          task: [
+            TRUSTED_LOCAL_BOSS_WARNING,
+            `Adversarially review trusted-local Boss run ${result.run.bossRunId}.`,
+            `Goal: ${result.run.goal}`,
+            "Wait for the owning Pi session to deliver an exact advisory proof revision and digest before returning a decision.",
+            "Do not claim protected authority, independent attestation, or tamper-proof evidence.",
+          ].join("\n"),
+          cwd: ctx.cwd,
+          harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
+          effort: "auto",
+          subagents: "auto",
+          bossTeam: { bossRunId: result.run.bossRunId, role: "adversary", controllerTarget: result.run.managerSessionId },
+        };
+        let spawnedReviewer: WorkerRecord | undefined;
+        let reviewerBindingKey: string | undefined;
+        try {
+          const worker = await spawnWorker(reviewerParams, ctx, await resolveSpawn(reviewerParams, ctx));
+          spawnedReviewer = worker;
+          reviewerBindingKey = `${worker.id}\0${workerIncarnation(worker)}`;
+          bossBindingsInFlight.add(reviewerBindingKey);
+          await store.mutate((state) => {
+            const current = state.workers.find((candidate) => candidate.id === worker.id && candidate.runId === worker.runId);
+            if (!current) throw new Error(`Boss adversary ${worker.id} disappeared before run binding`);
+            if (current.managerSessionId !== result.run!.managerSessionId) throw new Error(`Boss adversary ${worker.id} Controller ownership changed before run binding`);
+            current.bossRunId = result.run!.bossRunId;
+            current.updatedAt = Date.now();
+          });
+          worker.bossRunId = result.run.bossRunId;
+          await trustedLocalBossStore.recordReviewerStarted(result.run.bossRunId, worker);
+          if (reviewerBindingKey) bossBindingsInFlight.delete(reviewerBindingKey);
+          spawnedReviewer = undefined;
+        } catch (error) {
+          if (reviewerBindingKey) bossBindingsInFlight.delete(reviewerBindingKey);
+          if (spawnedReviewer) await stopBossOrphanWorker(spawnedReviewer, managerSessionId(ctx)).catch(() => undefined);
+          await trustedLocalBossStore.recordReviewerFailed(result.run.bossRunId, error);
+        }
+        result = await trustedLocalBossStore.execute(request, managerSessionId(ctx));
+      }
+      const deliveredProof = result.run?.proofPackets.at(-1);
+      const assignedReviewer = result.run?.assignments.find((assignment) => assignment.role === "adversary");
+      const priorProofDelivery = deliveredProof ? result.run?.deliveries.find((delivery) => delivery.kind === "proof-review" && delivery.proofPacketId === deliveredProof.proofPacketId) : undefined;
+      if (deliveredProof && assignedReviewer?.workerId && (!priorProofDelivery || priorProofDelivery.state === "failed")) {
+        let deliveryError: unknown;
+        try {
+          const snapshot = await store.read();
+          const reviewerWorker = snapshot.workers.find((candidate) => candidate.id === assignedReviewer.workerId && workerIncarnation(candidate) === assignedReviewer.workerIncarnationId && candidate.bossRunId === result.run!.bossRunId && candidate.managerSessionId === result.run!.managerSessionId);
+          if (!reviewerWorker || !isLiveState(reviewerWorker.state)) throw new Error("Exact live Boss adversary is unavailable for proof delivery");
+          pi.events.emit(INTERCOM_LIFECYCLE_SEND_EVENT, {
+            to: reviewerWorker.intercomTarget ?? reviewerWorker.id,
+            message: `${TRUSTED_LOCAL_BOSS_WARNING}\nReview exact advisory proof ${deliveredProof.proofPacketId} revision ${deliveredProof.revision} sha256:${deliveredProof.snapshotSha256} for Boss run ${result.run!.bossRunId}. Report concrete blockers to the owning Pi session.`,
+          });
+        } catch (error) {
+          deliveryError = error;
+        }
+        await trustedLocalBossStore.recordProofDelivery(result.run!.bossRunId, deliveredProof.proofPacketId, deliveryError);
+        result = await trustedLocalBossStore.execute({ action: "status", bossRunId: result.run!.bossRunId }, managerSessionId(ctx));
+        result.message += `\n\nProof revision ${deliveredProof.revision} is bound to sha256:${deliveredProof.snapshotSha256}; local review delivery ${deliveryError === undefined ? "succeeded" : "failed"}. No protected attestation is claimed.`;
+      }
+      return result;
+    }
+
+    if (request.action === "cancel" && result.run) {
+      let stopError: unknown;
+      try {
+        const snapshot = await store.read();
+        const failures: string[] = [];
+        for (const assignment of result.run.assignments.filter((candidate) => candidate.state === "assigned" && candidate.workerId && candidate.workerIncarnationId)) {
+          try {
+            const worker = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && workerIncarnation(candidate) === assignment.workerIncarnationId && candidate.bossRunId === result.run!.bossRunId && candidate.managerSessionId === result.run!.managerSessionId);
+            if (!worker) {
+              const conflicting = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && candidate.bossRunId === result.run!.bossRunId && candidate.managerSessionId === result.run!.managerSessionId);
+              if (conflicting) throw new Error(`Boss ${assignment.role} worker identity changed before cancellation`);
+              continue;
+            }
+            if (isLiveState(worker.state)) await stopWorker(worker, { expectedManagerSessionId: result.run!.managerSessionId, reason: "boss-run-cancelled" });
+          } catch (error) {
+            failures.push(`${assignment.role}: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        if (failures.length) throw new Error(failures.join("; "));
+      } catch (error) {
+        stopError = error;
+      }
+      result = { title: result.title, message: result.message, run: await trustedLocalBossStore.recordCancellationResult(result.run.bossRunId, stopError) };
+      result.message = `${result.run ? `${TRUSTED_LOCAL_BOSS_WARNING}\nrun: ${result.run.bossRunId}\nstate: ${result.run.state}\ncancellation: ${result.run.cancellation?.state}${result.run.cancellation?.error ? ` — ${result.run.cancellation.error}` : ""}` : result.message}`;
+      return result;
+    }
+
+    if ((request.action === "pause" || request.action === "resume") && result.run) {
+      const kind = request.action === "pause" ? "pause-notice" : "resume-notice";
+      const snapshot = await store.read();
+      for (const assignment of result.run.assignments.filter((candidate) => candidate.state === "assigned" && candidate.workerId && candidate.workerIncarnationId)) {
+        let deliveryError: unknown;
+        try {
+          const worker = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && workerIncarnation(candidate) === assignment.workerIncarnationId && candidate.bossRunId === result.run!.bossRunId && candidate.managerSessionId === result.run!.managerSessionId);
+          if (!worker || !isLiveState(worker.state)) throw new Error(`Exact live ${assignment.role} worker is unavailable`);
+          pi.events.emit(INTERCOM_LIFECYCLE_SEND_EVENT, {
+            to: worker.intercomTarget ?? worker.id,
+            message: `${TRUSTED_LOCAL_BOSS_WARNING}\nBoss run ${result.run.bossRunId} ${request.action} requested. ${request.note ?? "Apply this as a best-effort local workflow control and report your state."}`,
+          });
+        } catch (error) {
+          deliveryError = error;
+        }
+        await trustedLocalBossStore.recordControlDelivery(result.run.bossRunId, assignment.role, kind, deliveryError);
+      }
+      result = await trustedLocalBossStore.execute({ action: "status", bossRunId: result.run.bossRunId }, managerSessionId(ctx));
+      return result;
+    }
+
+    if (request.action !== "create" || !result.run) {
+      return result;
+    }
+
+    const bossRunId = result.run.bossRunId;
+    const [managerTarget, workerTarget, scoutTarget] = trustedLocalBossParticipantTargets(bossRunId);
+    const staffing = [
+      { role: "manager" as const, fleetRole: "manager", id: managerTarget, task: `You are the sole Manager for trusted-local Boss run ${bossRunId}. Build a bounded plan, coordinate the assigned Worker and Scout through ordinary Agent Intercom, track evidence and blockers, and report progress to the owning Pi session.` },
+      { role: "worker" as const, fleetRole: "worker", id: workerTarget, task: `You are the implementation Worker for trusted-local Boss run ${bossRunId}. Execute bounded work assigned by the Manager, verify it, and report progress and blockers through ordinary Agent Intercom.` },
+      { role: "scout" as const, fleetRole: "scout", id: scoutTarget, task: `You are the Scout for trusted-local Boss run ${bossRunId}. Investigate dependencies, risks, and verification gaps; make no authority claims and report findings through ordinary Agent Intercom.` },
+    ];
+    for (const member of staffing) {
+      const params: FleetParams = {
+        action: "spawn",
+        id: member.id,
+        role: member.fleetRole,
+        task: [TRUSTED_LOCAL_BOSS_WARNING, member.task, `Goal: ${result.run.goal}`, "Do not claim protected authority or tamper-proof evidence."].join("\n"),
+        cwd: ctx.cwd,
+        harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
+        effort: "auto",
+        subagents: "auto",
+        bossTeam: { bossRunId, role: member.role, controllerTarget: result.run.managerSessionId },
+      };
+      let spawnedMember: WorkerRecord | undefined;
+      let memberBindingKey: string | undefined;
+      try {
+        const worker = await spawnWorker(params, ctx, await resolveSpawn(params, ctx));
+        spawnedMember = worker;
+        memberBindingKey = `${worker.id}\0${workerIncarnation(worker)}`;
+        bossBindingsInFlight.add(memberBindingKey);
+        await store.mutate((state) => {
+          const current = state.workers.find((candidate) => candidate.id === worker.id && candidate.runId === worker.runId);
+          if (!current) throw new Error(`Boss ${member.role} ${worker.id} disappeared before run binding`);
+          if (current.managerSessionId !== result.run!.managerSessionId) throw new Error(`Boss ${member.role} ${worker.id} Controller ownership changed before run binding`);
+          current.bossRunId = bossRunId;
+          current.updatedAt = Date.now();
+        });
+        worker.bossRunId = bossRunId;
+        await trustedLocalBossStore.recordAssignmentStartedForRole(bossRunId, member.role, worker);
+        if (memberBindingKey) bossBindingsInFlight.delete(memberBindingKey);
+        spawnedMember = undefined;
+        await updateStatus(ctx);
+      } catch (error) {
+        if (memberBindingKey) bossBindingsInFlight.delete(memberBindingKey);
+        if (spawnedMember) await stopBossOrphanWorker(spawnedMember, managerSessionId(ctx)).catch(() => undefined);
+        await trustedLocalBossStore.recordAssignmentFailedForRole(bossRunId, member.role, error);
+        if (member.role === "manager") break;
+      }
+    }
+    const staffed = await trustedLocalBossStore.execute({ action: "status", bossRunId }, managerSessionId(ctx));
+    return staffed;
+  }
+
+  pi.registerTool({
+    name: "boss",
+    label: "Boss",
+    description: "Create and manage Controller-owned trusted-local Boss runs. The current top-level Pi session is the Controller. Boss participants cannot access this tool.",
+    promptSnippet: "Create and manage Controller-owned trusted-local Boss teams",
+    promptGuidelines: [
+      "Use boss when the user asks the top-level Pi Controller to create or manage a Boss run; do not ask the user to type /boss.",
+      "Boss runs use trusted-local advisory scoping, not protected or tamper-proof authority.",
+      "Use exact bossRunId values returned by boss for status, pause, resume, proof, approval, rejection, and cancellation.",
+    ],
+    parameters: Type.Object({
+      action: StringEnum(["create", "status", "resume", "pause", "cancel", "proof", "approve", "reject"] as const),
+      goal: Type.Optional(Type.String({ description: "Explicit goal; required for create." })),
+      bossRunId: Type.Optional(Type.String({ description: "Exact Boss run id; required except for create and status-all." })),
+      note: Type.Optional(Type.String({ description: "Optional control or decision note." })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const args = params.action === "create"
+        ? `create ${params.goal ?? ""}`
+        : `${params.action}${params.bossRunId ? ` ${params.bossRunId}` : ""}${params.note ? ` ${params.note}` : ""}`;
+      const result = await executeTrustedLocalBoss(args, ctx);
+      return {
+        content: [{ type: "text", text: result.message }],
+        details: { title: result.title, run: result.run, runs: result.runs },
+      };
+    },
+    renderCall(args, theme) {
+      const target = args.bossRunId ? ` ${args.bossRunId}` : "";
+      return new Text(`${theme.fg("toolTitle", theme.bold("boss "))}${theme.fg("accent", args.action)}${theme.fg("muted", target)}`, 0, 0);
+    },
+    renderResult(result, { isPartial }, theme) {
+      const first = result.content[0];
+      const text = first?.type === "text" ? first.text : "(no output)";
+      return new Text(theme.fg(isPartial ? "warning" : "toolOutput", text), 0, 0);
+    },
+  });
+
   pi.registerCommand("boss", {
     description: "Create and manage a trusted-local Boss run (same-user agents trusted; advisory evidence)",
     getArgumentCompletions: (prefix) => {
@@ -1902,182 +2114,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       try {
         assertDirectInteractiveBossCommand(ctx);
-        if (!config) await loadConfig();
-        await synchronizeTrustedLocalBossWorkers();
-        const request = parseBossCommand(args);
-        let result = await trustedLocalBossStore.execute(request, managerSessionId(ctx));
-
-        if (request.action === "proof" && result.run) {
-          const reviewer = result.run.assignments.find((assignment) => assignment.role === "adversary");
-          if (reviewer?.state === "requested") {
-            const reviewerParams: FleetParams = {
-              action: "spawn",
-              id: `boss-adversary-${result.run.bossRunId.slice(-12)}`,
-              role: "challenger",
-              task: [
-                TRUSTED_LOCAL_BOSS_WARNING,
-                `Adversarially review trusted-local Boss run ${result.run.bossRunId}.`,
-                `Goal: ${result.run.goal}`,
-                "Wait for the owning Pi session to deliver an exact advisory proof revision and digest before returning a decision.",
-                "Do not claim protected authority, independent attestation, or tamper-proof evidence.",
-              ].join("\n"),
-              cwd: ctx.cwd,
-              harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
-              effort: "auto",
-              subagents: "auto",
-              bossTeam: { bossRunId: result.run.bossRunId, role: "adversary", controllerTarget: result.run.managerSessionId },
-            };
-            let spawnedReviewer: WorkerRecord | undefined;
-            let reviewerBindingKey: string | undefined;
-            try {
-              const worker = await spawnWorker(reviewerParams, ctx, await resolveSpawn(reviewerParams, ctx));
-              spawnedReviewer = worker;
-              reviewerBindingKey = `${worker.id}\0${workerIncarnation(worker)}`;
-              bossBindingsInFlight.add(reviewerBindingKey);
-              await store.mutate((state) => {
-                const current = state.workers.find((candidate) => candidate.id === worker.id && candidate.runId === worker.runId);
-                if (!current) throw new Error(`Boss adversary ${worker.id} disappeared before run binding`);
-                if (current.managerSessionId !== result.run!.managerSessionId) throw new Error(`Boss adversary ${worker.id} Controller ownership changed before run binding`);
-                current.bossRunId = result.run!.bossRunId;
-                current.updatedAt = Date.now();
-              });
-              worker.bossRunId = result.run.bossRunId;
-              await trustedLocalBossStore.recordReviewerStarted(result.run.bossRunId, worker);
-              if (reviewerBindingKey) bossBindingsInFlight.delete(reviewerBindingKey);
-              spawnedReviewer = undefined;
-            } catch (error) {
-              if (reviewerBindingKey) bossBindingsInFlight.delete(reviewerBindingKey);
-              if (spawnedReviewer) await stopBossOrphanWorker(spawnedReviewer, managerSessionId(ctx)).catch(() => undefined);
-              await trustedLocalBossStore.recordReviewerFailed(result.run.bossRunId, error);
-            }
-            result = await trustedLocalBossStore.execute(request, managerSessionId(ctx));
-          }
-          const deliveredProof = result.run?.proofPackets.at(-1);
-          const assignedReviewer = result.run?.assignments.find((assignment) => assignment.role === "adversary");
-          const priorProofDelivery = deliveredProof ? result.run?.deliveries.find((delivery) => delivery.kind === "proof-review" && delivery.proofPacketId === deliveredProof.proofPacketId) : undefined;
-          if (deliveredProof && assignedReviewer?.workerId && (!priorProofDelivery || priorProofDelivery.state === "failed")) {
-            let deliveryError: unknown;
-            try {
-              const snapshot = await store.read();
-              const reviewerWorker = snapshot.workers.find((candidate) => candidate.id === assignedReviewer.workerId && workerIncarnation(candidate) === assignedReviewer.workerIncarnationId && candidate.bossRunId === result.run!.bossRunId && candidate.managerSessionId === result.run!.managerSessionId);
-              if (!reviewerWorker || !isLiveState(reviewerWorker.state)) throw new Error("Exact live Boss adversary is unavailable for proof delivery");
-              pi.events.emit(INTERCOM_LIFECYCLE_SEND_EVENT, {
-                to: reviewerWorker.intercomTarget ?? reviewerWorker.id,
-                message: `${TRUSTED_LOCAL_BOSS_WARNING}\nReview exact advisory proof ${deliveredProof.proofPacketId} revision ${deliveredProof.revision} sha256:${deliveredProof.snapshotSha256} for Boss run ${result.run!.bossRunId}. Report concrete blockers to the owning Pi session.`,
-              });
-            } catch (error) {
-              deliveryError = error;
-            }
-            await trustedLocalBossStore.recordProofDelivery(result.run!.bossRunId, deliveredProof.proofPacketId, deliveryError);
-            result = await trustedLocalBossStore.execute({ action: "status", bossRunId: result.run!.bossRunId }, managerSessionId(ctx));
-            result.message += `\n\nProof revision ${deliveredProof.revision} is bound to sha256:${deliveredProof.snapshotSha256}; local review delivery ${deliveryError === undefined ? "succeeded" : "failed"}. No protected attestation is claimed.`;
-          }
-          await ctx.ui.editor(result.title, result.message);
-          return;
-        }
-
-        if (request.action === "cancel" && result.run) {
-          let stopError: unknown;
-          try {
-            const snapshot = await store.read();
-            const failures: string[] = [];
-            for (const assignment of result.run.assignments.filter((candidate) => candidate.state === "assigned" && candidate.workerId && candidate.workerIncarnationId)) {
-              try {
-                const worker = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && workerIncarnation(candidate) === assignment.workerIncarnationId && candidate.bossRunId === result.run!.bossRunId && candidate.managerSessionId === result.run!.managerSessionId);
-                if (!worker) {
-                  const conflicting = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && candidate.bossRunId === result.run!.bossRunId && candidate.managerSessionId === result.run!.managerSessionId);
-                  if (conflicting) throw new Error(`Boss ${assignment.role} worker identity changed before cancellation`);
-                  continue;
-                }
-                if (isLiveState(worker.state)) await stopWorker(worker, { expectedManagerSessionId: result.run!.managerSessionId, reason: "boss-run-cancelled" });
-              } catch (error) {
-                failures.push(`${assignment.role}: ${error instanceof Error ? error.message : String(error)}`);
-              }
-            }
-            if (failures.length) throw new Error(failures.join("; "));
-          } catch (error) {
-            stopError = error;
-          }
-          result = { title: result.title, message: result.message, run: await trustedLocalBossStore.recordCancellationResult(result.run.bossRunId, stopError) };
-          result.message = `${result.run ? `${TRUSTED_LOCAL_BOSS_WARNING}\nrun: ${result.run.bossRunId}\nstate: ${result.run.state}\ncancellation: ${result.run.cancellation?.state}${result.run.cancellation?.error ? ` — ${result.run.cancellation.error}` : ""}` : result.message}`;
-          await ctx.ui.editor(result.title, result.message);
-          return;
-        }
-
-        if ((request.action === "pause" || request.action === "resume") && result.run) {
-          const kind = request.action === "pause" ? "pause-notice" : "resume-notice";
-          const snapshot = await store.read();
-          for (const assignment of result.run.assignments.filter((candidate) => candidate.state === "assigned" && candidate.workerId && candidate.workerIncarnationId)) {
-            let deliveryError: unknown;
-            try {
-              const worker = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && workerIncarnation(candidate) === assignment.workerIncarnationId && candidate.bossRunId === result.run!.bossRunId && candidate.managerSessionId === result.run!.managerSessionId);
-              if (!worker || !isLiveState(worker.state)) throw new Error(`Exact live ${assignment.role} worker is unavailable`);
-              pi.events.emit(INTERCOM_LIFECYCLE_SEND_EVENT, {
-                to: worker.intercomTarget ?? worker.id,
-                message: `${TRUSTED_LOCAL_BOSS_WARNING}\nBoss run ${result.run.bossRunId} ${request.action} requested. ${request.note ?? "Apply this as a best-effort local workflow control and report your state."}`,
-              });
-            } catch (error) {
-              deliveryError = error;
-            }
-            await trustedLocalBossStore.recordControlDelivery(result.run.bossRunId, assignment.role, kind, deliveryError);
-          }
-          result = await trustedLocalBossStore.execute({ action: "status", bossRunId: result.run.bossRunId }, managerSessionId(ctx));
-          await ctx.ui.editor(result.title, result.message);
-          return;
-        }
-
-        if (request.action !== "create" || !result.run) {
-          await ctx.ui.editor(result.title, result.message);
-          return;
-        }
-
-        const bossRunId = result.run.bossRunId;
-        const [managerTarget, workerTarget, scoutTarget] = trustedLocalBossParticipantTargets(bossRunId);
-        const staffing = [
-          { role: "manager" as const, fleetRole: "manager", id: managerTarget, task: `You are the sole Manager for trusted-local Boss run ${bossRunId}. Build a bounded plan, coordinate the assigned Worker and Scout through ordinary Agent Intercom, track evidence and blockers, and report progress to the owning Pi session.` },
-          { role: "worker" as const, fleetRole: "worker", id: workerTarget, task: `You are the implementation Worker for trusted-local Boss run ${bossRunId}. Execute bounded work assigned by the Manager, verify it, and report progress and blockers through ordinary Agent Intercom.` },
-          { role: "scout" as const, fleetRole: "scout", id: scoutTarget, task: `You are the Scout for trusted-local Boss run ${bossRunId}. Investigate dependencies, risks, and verification gaps; make no authority claims and report findings through ordinary Agent Intercom.` },
-        ];
-        for (const member of staffing) {
-          const params: FleetParams = {
-            action: "spawn",
-            id: member.id,
-            role: member.fleetRole,
-            task: [TRUSTED_LOCAL_BOSS_WARNING, member.task, `Goal: ${result.run.goal}`, "Do not claim protected authority or tamper-proof evidence."].join("\n"),
-            cwd: ctx.cwd,
-            harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
-            effort: "auto",
-            subagents: "auto",
-            bossTeam: { bossRunId, role: member.role, controllerTarget: result.run.managerSessionId },
-          };
-          let spawnedMember: WorkerRecord | undefined;
-          let memberBindingKey: string | undefined;
-          try {
-            const worker = await spawnWorker(params, ctx, await resolveSpawn(params, ctx));
-            spawnedMember = worker;
-            memberBindingKey = `${worker.id}\0${workerIncarnation(worker)}`;
-            bossBindingsInFlight.add(memberBindingKey);
-            await store.mutate((state) => {
-              const current = state.workers.find((candidate) => candidate.id === worker.id && candidate.runId === worker.runId);
-              if (!current) throw new Error(`Boss ${member.role} ${worker.id} disappeared before run binding`);
-              if (current.managerSessionId !== result.run!.managerSessionId) throw new Error(`Boss ${member.role} ${worker.id} Controller ownership changed before run binding`);
-              current.bossRunId = bossRunId;
-              current.updatedAt = Date.now();
-            });
-            worker.bossRunId = bossRunId;
-            await trustedLocalBossStore.recordAssignmentStartedForRole(bossRunId, member.role, worker);
-            if (memberBindingKey) bossBindingsInFlight.delete(memberBindingKey);
-            spawnedMember = undefined;
-            await updateStatus(ctx);
-          } catch (error) {
-            if (memberBindingKey) bossBindingsInFlight.delete(memberBindingKey);
-            if (spawnedMember) await stopBossOrphanWorker(spawnedMember, managerSessionId(ctx)).catch(() => undefined);
-            await trustedLocalBossStore.recordAssignmentFailedForRole(bossRunId, member.role, error);
-            if (member.role === "manager") break;
-          }
-        }
-        const staffed = await trustedLocalBossStore.execute({ action: "status", bossRunId }, managerSessionId(ctx));
-        await ctx.ui.editor(staffed.title, staffed.message);
+        const result = await executeTrustedLocalBoss(args, ctx);
+        await ctx.ui.editor(result.title, result.message);
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
