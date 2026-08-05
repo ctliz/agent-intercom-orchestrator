@@ -1,22 +1,31 @@
 import assert from "node:assert/strict";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
-import { parseBossCommand } from "../src/boss-command.ts";
-import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore } from "../src/boss-trusted-local.ts";
+import { parseBossCommand, type BossCommandRequest } from "../src/boss-command.ts";
+import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, type TrustedLocalBossResult } from "../src/boss-trusted-local.ts";
 import type { WorkerRecord } from "../src/types.ts";
+
+const testRunOwners = new Map<string, string>();
 
 async function fixture() {
   const dir = await mkdtemp(join(tmpdir(), "boss-trusted-local-"));
   let tick = 0;
   const store = new TrustedLocalBossStore(join(dir, "runs.json"), () => new Date(1_700_000_000_000 + tick++));
+  const execute = store.execute.bind(store);
+  store.execute = async (request: BossCommandRequest, managerSessionId: string): Promise<TrustedLocalBossResult> => {
+    const result = await execute(request, managerSessionId);
+    if (result.run) testRunOwners.set(result.run.bossRunId, result.run.managerSessionId);
+    for (const run of result.runs ?? []) testRunOwners.set(run.bossRunId, run.managerSessionId);
+    return result;
+  };
   return { dir, store };
 }
 
 function managerWorker(bossRunId: string, state: WorkerRecord["state"] = "ready"): WorkerRecord {
   return {
-    id: "boss-manager-test",
+    id: `boss-manager-${bossRunId.slice(-12)}`,
     runId: "worker-incarnation-test",
     workerIncarnationId: "worker-incarnation-test",
     workerGeneration: 1,
@@ -28,7 +37,7 @@ function managerWorker(bossRunId: string, state: WorkerRecord["state"] = "ready"
     cwd: "/tmp",
     state,
     owned: true,
-    managerSessionId: "manager-session-1",
+    managerSessionId: testRunOwners.get(bossRunId) ?? "manager-session-1",
     createdAt: 1_700_000_000_000,
     updatedAt: 1_700_000_000_000,
     leaseExpiresAt: 1_700_000_060_000,
@@ -45,12 +54,13 @@ test("trusted-local Boss creates and reports an explicitly advisory run", async 
     assert.match(created.message, /evidence is advisory, not tamper-proof/);
 
     const status = await store.execute(parseBossCommand("status"), "manager-session-1");
-    assert.equal(status.run?.bossRunId, created.run?.bossRunId);
-    assert.equal(status.run?.goal, "ship the useful workflow");
+    assert.deepEqual(status.runs?.map((run) => run.bossRunId), [created.run?.bossRunId]);
+    assert.match(status.message, /Use \/boss status <exact-run-id> for details/);
 
     const disk = JSON.parse(await readFile(join(dir, "runs.json"), "utf8"));
     assert.equal(disk.revision, 1);
-    assert.equal(disk.currentRunId, created.run?.bossRunId);
+    assert.equal(disk.version, "orc.boss-trusted-local.v2");
+    assert.equal(disk.currentRunId, undefined);
     assert.equal(disk.runs[0].assignments[0].role, "manager");
     assert.equal(disk.runs[0].assignments[0].state, "requested");
   } finally {
@@ -76,12 +86,127 @@ test("trusted-local Boss supports pause, resume, proof snapshot, and cancel", as
   }
 });
 
-test("trusted-local Boss permits only one open run and rejects premature approvals", async () => {
+test("trusted-local Boss permits concurrent open runs and rejects premature approvals", async () => {
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create first goal"), "manager-session-3");
-    await assert.rejects(store.execute(parseBossCommand("create second goal"), "manager-session-3"), /already open/);
+    const second = await store.execute(parseBossCommand("create second goal"), "manager-session-3");
+    assert.notEqual(second.run?.bossRunId, created.run?.bossRunId);
+    const owned = await store.execute(parseBossCommand("status"), "manager-session-3");
+    assert.deepEqual(owned.runs?.map((run) => run.goal), ["second goal", "first goal"]);
+    assert.ok(owned.message.indexOf("second goal") < owned.message.indexOf("first goal"));
     await assert.rejects(store.execute(parseBossCommand(`approve ${created.run!.bossRunId} looks good`), "manager-session-3"), /proof packet/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("trusted-local Boss owned status payload uses bossRunId as the deterministic timestamp tie-breaker", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "boss-trusted-local-summary-tie-"));
+  const store = new TrustedLocalBossStore(join(dir, "runs.json"), () => new Date(1_700_000_000_000));
+  try {
+    const first = await store.execute(parseBossCommand("create equal timestamp first"), "controller-tie");
+    const second = await store.execute(parseBossCommand("create equal timestamp second"), "controller-tie");
+    const expectedIds = [first.run!.bossRunId, second.run!.bossRunId].sort((left, right) => left.localeCompare(right));
+    const owned = await store.execute(parseBossCommand("status"), "controller-tie");
+    assert.deepEqual(owned.runs?.map((run) => run.bossRunId), expectedIds);
+    assert.ok(owned.message.indexOf(expectedIds[0]) < owned.message.indexOf(expectedIds[1]));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("trusted-local Boss serializes concurrent creates across Controllers and lists only owned runs", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "boss-trusted-local-concurrent-"));
+  const path = join(dir, "runs.json");
+  let tick = 0;
+  const now = () => new Date(1_700_000_000_000 + tick++);
+  const firstStore = new TrustedLocalBossStore(path, now);
+  const secondStore = new TrustedLocalBossStore(path, now);
+  try {
+    const created = await Promise.all([
+      firstStore.execute(parseBossCommand("create controller alpha first"), "controller-alpha"),
+      secondStore.execute(parseBossCommand("create controller beta first"), "controller-beta"),
+      firstStore.execute(parseBossCommand("create controller alpha second"), "controller-alpha"),
+    ]);
+    assert.equal(new Set(created.map((result) => result.run?.bossRunId)).size, 3);
+
+    const alpha = await secondStore.execute(parseBossCommand("status"), "controller-alpha");
+    const beta = await firstStore.execute(parseBossCommand("status"), "controller-beta");
+    assert.deepEqual(alpha.runs?.map((run) => run.goal).sort(), ["controller alpha first", "controller alpha second"]);
+    assert.deepEqual(beta.runs?.map((run) => run.goal), ["controller beta first"]);
+    assert.doesNotMatch(alpha.message, /controller beta first/);
+    assert.doesNotMatch(beta.message, /controller alpha/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("trusted-local Boss denies cross-Controller detail and mutations before disclosure", async () => {
+  const { dir, store } = await fixture();
+  try {
+    const created = await store.execute(parseBossCommand("create controller private goal"), "controller-owner");
+    const id = created.run!.bossRunId;
+    await assert.rejects(
+      store.execute(parseBossCommand(`status ${id}`), "controller-foreign"),
+      (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /owning Controller session/);
+        assert.doesNotMatch(error.message, /controller private goal|active/, "ownership denial must occur before goal/state formatting");
+        return true;
+      },
+    );
+    await assert.rejects(store.execute(parseBossCommand(`pause ${id}`), "controller-foreign"), /owning Controller session/);
+    await assert.rejects(store.execute(parseBossCommand(`cancel ${id}`), "controller-foreign"), /owning Controller session/);
+    const unchanged = await store.execute(parseBossCommand(`status ${id}`), "controller-owner");
+    assert.equal(unchanged.run?.state, "active");
+    assert.equal(unchanged.run?.cancellation, null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("trusted-local Boss terminal actions do not disturb sibling runs", async () => {
+  const { dir, store } = await fixture();
+  try {
+    const first = await store.execute(parseBossCommand("create cancel only this run"), "controller-owner");
+    const second = await store.execute(parseBossCommand("create keep sibling active"), "controller-owner");
+    await store.execute(parseBossCommand(`cancel ${first.run!.bossRunId}`), "controller-owner");
+    const sibling = await store.execute(parseBossCommand(`status ${second.run!.bossRunId}`), "controller-owner");
+    assert.equal(sibling.run?.state, "active");
+    assert.equal(sibling.run?.cancellation, null);
+    const owned = await store.execute(parseBossCommand("status"), "controller-owner");
+    assert.deepEqual(owned.runs?.map((run) => [run.goal, run.state]), [
+      ["keep sibling active", "active"],
+      ["cancel only this run", "cancelled"],
+    ]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("trusted-local Boss reads v1 state and migrates it on the next write", async () => {
+  const { dir, store } = await fixture();
+  const path = join(dir, "runs.json");
+  try {
+    const created = await store.execute(parseBossCommand("create legacy compatible run"), "controller-legacy");
+    const current = JSON.parse(await readFile(path, "utf8"));
+    await writeFile(path, JSON.stringify({
+      version: "orc.boss-trusted-local.v1",
+      revision: current.revision,
+      currentRunId: created.run!.bossRunId,
+      runs: current.runs,
+    }));
+
+    const reopened = new TrustedLocalBossStore(path);
+    assert.equal((await reopened.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "controller-legacy")).run?.goal, "legacy compatible run");
+    assert.equal(JSON.parse(await readFile(path, "utf8")).version, "orc.boss-trusted-local.v1", "read-only status keeps the compatible v1 file intact");
+    await reopened.execute(parseBossCommand("create migrated sibling run"), "controller-legacy");
+    const migrated = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(migrated.version, "orc.boss-trusted-local.v2");
+    assert.equal(migrated.currentRunId, undefined);
+    assert.equal(migrated.runs.length, 2);
+    assert.deepEqual((await readdir(dir)).filter((entry) => entry.includes(".tmp-")), [], "atomic rename leaves no partial migration file");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -91,7 +216,7 @@ test("trusted-local Boss records Manager staffing and lifecycle changes from ord
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create staff and supervise"), "manager-session-5");
-    const worker = managerWorker(created.run!.bossRunId);
+    const worker = { ...managerWorker(created.run!.bossRunId), managerSessionId: created.run!.managerSessionId };
     const staffed = await store.recordManagerStarted(created.run!.bossRunId, worker);
     assert.equal(staffed.assignments[0].state, "assigned");
     assert.equal(staffed.assignments[0].workerId, worker.id);
@@ -101,9 +226,9 @@ test("trusted-local Boss records Manager staffing and lifecycle changes from ord
     assert.equal(await store.synchronizeWorkers([worker]), true);
     assert.equal(await store.synchronizeWorkers([worker]), false, "unchanged fleet state must not duplicate lifecycle observations");
     const status = await store.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "manager-session-5");
-    assert.match(status.message, /manager revision 1: assigned; worker=boss-manager-test/);
+    assert.match(status.message, new RegExp(`manager revision 1: assigned; worker=${worker.id}`));
     assert.match(status.message, /assignment delivery: launch-mandate delivered/);
-    assert.match(status.message, /boss-manager-test working/);
+    assert.match(status.message, new RegExp(`${worker.id} working`));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -113,8 +238,8 @@ test("trusted-local Boss revisions Worker and Scout assignments with ordinary de
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create staff the delivery ledger"), "manager-session-staff");
-    const worker = { ...managerWorker(created.run!.bossRunId), id: "boss-worker-test", runId: "worker-role-incarnation", workerIncarnationId: "worker-role-incarnation", role: "worker" };
-    const scout = { ...managerWorker(created.run!.bossRunId), id: "boss-scout-test", runId: "scout-role-incarnation", workerIncarnationId: "scout-role-incarnation", role: "scout" };
+    const worker = { ...managerWorker(created.run!.bossRunId), id: `boss-worker-${created.run!.bossRunId.slice(-12)}`, runId: "worker-role-incarnation", workerIncarnationId: "worker-role-incarnation", role: "worker" };
+    const scout = { ...managerWorker(created.run!.bossRunId), id: `boss-scout-${created.run!.bossRunId.slice(-12)}`, runId: "scout-role-incarnation", workerIncarnationId: "scout-role-incarnation", role: "scout" };
     await store.recordAssignmentStartedForRole(created.run!.bossRunId, "worker", worker);
     const staffed = await store.recordAssignmentStartedForRole(created.run!.bossRunId, "scout", scout);
     assert.equal(staffed.deliveries.length, 2);
@@ -150,7 +275,7 @@ test("trusted-local Boss fails the run when Manager launch or lifecycle fails", 
   const second = await fixture();
   try {
     const created = await second.store.execute(parseBossCommand("create observe failure"), "manager-session-7");
-    const worker = managerWorker(created.run!.bossRunId);
+    const worker = { ...managerWorker(created.run!.bossRunId), managerSessionId: created.run!.managerSessionId };
     await second.store.recordManagerStarted(created.run!.bossRunId, worker);
     worker.state = "failed";
     worker.lastError = "worker process exited";
@@ -175,7 +300,7 @@ test("trusted-local Boss binds advisory proof revisions to an assigned adversary
     assert.equal(staffing.run!.proofPackets.length, 0);
     await assert.rejects(store.execute(parseBossCommand(`approve ${created.run!.bossRunId} premature`), "manager-session-8"), /proof packet/);
 
-    const reviewerWorker = { ...managerWorker(created.run!.bossRunId), id: "boss-adversary-test", runId: "reviewer-incarnation-test", workerIncarnationId: "reviewer-incarnation-test", role: "challenger" };
+    const reviewerWorker = { ...managerWorker(created.run!.bossRunId), id: `boss-adversary-${created.run!.bossRunId.slice(-12)}`, runId: "reviewer-incarnation-test", workerIncarnationId: "reviewer-incarnation-test", role: "challenger" };
     await store.recordReviewerStarted(created.run!.bossRunId, reviewerWorker);
     const proof = await store.execute(parseBossCommand(`proof ${created.run!.bossRunId}`), "manager-session-8");
     assert.equal(proof.run!.proofPackets.at(-1)?.revision, 1);
@@ -188,7 +313,7 @@ test("trusted-local Boss binds advisory proof revisions to an assigned adversary
     const approved = await store.execute(parseBossCommand(`approve ${created.run!.bossRunId} exact revision reviewed`), "manager-session-8");
     assert.equal(approved.run?.state, "approved");
     assert.equal(approved.run?.decisions[0].proofRevision, 1);
-    assert.equal(approved.run?.decisions[0].reviewerWorkerId, "boss-adversary-test");
+    assert.equal(approved.run?.decisions[0].reviewerWorkerId, reviewerWorker.id);
     assert.match(approved.message, /latest decision: approved on proof revision 1/);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -199,7 +324,7 @@ test("trusted-local Boss binds advisory proof revisions to an assigned adversary
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create fence the owner"), "manager-session-owner");
-    await assert.rejects(store.execute(parseBossCommand(`cancel ${created.run!.bossRunId}`), "manager-session-foreign"), /owning Manager session/);
+    await assert.rejects(store.execute(parseBossCommand(`cancel ${created.run!.bossRunId}`), "manager-session-foreign"), /owning Controller session/);
     const cancelled = await store.execute(parseBossCommand(`cancel ${created.run!.bossRunId}`), "manager-session-owner");
     assert.equal(cancelled.run?.state, "cancelled");
     await assert.rejects(store.recordManagerStarted(created.run!.bossRunId, managerWorker(created.run!.bossRunId)), /cannot start after run cancelled/);
@@ -210,7 +335,7 @@ test("trusted-local Boss binds advisory proof revisions to an assigned adversary
     const failedRun = await store.execute(parseBossCommand("create stale proof terminal fence"), "manager-session-owner");
     await store.recordManagerStarted(failedRun.run!.bossRunId, managerWorker(failedRun.run!.bossRunId));
     await store.execute(parseBossCommand(`proof ${failedRun.run!.bossRunId}`), "manager-session-owner");
-    const reviewerWorker = { ...managerWorker(failedRun.run!.bossRunId), id: "terminal-reviewer", runId: "terminal-reviewer-incarnation", workerIncarnationId: "terminal-reviewer-incarnation", role: "challenger" };
+    const reviewerWorker = { ...managerWorker(failedRun.run!.bossRunId), id: `boss-adversary-${failedRun.run!.bossRunId.slice(-12)}`, runId: "terminal-reviewer-incarnation", workerIncarnationId: "terminal-reviewer-incarnation", role: "challenger" };
     await store.recordReviewerStarted(failedRun.run!.bossRunId, reviewerWorker);
     const terminalProof = await store.execute(parseBossCommand(`proof ${failedRun.run!.bossRunId}`), "manager-session-owner");
     await store.recordProofDelivery(failedRun.run!.bossRunId, terminalProof.run!.proofPackets.at(-1)!.proofPacketId);
@@ -234,7 +359,7 @@ test("trusted-local Boss binds advisory proof revisions to an assigned adversary
     const created = await store.execute(parseBossCommand("create bounded proof ledger"), "manager-session-bounds");
     await store.recordManagerStarted(created.run!.bossRunId, managerWorker(created.run!.bossRunId));
     await store.execute(parseBossCommand(`proof ${created.run!.bossRunId}`), "manager-session-bounds");
-    const reviewerWorker = { ...managerWorker(created.run!.bossRunId), id: "bounds-reviewer", runId: "bounds-reviewer-incarnation", workerIncarnationId: "bounds-reviewer-incarnation", role: "challenger" };
+    const reviewerWorker = { ...managerWorker(created.run!.bossRunId), id: `boss-adversary-${created.run!.bossRunId.slice(-12)}`, runId: "bounds-reviewer-incarnation", workerIncarnationId: "bounds-reviewer-incarnation", role: "challenger" };
     await store.recordReviewerStarted(created.run!.bossRunId, reviewerWorker);
     for (let index = 0; index < 64; index += 1) {
       const proof = await store.execute(parseBossCommand(`proof ${created.run!.bossRunId}`), "manager-session-bounds");
@@ -261,7 +386,7 @@ test("trusted-local Boss binds advisory proof revisions to an assigned adversary
     assert.equal(retriedAssignment.state, "requested");
     assert.equal(retriedAssignment.revision, 2);
     assert.equal(retriedAssignment.lastError, undefined);
-    const reviewer = { ...managerWorker(created.run!.bossRunId), id: "retry-reviewer", runId: "retry-reviewer-incarnation", workerIncarnationId: "retry-reviewer-incarnation", role: "challenger" };
+    const reviewer = { ...managerWorker(created.run!.bossRunId), id: `boss-adversary-${created.run!.bossRunId.slice(-12)}`, runId: "retry-reviewer-incarnation", workerIncarnationId: "retry-reviewer-incarnation", role: "challenger" };
     await store.recordReviewerStarted(created.run!.bossRunId, reviewer);
     const proof = await store.execute(parseBossCommand(`proof ${created.run!.bossRunId}`), "manager-session-reviewer-retry");
     await store.recordProofDelivery(created.run!.bossRunId, proof.run!.proofPackets.at(-1)!.proofPacketId);
@@ -277,7 +402,7 @@ test("trusted-local Boss keeps proof delivery live at ledger capacity and retrie
     const created = await store.execute(parseBossCommand("create fill bounded delivery ledger"), "manager-session-proof-cap");
     await store.recordManagerStarted(created.run!.bossRunId, managerWorker(created.run!.bossRunId));
     await store.execute(parseBossCommand(`proof ${created.run!.bossRunId}`), "manager-session-proof-cap");
-    const reviewer = { ...managerWorker(created.run!.bossRunId), id: "cap-reviewer", runId: "cap-reviewer-incarnation", workerIncarnationId: "cap-reviewer-incarnation", role: "challenger" };
+    const reviewer = { ...managerWorker(created.run!.bossRunId), id: `boss-adversary-${created.run!.bossRunId.slice(-12)}`, runId: "cap-reviewer-incarnation", workerIncarnationId: "cap-reviewer-incarnation", role: "challenger" };
     await store.recordReviewerStarted(created.run!.bossRunId, reviewer);
     for (let index = 0; index < 254; index += 1) await store.recordControlDelivery(created.run!.bossRunId, "manager", index % 2 === 0 ? "pause-notice" : "resume-notice");
     const full = await store.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "manager-session-proof-cap");
@@ -301,7 +426,7 @@ test("trusted-local Boss keeps late reviewer assignment live at lifecycle capaci
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create retain bounded lifecycle liveness"), "manager-session-lifecycle-cap");
-    const manager = managerWorker(created.run!.bossRunId);
+    const manager = { ...managerWorker(created.run!.bossRunId), managerSessionId: created.run!.managerSessionId };
     await store.recordManagerStarted(created.run!.bossRunId, manager);
     for (let index = 0; index < 255; index += 1) {
       manager.state = index % 2 === 0 ? "working" : "ready";
@@ -310,7 +435,7 @@ test("trusted-local Boss keeps late reviewer assignment live at lifecycle capaci
     const full = await store.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "manager-session-lifecycle-cap");
     assert.equal(full.run?.lifecycle.length, 256);
     await store.execute(parseBossCommand(`proof ${created.run!.bossRunId}`), "manager-session-lifecycle-cap");
-    const reviewer = { ...managerWorker(created.run!.bossRunId), id: "lifecycle-cap-reviewer", runId: "lifecycle-cap-reviewer-incarnation", workerIncarnationId: "lifecycle-cap-reviewer-incarnation", role: "challenger" };
+    const reviewer = { ...managerWorker(created.run!.bossRunId), id: `boss-adversary-${created.run!.bossRunId.slice(-12)}`, runId: "lifecycle-cap-reviewer-incarnation", workerIncarnationId: "lifecycle-cap-reviewer-incarnation", role: "challenger" };
     const staffed = await store.recordReviewerStarted(created.run!.bossRunId, reviewer);
     assert.equal(staffed.assignments.find((assignment) => assignment.role === "adversary")?.state, "assigned");
     assert.equal(staffed.lifecycle.length, 256);
@@ -318,6 +443,71 @@ test("trusted-local Boss keeps late reviewer assignment live at lifecycle capaci
     const proof = await store.execute(parseBossCommand(`proof ${created.run!.bossRunId}`), "manager-session-lifecycle-cap");
     await store.recordProofDelivery(created.run!.bossRunId, proof.run!.proofPackets.at(-1)!.proofPacketId);
     assert.equal((await store.execute(parseBossCommand(`approve ${created.run!.bossRunId} lifecycle cap reviewed`), "manager-session-lifecycle-cap")).run?.state, "approved");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("trusted-local Boss durably recovers the spawn-to-assignment binding gap across store instances", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "boss-binding-recovery-"));
+  const path = join(dir, "runs.json");
+  const first = new TrustedLocalBossStore(path);
+  const second = new TrustedLocalBossStore(path);
+  try {
+    const created = await first.execute(parseBossCommand("create recover durable binding"), "controller-binding-owner");
+    const suffix = created.run!.bossRunId.slice(-12);
+    const worker = {
+      ...managerWorker(created.run!.bossRunId, "ready"),
+      id: `boss-manager-${suffix}`,
+      managerSessionId: created.run!.managerSessionId,
+      runId: "durable-binding-incarnation",
+      workerIncarnationId: "durable-binding-incarnation",
+    };
+    const foreignOwned = { ...worker, managerSessionId: "foreign-controller" };
+    await assert.rejects(first.recordManagerStarted(created.run!.bossRunId, foreignOwned), /identity, ownership, or run binding/);
+    await assert.rejects(first.recordManagerStarted(created.run!.bossRunId, { ...worker, owned: false }), /identity, ownership, or run binding/);
+    await assert.rejects(first.recordManagerStarted(created.run!.bossRunId, { ...worker, id: `boss-worker-${suffix}` }), /identity, ownership, or run binding/);
+    assert.equal(await first.recoverRequestedWorkerBindings([foreignOwned]), false);
+    assert.equal((await first.findOrphanedWorkers([foreignOwned])).length, 0, "foreign Controller ownership is never contained or rebound by this run");
+    assert.equal(await first.synchronizeWorkers([foreignOwned]), false, "foreign ownership cannot wedge requested-run synchronization");
+    const unowned = { ...worker, owned: false };
+    assert.equal(await first.recoverRequestedWorkerBindings([unowned]), false);
+    assert.equal((await first.findOrphanedWorkers([unowned])).length, 0, "unowned records are outside Boss containment authority");
+    assert.equal(await first.synchronizeWorkers([unowned]), false, "unowned records cannot wedge requested-run synchronization");
+
+    const recovered = await Promise.all([
+      first.recoverRequestedWorkerBindings([worker]),
+      second.recoverRequestedWorkerBindings([worker]),
+    ]);
+    assert.equal(recovered.some(Boolean), true);
+    const status = await first.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "controller-binding-owner");
+    assert.equal(status.run?.assignments[0].state, "assigned");
+    assert.equal(status.run?.assignments[0].workerIncarnationId, "durable-binding-incarnation");
+    assert.equal(status.run?.deliveries.filter((delivery) => delivery.kind === "launch-mandate").length, 1);
+    assert.equal(status.run?.lifecycle.filter((entry) => entry.workerIncarnationId === "durable-binding-incarnation").length, 1);
+    assert.equal((await first.findOrphanedWorkers([worker])).length, 0);
+    assert.equal(await first.recoverRequestedWorkerBindings([worker]), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("trusted-local Boss recovery skips terminal runs so orphan containment remains available", async () => {
+  const { dir, store } = await fixture();
+  try {
+    const created = await store.execute(parseBossCommand("create fail before worker binding"), "controller-terminal-recovery");
+    await store.recordManagerFailed(created.run!.bossRunId, new Error("manager launch failed"));
+    const taggedWorker = {
+      ...managerWorker(created.run!.bossRunId, "ready"),
+      id: `boss-worker-${created.run!.bossRunId.slice(-12)}`,
+      role: "worker",
+      runId: "terminal-requested-worker-incarnation",
+      workerIncarnationId: "terminal-requested-worker-incarnation",
+    };
+    assert.equal(await store.recoverRequestedWorkerBindings([taggedWorker]), false);
+    const orphans = await store.findOrphanedWorkers([taggedWorker]);
+    assert.equal(orphans.length, 1);
+    assert.equal(orphans[0].assignmentRole, "worker");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -365,7 +555,7 @@ test("trusted-local Boss projects missing workers and recovers pending cancellat
   const second = await fixture();
   try {
     const created = await second.store.execute(parseBossCommand("create recover cancellation"), "manager-session-cancel-recovery");
-    const worker = managerWorker(created.run!.bossRunId, "stopped");
+    const worker = { ...managerWorker(created.run!.bossRunId, "stopped"), managerSessionId: created.run!.managerSessionId };
     await second.store.recordManagerStarted(created.run!.bossRunId, { ...worker, state: "ready" });
     await second.store.execute(parseBossCommand(`cancel ${created.run!.bossRunId}`), "manager-session-cancel-recovery");
     assert.equal(await second.store.synchronizeWorkers([worker]), true);
@@ -379,7 +569,7 @@ test("trusted-local Boss projects missing workers and recovers pending cancellat
   const third = await fixture();
   try {
     const created = await third.store.execute(parseBossCommand("create preserve cancellation identity conflict"), "manager-session-cancel-conflict");
-    const exact = managerWorker(created.run!.bossRunId, "ready");
+    const exact = { ...managerWorker(created.run!.bossRunId, "ready"), managerSessionId: created.run!.managerSessionId };
     await third.store.recordManagerStarted(created.run!.bossRunId, exact);
     await third.store.execute(parseBossCommand(`cancel ${created.run!.bossRunId}`), "manager-session-cancel-conflict");
     await third.store.recordCancellationResult(created.run!.bossRunId, new Error("initial stop failed"));
@@ -400,7 +590,7 @@ test("trusted-local Boss records durable Manager cancellation outcomes", async (
   try {
     const created = await store.execute(parseBossCommand("create cancel exactly"), "manager-session-9");
     await store.recordManagerStarted(created.run!.bossRunId, managerWorker(created.run!.bossRunId));
-    await store.recordAssignmentStartedForRole(created.run!.bossRunId, "worker", { ...managerWorker(created.run!.bossRunId), id: "cancel-worker", runId: "cancel-worker-incarnation", workerIncarnationId: "cancel-worker-incarnation", role: "worker" });
+    await store.recordAssignmentStartedForRole(created.run!.bossRunId, "worker", { ...managerWorker(created.run!.bossRunId), id: `boss-worker-${created.run!.bossRunId.slice(-12)}`, runId: "cancel-worker-incarnation", workerIncarnationId: "cancel-worker-incarnation", role: "worker" });
     const requested = await store.execute(parseBossCommand(`cancel ${created.run!.bossRunId}`), "manager-session-9");
     assert.equal(requested.run?.cancellation?.state, "pending");
     assert.equal(requested.run?.assignments[0].state, "assigned", "assignment remains bound until the stop outcome is recorded");

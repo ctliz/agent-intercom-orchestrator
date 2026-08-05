@@ -9,6 +9,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DEFAULT_CONFIG, readConfig, resolveProfileCommand, writeConfigDefaults } from "./config.ts";
 import { assertDirectInteractiveBossCommand, parseBossCommand } from "./boss-command.ts";
+import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
 import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore } from "./boss-trusted-local.ts";
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
 import { buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy } from "./permissions.ts";
@@ -123,6 +124,7 @@ type FleetParams = {
   execute?: boolean;
   acknowledge?: boolean;
   lines?: number;
+  bossTeam?: TrustedLocalBossTeamIdentity;
 };
 
 type CleanupCandidate =
@@ -879,6 +881,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
 
   const synchronizeTrustedLocalBossWorkers = async (): Promise<boolean> => {
     let snapshot = await store.read();
+    const recoveredBindings = await trustedLocalBossStore.recoverRequestedWorkerBindings(snapshot.workers);
+    if (recoveredBindings) snapshot = await store.read();
     const orphans = (await trustedLocalBossStore.findOrphanedWorkers(snapshot.workers)).filter(({ worker }) => !bossBindingsInFlight.has(`${worker.id}\0${workerIncarnation(worker)}`));
     const failures: string[] = [];
     for (const orphan of orphans) {
@@ -892,7 +896,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     snapshot = await store.read();
     const changed = await trustedLocalBossStore.synchronizeWorkers(snapshot.workers);
     if (failures.length) throw new Error(`Trusted-local Boss orphan containment failed: ${failures.join("; ")}`);
-    return changed || orphans.length > 0;
+    return recoveredBindings || changed || orphans.length > 0;
   };
 
   const pruneTerminalWorker = async (target: WorkerRecord, expectedReason?: string, now = Date.now()): Promise<boolean> => {
@@ -1297,6 +1301,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       managerSessionId: managerSessionId(ctx),
       config,
     });
+    if (params.bossTeam) assertTrustedLocalBossControllerTarget(params.bossTeam, worker.managerSessionId);
     const persistentPi = harness === "pi" && profile.mode === "persistent";
     const verifiedPersistentPi = persistentPi && managerOwnerContext === "pi";
     const persistentOpenCode = harness === "opencode" && profile.mode === "persistent";
@@ -1399,6 +1404,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           managerSessionId: worker.managerSessionId,
           fresh: params.fresh,
         }),
+        ...buildOptionalTrustedLocalBossTeamEnvironment(params.bossTeam),
         ...(persistentOpenCode ? {
           AGENT_INTERCOM_OPENCODE_HEALTH_PATH: workerHealthPath!,
           AGENT_INTERCOM_OPENCODE_STATE_PATH: workerStatePath!,
@@ -1816,6 +1822,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           const current = state.workers.find((candidate) => candidate.id === observed.id && candidate.runId === observed.runId);
           if (!current) throw new Error(`Worker ${observed.id} changed before it could be adopted`);
           if (!current.owned) throw new Error(`Worker ${current.id} was not created by this orchestrator`);
+          assertTrustedLocalBossWorkerAdoptionAllowed(current);
           if (!isLiveState(current.state) || current.stateReason === "stop_in_progress") throw new Error(`Worker ${current.id} is ${current.state}; only active live workers can be adopted`);
           const now = Date.now();
           current.managerOwner = rebindManagerOwner(current, managerOwnerContext, owner);
@@ -1915,9 +1922,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
                 "Do not claim protected authority, independent attestation, or tamper-proof evidence.",
               ].join("\n"),
               cwd: ctx.cwd,
-              harness: "auto",
+              harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
               effort: "auto",
               subagents: "auto",
+              bossTeam: { bossRunId: result.run.bossRunId, role: "adversary", controllerTarget: result.run.managerSessionId },
             };
             let spawnedReviewer: WorkerRecord | undefined;
             let reviewerBindingKey: string | undefined;
@@ -1929,9 +1937,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
               await store.mutate((state) => {
                 const current = state.workers.find((candidate) => candidate.id === worker.id && candidate.runId === worker.runId);
                 if (!current) throw new Error(`Boss adversary ${worker.id} disappeared before run binding`);
+                if (current.managerSessionId !== result.run!.managerSessionId) throw new Error(`Boss adversary ${worker.id} Controller ownership changed before run binding`);
                 current.bossRunId = result.run!.bossRunId;
                 current.updatedAt = Date.now();
               });
+              worker.bossRunId = result.run.bossRunId;
               await trustedLocalBossStore.recordReviewerStarted(result.run.bossRunId, worker);
               if (reviewerBindingKey) bossBindingsInFlight.delete(reviewerBindingKey);
               spawnedReviewer = undefined;
@@ -1949,7 +1959,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
             let deliveryError: unknown;
             try {
               const snapshot = await store.read();
-              const reviewerWorker = snapshot.workers.find((candidate) => candidate.id === assignedReviewer.workerId && workerIncarnation(candidate) === assignedReviewer.workerIncarnationId && candidate.bossRunId === result.run!.bossRunId);
+              const reviewerWorker = snapshot.workers.find((candidate) => candidate.id === assignedReviewer.workerId && workerIncarnation(candidate) === assignedReviewer.workerIncarnationId && candidate.bossRunId === result.run!.bossRunId && candidate.managerSessionId === result.run!.managerSessionId);
               if (!reviewerWorker || !isLiveState(reviewerWorker.state)) throw new Error("Exact live Boss adversary is unavailable for proof delivery");
               pi.events.emit(INTERCOM_LIFECYCLE_SEND_EVENT, {
                 to: reviewerWorker.intercomTarget ?? reviewerWorker.id,
@@ -1973,9 +1983,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
             const failures: string[] = [];
             for (const assignment of result.run.assignments.filter((candidate) => candidate.state === "assigned" && candidate.workerId && candidate.workerIncarnationId)) {
               try {
-                const worker = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && workerIncarnation(candidate) === assignment.workerIncarnationId && candidate.bossRunId === result.run!.bossRunId);
+                const worker = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && workerIncarnation(candidate) === assignment.workerIncarnationId && candidate.bossRunId === result.run!.bossRunId && candidate.managerSessionId === result.run!.managerSessionId);
                 if (!worker) {
-                  const conflicting = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && candidate.bossRunId === result.run!.bossRunId);
+                  const conflicting = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && candidate.bossRunId === result.run!.bossRunId && candidate.managerSessionId === result.run!.managerSessionId);
                   if (conflicting) throw new Error(`Boss ${assignment.role} worker identity changed before cancellation`);
                   continue;
                 }
@@ -2000,7 +2010,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           for (const assignment of result.run.assignments.filter((candidate) => candidate.state === "assigned" && candidate.workerId && candidate.workerIncarnationId)) {
             let deliveryError: unknown;
             try {
-              const worker = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && workerIncarnation(candidate) === assignment.workerIncarnationId && candidate.bossRunId === result.run!.bossRunId);
+              const worker = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && workerIncarnation(candidate) === assignment.workerIncarnationId && candidate.bossRunId === result.run!.bossRunId && candidate.managerSessionId === result.run!.managerSessionId);
               if (!worker || !isLiveState(worker.state)) throw new Error(`Exact live ${assignment.role} worker is unavailable`);
               pi.events.emit(INTERCOM_LIFECYCLE_SEND_EVENT, {
                 to: worker.intercomTarget ?? worker.id,
@@ -2022,10 +2032,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         }
 
         const bossRunId = result.run.bossRunId;
+        const [managerTarget, workerTarget, scoutTarget] = trustedLocalBossParticipantTargets(bossRunId);
         const staffing = [
-          { role: "manager" as const, fleetRole: "manager", id: `boss-manager-${bossRunId.slice(-12)}`, task: `You are the sole Manager for trusted-local Boss run ${bossRunId}. Build a bounded plan, coordinate the assigned Worker and Scout through ordinary Agent Intercom, track evidence and blockers, and report progress to the owning Pi session.` },
-          { role: "worker" as const, fleetRole: "worker", id: `boss-worker-${bossRunId.slice(-12)}`, task: `You are the implementation Worker for trusted-local Boss run ${bossRunId}. Execute bounded work assigned by the Manager, verify it, and report progress and blockers through ordinary Agent Intercom.` },
-          { role: "scout" as const, fleetRole: "scout", id: `boss-scout-${bossRunId.slice(-12)}`, task: `You are the Scout for trusted-local Boss run ${bossRunId}. Investigate dependencies, risks, and verification gaps; make no authority claims and report findings through ordinary Agent Intercom.` },
+          { role: "manager" as const, fleetRole: "manager", id: managerTarget, task: `You are the sole Manager for trusted-local Boss run ${bossRunId}. Build a bounded plan, coordinate the assigned Worker and Scout through ordinary Agent Intercom, track evidence and blockers, and report progress to the owning Pi session.` },
+          { role: "worker" as const, fleetRole: "worker", id: workerTarget, task: `You are the implementation Worker for trusted-local Boss run ${bossRunId}. Execute bounded work assigned by the Manager, verify it, and report progress and blockers through ordinary Agent Intercom.` },
+          { role: "scout" as const, fleetRole: "scout", id: scoutTarget, task: `You are the Scout for trusted-local Boss run ${bossRunId}. Investigate dependencies, risks, and verification gaps; make no authority claims and report findings through ordinary Agent Intercom.` },
         ];
         for (const member of staffing) {
           const params: FleetParams = {
@@ -2034,9 +2045,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
             role: member.fleetRole,
             task: [TRUSTED_LOCAL_BOSS_WARNING, member.task, `Goal: ${result.run.goal}`, "Do not claim protected authority or tamper-proof evidence."].join("\n"),
             cwd: ctx.cwd,
-            harness: "auto",
+            harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
             effort: "auto",
             subagents: "auto",
+            bossTeam: { bossRunId, role: member.role, controllerTarget: result.run.managerSessionId },
           };
           let spawnedMember: WorkerRecord | undefined;
           let memberBindingKey: string | undefined;
@@ -2048,9 +2060,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
             await store.mutate((state) => {
               const current = state.workers.find((candidate) => candidate.id === worker.id && candidate.runId === worker.runId);
               if (!current) throw new Error(`Boss ${member.role} ${worker.id} disappeared before run binding`);
+              if (current.managerSessionId !== result.run!.managerSessionId) throw new Error(`Boss ${member.role} ${worker.id} Controller ownership changed before run binding`);
               current.bossRunId = bossRunId;
               current.updatedAt = Date.now();
             });
+            worker.bossRunId = bossRunId;
             await trustedLocalBossStore.recordAssignmentStartedForRole(bossRunId, member.role, worker);
             if (memberBindingKey) bossBindingsInFlight.delete(memberBindingKey);
             spawnedMember = undefined;
