@@ -52,6 +52,108 @@ test("owned Boss participants cannot register /boss, boss, or agent_fleet when o
   }
 });
 
+test("Boss participant launches carry isolated Ralph state, exact extensions, tools, and role prompts", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-boss-launch-"));
+  const runtimeDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-boss-runtime-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  const previousRuntimeDir = process.env.XDG_RUNTIME_DIR;
+  const previousManagerContext = process.env.AGENT_INTERCOM_MANAGER_CONTEXT;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  process.env.XDG_RUNTIME_DIR = runtimeDir;
+  process.env.AGENT_INTERCOM_MANAGER_CONTEXT = "headless_cli";
+  try {
+    const orchestratorDir = join(agentDir, "intercom", "orchestrator");
+    const intercomExtension = join(agentDir, "git", "github.com", "dataforxyz", "agent-intercom-pi", "index.ts");
+    const ralphExtension = join(agentDir, "git", "github.com", "dataforxyz", "pi-extensions", "pi-ralph-wiggum", "index.ts");
+    await mkdir(orchestratorDir, { recursive: true });
+    await mkdir(dirname(intercomExtension), { recursive: true });
+    await mkdir(dirname(ralphExtension), { recursive: true });
+    await writeFile(intercomExtension, "export default function () {}\n");
+    await writeFile(ralphExtension, "export default function () {}\n");
+    await writeFile(join(orchestratorDir, "config.json"), JSON.stringify({
+      profiles: {
+        "pi-peer": { harness: "pi", command: "/bin/true", args: ["--mode", "rpc", "--exclude-tools", "agent_fleet"], mode: "persistent", maxRuntime: "12h" },
+      },
+    }));
+
+    const lifecycle = new Map<string, (...args: any[]) => any>();
+    const tools = new Map<string, any>();
+    const launches: string[][] = [];
+    const pi: any = {
+      on(name: string, handler: (...args: any[]) => any) { lifecycle.set(name, handler); },
+      events: { on() { return () => {}; }, emit() {} },
+      registerTool(tool: any) { tools.set(tool.name, tool); },
+      registerCommand() {},
+      async exec(command: string, args: string[]) {
+        if (command === "systemd-run" && args.some((arg) => arg.startsWith("--unit=agent-intercom-worker-boss-"))) launches.push([...args]);
+        if (command === "systemd") return { ...commandResult(), stdout: "systemd 257\n" };
+        if (command === "systemctl" && args.includes("show")) {
+          return { ...commandResult(), stdout: "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nResult=success\nExecMainStatus=0\nJob=\nExecMainStartTimestampMonotonic=10\n" };
+        }
+        return commandResult();
+      },
+    };
+    const ctx: any = {
+      cwd: "/tmp", mode: "rpc", hasUI: false,
+      sessionManager: { getSessionId: () => "controller-exact-target", getSessionFile: () => undefined },
+      ui: { setStatus() {}, notify() {} },
+    };
+    const extensionUrl = new URL(`../src/index.ts?boss-launch=${Date.now()}`, import.meta.url);
+    const { default: extension } = await import(extensionUrl.href);
+    extension(pi);
+    await lifecycle.get("session_start")?.({}, ctx);
+    const created = await tools.get("boss").execute(
+      "boss-launch-test",
+      { action: "create", goal: "ship supervised Ralph loops" },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+
+    assert.equal(launches.length, 3);
+    const bossRunId = created.details.run.bossRunId as string;
+    const suffix = bossRunId.slice(-12);
+    const orchestratorExtension = new URL("../src/index.ts", import.meta.url).pathname;
+    for (const role of ["manager", "worker", "scout"] as const) {
+      const launch = launches.find((args) => args.some((arg) => arg === `--setenv=AGENT_INTERCOM_BOSS_ROLE=${role}`));
+      assert.ok(launch, `missing ${role} launch`);
+      assert.ok(launch.includes(`--setenv=AGENT_INTERCOM_BOSS_RUN_ID=${bossRunId}`));
+      assert.ok(launch.includes("--setenv=AGENT_INTERCOM_BOSS_CONTROLLER_TARGET=controller-exact-target"));
+      assert.ok(launch.includes(`--setenv=AGENT_INTERCOM_BOSS_MANAGER_TARGET=boss-manager-${suffix}`));
+      assert.ok(launch.includes(`--setenv=PI_RALPH_STATE_ROOT=${join(runtimeDir, "agent-intercom-worker", "boss-ralph", bossRunId, role)}`));
+      assert.ok(launch.includes("--no-extensions"));
+      for (const extensionPath of [intercomExtension, orchestratorExtension, ralphExtension]) {
+        assert.ok(launch.includes(extensionPath), `${role} missing extension ${extensionPath}`);
+      }
+      const toolsIndex = launch.indexOf("--tools");
+      assert.notEqual(toolsIndex, -1);
+      const allowedTools = launch[toolsIndex + 1].split(",");
+      assert.deepEqual(allowedTools.slice(-2), ["ralph_start", "ralph_done"]);
+      assert.equal(allowedTools.includes("agent_fleet"), false);
+      assert.equal(allowedTools.includes("boss"), false);
+      const prompt = launch.join("\n");
+      assert.match(prompt, new RegExp(`Immediately start the isolated Ralph loop named boss-${suffix}-${role}`));
+      assert.match(prompt, /itemsPerIteration=3, reflectEvery=5, maxIterations=100/);
+    }
+    const managerPrompt = launches.find((args) => args.includes("--setenv=AGENT_INTERCOM_BOSS_ROLE=manager"))!.join("\n");
+    assert.match(managerPrompt, /At the start of every Ralph iteration, call intercom_team/);
+    assert.match(managerPrompt, /Every iteration, send bounded progress nudges to both Worker and Scout/);
+    const workerPrompt = launches.find((args) => args.includes("--setenv=AGENT_INTERCOM_BOSS_ROLE=worker"))!.join("\n");
+    assert.match(workerPrompt, /Report concrete progress, verification evidence, and blockers to the Manager/);
+
+    await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    if (previousRuntimeDir === undefined) delete process.env.XDG_RUNTIME_DIR;
+    else process.env.XDG_RUNTIME_DIR = previousRuntimeDir;
+    if (previousManagerContext === undefined) delete process.env.AGENT_INTERCOM_MANAGER_CONTEXT;
+    else process.env.AGENT_INTERCOM_MANAGER_CONTEXT = previousManagerContext;
+    await rm(agentDir, { recursive: true, force: true });
+    await rm(runtimeDir, { recursive: true, force: true });
+  }
+});
+
 test("reconciliation retires completed one-shot units after preserving their completed state", async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-retire-test-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;

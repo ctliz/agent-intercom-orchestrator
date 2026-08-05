@@ -9,10 +9,10 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DEFAULT_CONFIG, readConfig, resolveProfileCommand, writeConfigDefaults } from "./config.ts";
 import { assertDirectInteractiveBossCommand, parseBossCommand } from "./boss-command.ts";
-import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
+import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossRalphEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
 import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore } from "./boss-trusted-local.ts";
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
-import { buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy } from "./permissions.ts";
+import { addPiTools, buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy, SAFE_PI_BOSS_RALPH_TOOLS } from "./permissions.ts";
 import { resolvePiRuntime } from "./pi-runtime.ts";
 import { prepareWorkerRuntime, workerRuntimeRoot, workerSocketRuntimeRoot } from "./runtime.ts";
 import { INTERCOM_CONTROL_RECEIVED_EVENT, INTERCOM_CONTROL_REGISTER_EVENT, INTERCOM_CONTROL_SEND_EVENT, registerOwnedWorkerReadinessProbeType, registerOwnedWorkerReadinessResponder, WORKER_READINESS_ACK, WORKER_READINESS_PROBE, WorkerReadinessAckTracker } from "./readiness.ts";
@@ -267,11 +267,7 @@ async function discoverGitMetadataPaths(runner: CommandRunner, cwd: string): Pro
   return [...new Set([resolve(cwd, ".git"), ...result.stdout.split("\n").map((line) => line.trim()).filter((line) => line.startsWith("/"))])];
 }
 
-async function resolvePiIntercomExtension(agentDir: string): Promise<string> {
-  const candidates = [
-    join(agentDir, "git", "github.com", "dataforxyz", "agent-intercom-pi", "index.ts"),
-    join(agentDir, "npm", "node_modules", "@dataforxyz", "agent-intercom-pi", "index.ts"),
-  ];
+async function resolveInstalledPiExtension(candidates: string[], requirement: string): Promise<string> {
   for (const candidate of candidates) {
     try {
       await access(candidate);
@@ -280,7 +276,22 @@ async function resolvePiIntercomExtension(agentDir: string): Promise<string> {
       // Try the next supported Pi package cache location.
     }
   }
-  throw new Error("Hardened Pi workers require agent-intercom-pi in the Pi git or npm package cache");
+  throw new Error(requirement);
+}
+
+async function resolvePiIntercomExtension(agentDir: string): Promise<string> {
+  return resolveInstalledPiExtension([
+    join(agentDir, "git", "github.com", "dataforxyz", "agent-intercom-pi", "index.ts"),
+    join(agentDir, "npm", "node_modules", "@dataforxyz", "agent-intercom-pi", "index.ts"),
+  ], "Hardened Pi workers require agent-intercom-pi in the Pi git or npm package cache");
+}
+
+async function resolvePiRalphExtension(agentDir: string): Promise<string> {
+  return resolveInstalledPiExtension([
+    join(agentDir, "git", "github.com", "dataforxyz", "pi-extensions", "pi-ralph-wiggum", "index.ts"),
+    join(agentDir, "git", "github.com", "tmustier", "pi-extensions", "pi-ralph-wiggum", "index.ts"),
+    join(agentDir, "npm", "node_modules", "@tmustier", "pi-ralph-wiggum", "index.ts"),
+  ], "Trusted-local Boss Pi participants require pi-ralph-wiggum in the Pi git or npm package cache");
 }
 
 function formatTime(timestamp: number): string {
@@ -1348,11 +1359,14 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       const runtime = permissionProfile.hardened ? await prepareWorkerRuntime(harness, id, agentDir, { profileName }) : undefined;
       if (persistentOpenCode || persistentAdapter) await rm(worker.healthPath!, { force: true });
       if (persistentOpenCode && params.fresh) await rm(worker.runtimeStatePath!, { force: true });
-      const harnessArgs = buildWorkerArgs({ harness, profile, profileName, workerId: id, cwd, role, task, model, effort, instructions, managerTarget: worker.managerSessionId, permissionProfile });
+      let harnessArgs = buildWorkerArgs({ harness, profile, profileName, workerId: id, cwd, role, task, model, effort, instructions, managerTarget: worker.managerSessionId, permissionProfile });
       if (runtime?.extraArgs.length) harnessArgs.push(...runtime.extraArgs);
       const gitMetadataPaths = permissionProfile.git === "read-only" ? await discoverGitMetadataPaths(runner, cwd) : [];
-      if (harness === "pi" && permissionProfile.hardened) {
-        harnessArgs.push("--no-extensions", "--extension", await resolvePiIntercomExtension(agentDir), "--extension", ORCHESTRATOR_EXTENSION);
+      if (harness === "pi" && params.bossTeam) harnessArgs = addPiTools(harnessArgs, SAFE_PI_BOSS_RALPH_TOOLS);
+      if (harness === "pi" && (permissionProfile.hardened || params.bossTeam)) {
+        const extensions = [await resolvePiIntercomExtension(agentDir), ORCHESTRATOR_EXTENSION];
+        if (params.bossTeam) extensions.push(await resolvePiRalphExtension(agentDir));
+        harnessArgs.push("--no-extensions", ...extensions.flatMap((extension) => ["--extension", extension]));
       }
       const permissionEnvironment = buildPermissionEnvironment(permissionProfileName, permissionProfile);
       if (permissionProfile.git === "read-only") {
@@ -1395,6 +1409,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           ? [wrappedLauncher, "--harness", harness, "--", executable, ...harnessArgs]
           : [wrappedLauncher, "--", executable, ...(piRuntime?.args ?? []), ...harnessArgs]
         : harnessArgs;
+      if (params.bossTeam && !runtimeWorkerRoot) {
+        throw new Error("Trusted-local Boss Pi participants require a hardened permission profile with a private runtime root");
+      }
       const unitEnvironment: Record<string, string> = {
         ...permissionEnvironment,
         ...(runtime?.environment ?? {}),
@@ -1405,6 +1422,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           fresh: params.fresh,
         }),
         ...buildOptionalTrustedLocalBossTeamEnvironment(params.bossTeam),
+        ...(params.bossTeam ? buildTrustedLocalBossRalphEnvironment(params.bossTeam, runtimeWorkerRoot!) : {}),
         ...(persistentOpenCode ? {
           AGENT_INTERCOM_OPENCODE_HEALTH_PATH: workerHealthPath!,
           AGENT_INTERCOM_OPENCODE_STATE_PATH: workerStatePath!,
@@ -1909,6 +1927,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
             TRUSTED_LOCAL_BOSS_WARNING,
             `Adversarially review trusted-local Boss run ${result.run.bossRunId}.`,
             `Goal: ${result.run.goal}`,
+            buildTrustedLocalBossParticipantPrompt({ bossRunId: result.run.bossRunId, role: "adversary", controllerTarget: result.run.managerSessionId }, result.run.goal),
             "Wait for the owning Pi session to deliver an exact advisory proof revision and digest before returning a decision.",
             "Do not claim protected authority, independent attestation, or tamper-proof evidence.",
           ].join("\n"),
@@ -2030,7 +2049,13 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         action: "spawn",
         id: member.id,
         role: member.fleetRole,
-        task: [TRUSTED_LOCAL_BOSS_WARNING, member.task, `Goal: ${result.run.goal}`, "Do not claim protected authority or tamper-proof evidence."].join("\n"),
+        task: [
+          TRUSTED_LOCAL_BOSS_WARNING,
+          member.task,
+          `Goal: ${result.run.goal}`,
+          buildTrustedLocalBossParticipantPrompt({ bossRunId, role: member.role, controllerTarget: result.run.managerSessionId }, result.run.goal),
+          "Do not claim protected authority or tamper-proof evidence.",
+        ].join("\n"),
         cwd: ctx.cwd,
         harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
         effort: "auto",

@@ -10,6 +10,7 @@ import { DEFAULT_CONFIG } from "../src/config.ts";
 import { resolvePiRuntime } from "../src/pi-runtime.ts";
 import { supportsHardenedUserUnits } from "./systemd-support.ts";
 import {
+  addPiTools,
   applyCodexPermissionArgs,
   applyPiPermissionArgs,
   blockedToolReason,
@@ -23,6 +24,7 @@ import {
   isReadOnlyTeaInvocation,
   legacySessionIpcPaths,
   privilegedRuntimePaths,
+  SAFE_PI_BOSS_RALPH_TOOLS,
 } from "../src/permissions.ts";
 
 test("built-in roles choose conservative permission profiles", () => {
@@ -66,6 +68,10 @@ test("permission profiles compile to Pi tool allowlists and systemd properties",
   const args = applyPiPermissionArgs(["--mode", "rpc"], reviewer);
   assert.deepEqual(args.slice(-2), ["--tools", reviewer.piTools?.join(",")]);
   assert.equal(args.at(-1)?.includes("bash"), false);
+  const bossArgs = addPiTools(args, SAFE_PI_BOSS_RALPH_TOOLS);
+  assert.deepEqual(bossArgs.at(-1)?.split(",").slice(-2), ["ralph_start", "ralph_done"]);
+  assert.equal(bossArgs.at(-1)?.includes("agent_fleet"), false);
+  assert.equal(bossArgs.at(-1)?.includes("boss"), false);
 
   const reviewerProperties = buildPermissionUnitProperties(reviewer, "/repo with spaces");
   assert.ok(reviewerProperties.includes("PrivateUsers=self"));
