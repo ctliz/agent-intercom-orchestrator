@@ -62,12 +62,14 @@ test("durable stop intent round-trips as a late-start fence", async () => {
       worker.stopRequestedAt = 1234;
       worker.stopReason = "manager-requested";
       worker.unit = "agent-intercom-worker-stop-fence-run.service";
+      worker.lastAuthenticatedIntercomActivityAt = 1200;
       state.workers.push(worker);
     });
     const reloaded = await new WorkerStore(path).read();
     assert.equal(reloaded.workers[0].stopRequestedAt, 1234);
     assert.equal(reloaded.workers[0].stopReason, "manager-requested");
     assert.equal(reloaded.workers[0].unit, "agent-intercom-worker-stop-fence-run.service");
+    assert.equal(reloaded.workers[0].lastAuthenticatedIntercomActivityAt, 1200);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -103,6 +105,7 @@ test("WorkerStore v1 migration maps every state, identity, owner, and audit fiel
       assert.equal(worker.runId, `run-${original}`);
       assert.equal(worker.workerGeneration, 1);
       assert.equal(worker.bossRunId, undefined);
+      assert.equal(worker.lastAuthenticatedIntercomActivityAt, undefined);
       assert.deepEqual(worker.managerOwner, {
         context: "pi",
         principalId: "manager-session",

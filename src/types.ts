@@ -251,6 +251,8 @@ export interface WorkerRecord {
   updatedAt: number;
   leaseExpiresAt: number;
   lastWorkerActivityAt?: number;
+  /** Exact inbound worker Intercom activity after sender/owner verification. */
+  lastAuthenticatedIntercomActivityAt?: number;
   idleDeadlineAt?: number;
   checkpointRequestedAt?: number;
   checkpointLastAttemptAt?: number;

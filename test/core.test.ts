@@ -311,10 +311,13 @@ test("manager-received worker Intercom activity resets the idle budget but manag
   worker.state = "running";
   worker.checkpointRequestedAt = 2_000;
   const state = { version: 1 as const, workers: [worker] };
+  recordWorkerActivity(worker, DEFAULT_CONFIG, 2_500);
+  assert.equal(worker.lastAuthenticatedIntercomActivityAt, undefined, "manual renewal activity must not claim inbound Intercom evidence");
   assert.equal(recordIntercomWorkerActivity(state, "manager-a", { id: "other", name: "other" }, DEFAULT_CONFIG, 3_000), undefined);
   assert.equal(recordIntercomWorkerActivity(state, "manager-a", { id: "spoof", name: "worker-a" }, DEFAULT_CONFIG, 3_500), undefined);
   const updated = recordIntercomWorkerActivity(state, "manager-a", { id: "worker-a", name: "display-name" }, DEFAULT_CONFIG, 4_000);
   assert.equal(updated?.lastWorkerActivityAt, 4_000);
+  assert.equal(updated?.lastAuthenticatedIntercomActivityAt, 4_000);
   assert.equal(updated?.idleDeadlineAt, workerIdleDeadline(DEFAULT_CONFIG, 4_000));
   assert.equal(updated?.checkpointRequestedAt, undefined);
 });

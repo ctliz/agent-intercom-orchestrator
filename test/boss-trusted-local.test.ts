@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { parseBossCommand, type BossCommandRequest } from "../src/boss-command.ts";
-import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, deterministicBossRunHandle, type TrustedLocalBossResult } from "../src/boss-trusted-local.ts";
+import { TRUSTED_LOCAL_BOSS_FIRST_ACTION_DEADLINE_MS, TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, deterministicBossRunHandle, type TrustedLocalBossResult } from "../src/boss-trusted-local.ts";
 import type { WorkerRecord } from "../src/types.ts";
 
 const testRunOwners = new Map<string, string>();
@@ -270,6 +270,57 @@ test("trusted-local Boss records Manager staffing and lifecycle changes from ord
     assert.match(status.message, new RegExp(`manager revision 1: assigned; worker=${worker.id}`));
     assert.match(status.message, /assignment delivery: launch-mandate delivered/);
     assert.match(status.message, new RegExp(`${worker.id} working`));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("trusted-local Boss separates transport readiness from observed activity and bounds first-action staleness", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "boss-trusted-local-activity-"));
+  let now = 1_700_000_000_000;
+  const store = new TrustedLocalBossStore(join(dir, "runs.json"), () => new Date(now));
+  try {
+    const created = await store.execute(parseBossCommand("create report real activity evidence"), "manager-activity");
+    const worker: WorkerRecord = {
+      ...managerWorker(created.run!.bossRunId),
+      managerSessionId: "manager-activity",
+      createdAt: now,
+      updatedAt: now,
+      lastWorkerActivityAt: now,
+    };
+    await store.recordManagerStarted(created.run!.bossRunId, worker);
+    assert.equal(await store.synchronizeWorkers([worker]), true, "first fleet synchronization records the ordinary lifecycle detail change");
+
+    const pending = await store.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "manager-activity");
+    const pendingManager = pending.activity?.find((entry) => entry.role === "manager");
+    assert.equal(pendingManager?.workerState, "ready");
+    assert.equal(pendingManager?.transportProcessReadiness, "observed");
+    assert.equal(pendingManager?.activityEvidence, "none_observed", "the launch-time worker timestamp is only a baseline");
+    assert.equal(pendingManager?.firstActionStatus, "awaiting_first_action");
+    assert.match(pending.message, /process\/transport state only; it does not prove productive task activity/);
+
+    now += TRUSTED_LOCAL_BOSS_FIRST_ACTION_DEADLINE_MS;
+    const stale = await store.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "manager-activity");
+    assert.equal(stale.activity?.find((entry) => entry.role === "manager")?.firstActionStatus, "first_action_stale");
+    assert.match(stale.message, /first-action=first-action-stale/);
+
+    // Manual renew/adopt paths advance only the general lease timestamp.
+    worker.lastWorkerActivityAt = now + 1;
+    assert.equal(await store.synchronizeWorkers([worker]), false);
+    const stillStale = await store.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "manager-activity");
+    assert.equal(stillStale.activity?.find((entry) => entry.role === "manager")?.firstActionStatus, "first_action_stale");
+
+    worker.lastAuthenticatedIntercomActivityAt = now + 2;
+    assert.equal(await store.synchronizeWorkers([worker]), true);
+    const active = await store.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "manager-activity");
+    const activeManager = active.activity?.find((entry) => entry.role === "manager");
+    assert.equal(activeManager?.activityEvidence, "authenticated_intercom");
+    assert.equal(activeManager?.activityObservedAt, new Date(now + 2).toISOString());
+    assert.equal(activeManager?.firstActionStatus, "activity_observed");
+    assert.match(active.message, /authenticated worker Intercom traffic only; Orc does not observe source edits or tool calls/);
+
+    const summary = await store.execute(parseBossCommand("status"), "manager-activity");
+    assert.match(summary.message, /first-action=activity_observed,not_assigned/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

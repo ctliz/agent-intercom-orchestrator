@@ -38,7 +38,7 @@ const MANAGER_CONTEXTS = new Set<ManagerOwnerKind>(["pi", "opencode", "headless_
 const LEGACY_WORKER_KEYS = new Set([
   "id", "runId", "harness", "backend", "role", "task", "cwd", "profile", "permissionProfile", "model", "effort", "instructions",
   "state", "owned", "managerSessionId", "intercomTarget", "unit", "mainPid", "externalSessionId", "healthPath", "runtimeStatePath",
-  "createdAt", "updatedAt", "leaseExpiresAt", "lastWorkerActivityAt", "idleDeadlineAt", "checkpointRequestedAt", "checkpointLastAttemptAt",
+  "createdAt", "updatedAt", "leaseExpiresAt", "lastWorkerActivityAt", "lastAuthenticatedIntercomActivityAt", "idleDeadlineAt", "checkpointRequestedAt", "checkpointLastAttemptAt",
   "checkpointAttemptCount", "checkpointDeadlineAt", "stopRequestedAt", "stoppedAt", "stopReason", "dirtyAtStop", "dirtyStatusAtStop", "dirtyCheckErrorAtStop",
   "lastError", "backendDetails",
 ]);
@@ -46,7 +46,7 @@ const V2_STORED_WORKER_KEYS = new Set([
   "id", "workerIncarnationId", "workerGeneration", "bossRunId", "harness", "backend", "role", "task", "cwd", "profile",
   "permissionProfile", "model", "effort", "instructions", "state", "stateReason", "terminalOutcome", "owned", "managerOwner",
   "migrationAudit", "intercomTarget", "unit", "mainPid", "externalSessionId", "healthPath", "runtimeStatePath", "createdAt", "updatedAt",
-  "leaseExpiresAt", "lastWorkerActivityAt", "idleDeadlineAt", "checkpointRequestedAt", "checkpointLastAttemptAt", "checkpointAttemptCount",
+  "leaseExpiresAt", "lastWorkerActivityAt", "lastAuthenticatedIntercomActivityAt", "idleDeadlineAt", "checkpointRequestedAt", "checkpointLastAttemptAt", "checkpointAttemptCount",
   "checkpointDeadlineAt", "stopRequestedAt", "stoppedAt", "stopReason", "dirtyAtStop", "dirtyStatusAtStop", "dirtyCheckErrorAtStop", "lastError", "backendDetails",
 ]);
 const V2_API_WORKER_KEYS = new Set([...V2_STORED_WORKER_KEYS, "runId", "managerSessionId"]);
@@ -55,7 +55,7 @@ const STRING_WORKER_KEYS = [
   "stopReason", "dirtyStatusAtStop", "dirtyCheckErrorAtStop", "lastError", "stateReason",
 ] as const;
 const NUMBER_WORKER_KEYS = [
-  "mainPid", "lastWorkerActivityAt", "idleDeadlineAt", "checkpointRequestedAt", "checkpointLastAttemptAt", "checkpointAttemptCount",
+  "mainPid", "lastWorkerActivityAt", "lastAuthenticatedIntercomActivityAt", "idleDeadlineAt", "checkpointRequestedAt", "checkpointLastAttemptAt", "checkpointAttemptCount",
   "checkpointDeadlineAt", "stopRequestedAt", "stoppedAt",
 ] as const;
 

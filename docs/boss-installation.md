@@ -140,6 +140,8 @@ boss({ action: "status" })
 
 A run displays both a deterministic `<prefix>-<base32-digest>` handle and its exact `boss-...` run ID. Later commands accept either value; mutation results continue to show the exact ID. Multiple nonterminal trusted-local runs may coexist, but each remains owned by its exact creating Controller session.
 
+Status deliberately separates process/transport lifecycle from task activity. A participant may be `ready` while no action has been observed. Each assigned role shows a ten-minute first-action deadline and becomes `first-action-stale` if the exact owned WorkerStore incarnation has produced no later authenticated Intercom activity. Manual lease renewal and adoption update general lifecycle timing but not this dedicated evidence timestamp. That timestamp is the only activity signal Orc currently owns; it is not evidence of source edits, tool calls, or productive output.
+
 Boss injects the verified Intercom, Orchestrator, Ralph, and Return On extensions into each participant. Return On uses a separate `PI_RETURN_ON_STATE_DIR` for every run and role so participants do not share watcher state.
 
 After the smoke, inspect the selected run and cancel it if it should not continue:
