@@ -1,4 +1,6 @@
-# Agent Intercom Orchestrator
+# Orc Boss
+
+Orc Boss is the trusted-local Boss workflow and cross-harness Agent Intercom Orchestrator for independent coding agents.
 
 Use independent coding agents to keep each other working after one of them says the task is done.
 
@@ -10,16 +12,18 @@ A manager controls the agents, evidence, limits, context resets, and stopping ru
 
 ## Install the Pi plugin
 
-The orchestrator is a Pi package containing both the `agent_fleet` extension and its Agent Skill. It requires Linux with a working systemd user manager. Install the Pi Intercom adapter first so managed coworkers can communicate with the manager:
+The orchestrator is a Pi package containing both the `agent_fleet` extension and its Agent Skill. It requires Linux with a working systemd user manager. For ordinary fleet use, install the Pi Intercom adapter first so managed coworkers can communicate with the manager:
 
 ```bash
 pi install npm:@dataforxyz/agent-intercom-pi
 pi install npm:@dataforxyz/agent-intercom-orchestrator
 ```
 
-For Git-pinned installs, use `git:github.com/dataforxyz/agent-intercom-pi@v0.9.3` and `git:github.com/dataforxyz/agent-intercom-orchestrator@v0.9.3` instead.
+Use release tags matching the version you intend to run for Git-pinned installs; do not copy the obsolete `v0.9.3` pins from older documentation. Dirty or explicitly pinned Git installs are never replaced automatically.
 
-Restart Pi, or run `/reload` in every already-open Pi session. Confirm both packages are installed:
+Orc Boss additionally requires the public Ralph and Return On extensions. Follow the preview-first [Orc Boss installation and onboarding guide](docs/boss-installation.md), which preserves unrelated Pi settings and Orchestrator configuration.
+
+Restart Pi, or run `/reload` in every already-open Pi session. Confirm the packages are installed:
 
 ```bash
 pi list
@@ -65,19 +69,27 @@ agent_fleet({ action: "history" }) // full retained history for this manager
 
 ## Trusted-local Boss runs
 
-A top-level Pi Controller can create and manage a concurrent logical Boss team through the LLM-callable `boss` tool:
+Before the first run, install and onboard the required Intercom Pi, Orchestrator, Ralph, and Return On stack. Preview setup with `agent-intercom-boss-setup --plan`, apply only after reviewing the exact changes, reload Pi, then inspect live readiness with `/boss doctor`. Setup requires explicit Manager, Worker, Scout, and Adversary model/effort choices plus a lowercase handle prefix; it preserves unrelated Pi settings and Orchestrator configuration and refuses dirty, pinned, duplicate, filtered, or identity-mismatched installs. See [Orc Boss installation](docs/boss-installation.md).
+
+A top-level Pi Controller can create and manage concurrent logical Boss teams through the LLM-callable `boss` tool. `doctor` and `plan` are read-only. Every persisted run receives a deterministic handle such as `boss-k3m7...`; commands accept that handle or the exact run ID, while mutation results retain the exact ID.
 
 ```typescript
+boss({ action: "plan" })
+boss({ action: "doctor" })
 boss({ action: "create", goal: "Implement and verify the requested feature" })
 boss({ action: "status" })
-boss({ action: "status", bossRunId: "<exact-run-id>" })
-boss({ action: "pause", bossRunId: "<exact-run-id>", note: "Hold while CI is investigated" })
-boss({ action: "resume", bossRunId: "<exact-run-id>" })
-boss({ action: "proof", bossRunId: "<exact-run-id>" })
-boss({ action: "cancel", bossRunId: "<exact-run-id>" })
+boss({ action: "status", bossRunId: "<handle-or-exact-run-id>" })
+boss({ action: "pause", bossRunId: "<handle-or-exact-run-id>", note: "Hold while CI is investigated" })
+boss({ action: "resume", bossRunId: "<handle-or-exact-run-id>" })
+boss({ action: "proof", bossRunId: "<handle-or-exact-run-id>" })
+boss({ action: "approve", bossRunId: "<handle-or-exact-run-id>", note: "Reviewed evidence is sufficient" })
+boss({ action: "reject", bossRunId: "<handle-or-exact-run-id>", note: "Missing required smoke evidence" })
+boss({ action: "cancel", bossRunId: "<handle-or-exact-run-id>" })
 ```
 
-The interactive `/boss` command remains available for direct user control. The tool uses the calling top-level Pi session as the exact creating Controller, returns exact run IDs and status to the model, and is absent from Manager, Worker, Scout, and Adversary participants because they launch with orchestration disabled. Only the creating Controller can inspect or mutate its runs.
+The interactive `/boss` command remains available for direct user control. The tool uses the calling top-level Pi session as the exact creating Controller and is absent from Manager, Worker, Scout, and Adversary participants because they launch with orchestration disabled. Only the creating Controller can inspect or mutate its runs. Boss participants currently use independent Pi peers for the exact team contract, even when their configured model identifiers route to different providers; ordinary `agent_fleet` continues to support Pi, Codex, Claude, and OpenCode coworkers.
+
+Every Boss participant receives the verified Intercom, Orchestrator, Ralph, and Return On extensions. Return On state is isolated per run and role, and Ralph/Return On state roots are checked for writability before create. Model catalog evidence is live when Pi exposes enumeration; an unavailable catalog is reported as a warning rather than fabricated as proof, while a known catalog missing a selected model blocks create.
 
 **TRUSTED LOCAL MODE — same-user agents and local files are trusted; evidence is advisory, not tamper-proof.** Team metadata provides logical trusted-local scoping, not hostile-agent-resistant authority.
 
@@ -96,6 +108,8 @@ See [`examples/orchestrator-config.json`](examples/orchestrator-config.json) and
 ## Start Here
 
 - [I Got Tired of AI Saying It Was Done When It Wasn't](docs/why-cross-harness-orchestration.md) — how the idea started with detailed corrections, then `fix it`, and eventually literally `lol` or `:(`.
+- [Orc Boss Installation and Onboarding](docs/boss-installation.md) — required stack, preview/apply setup, role preferences, diagnostics, and first-run smoke.
+- [Trusted-local Boss V1](docs/boss-trusted-local-v1.md) — current behavior, evidence boundary, concurrency, handles, and proof lifecycle.
 - [Creating and Supervising Worker Agents](docs/creating-and-supervising-worker-agents.md) — installation, harness restrictions, aliases, worker setup, permissions, evidence, and cleanup.
 - [Example Manager Prompt](docs/example-manager-prompt.md) — a reusable prompt for a Pi manager supervising builders, challengers, and proof advisors.
 
@@ -142,9 +156,7 @@ The Agent Intercom family grew from [Nico Bailon's original `pi-intercom`](https
 
 ## Releasing
 
-Releases are automated from version tags. Update `package.json`, the lockfile when
-present, and `CHANGELOG.md` on `main`, then push an annotated tag that exactly
-matches the package version:
+Releases are automated from version tags. Before changing the version, complete the documented typecheck, focused/full tests, package-content validation, clean-install smoke, live trusted-local Boss smoke, and independent final review. Update `package.json`, the lockfile when present, and `CHANGELOG.md` together on `main`; verify `npm pack --dry-run --json` includes the bundled exact-commit Core runtime plus Boss setup/docs assets. Then push an annotated tag that exactly matches the package version:
 
 ```bash
 git tag -a vX.Y.Z -m "vX.Y.Z"

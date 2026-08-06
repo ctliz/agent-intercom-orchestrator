@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Make Orc Boss onboarding preview-first and fail-closed with the packaged `agent-intercom-boss-setup` CLI, required-stack inventory for Intercom Pi, Orchestrator, Ralph, and Return On, explicit Manager/Worker/Scout/Adversary model and effort preferences, deterministic handle prefixes, atomic field-preserving config writes, and dirty/pinned/duplicate/filtered install refusal.
+- Gate trusted-local Boss creation on a composed readiness report covering the required stack, responsive systemd user manager, active Controller Intercom identity, completed versioned onboarding, live Pi model-catalog evidence when available, and writable Boss/worker/Ralph/Return On state roots; expose read-only `plan` and `doctor` actions through `/boss` and the `boss` tool.
+- Support concurrent trusted-local Boss runs with deterministic persisted handles accepted as aliases, inject the verified public Ralph and Return On extensions into Pi participants, and isolate Return On state per run and role.
+- Correct package runtime boundaries for Pi-owned peer dependencies, keep Agent Intercom Core exact-commit-pinned and bundled, and package the setup launcher, public installation guide, updated Agent Skill, and preview-only onboarding example.
 - Add an LLM-callable `boss` tool for top-level Pi Controllers, sharing the exact `/boss` lifecycle implementation and returning exact run/status data while remaining unavailable to orchestration-disabled Boss participants.
 - Scope each manager's periodic lifecycle heartbeat to its attached workers, avoid no-op worker-store commits, and fast-path managers with no live workers; startup, explicit cross-manager actions, and the persistent 15-minute cleanup timer retain global reconciliation and fail-closed convergence.
 - Replace the legacy `/agents` text editor with the compact graphical browser, scoped to the current Pi by default with `/agents history` and `/agents all` views; keep it aligned with the canonical worker lifecycle and render it on an opaque padded background so chat text cannot bleed through it.

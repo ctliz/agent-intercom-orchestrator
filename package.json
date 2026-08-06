@@ -7,7 +7,8 @@
   "bin": {
     "agent-intercom-fleet": "src/agent-fleet-cli.mjs",
     "agent-intercom-fleet-cleanup": "src/agent-fleet-cleanup.mjs",
-    "agent-intercom-access": "src/agent-intercom-access.mjs"
+    "agent-intercom-access": "src/agent-intercom-access.mjs",
+    "agent-intercom-boss-setup": "src/boss-setup-cli.mjs"
   },
   "repository": {
     "type": "git",
@@ -59,11 +60,17 @@
     ]
   },
   "dependencies": {
-    "@dataforxyz/agent-intercom-core": "git+https://github.com/dataforxyz/agent-intercom-core.git#8316cbab548f422ad11c78ed887fabeef94817c1",
+    "@dataforxyz/agent-intercom-core": "git+https://github.com/dataforxyz/agent-intercom-core.git#8316cbab548f422ad11c78ed887fabeef94817c1"
+  },
+  "bundledDependencies": [
+    "@dataforxyz/agent-intercom-core"
+  ],
+  "peerDependencies": {
     "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
-    "typebox": "^1.1.24"
+    "typebox": "*"
   },
   "devDependencies": {
     "@types/node": "^22.15.0",

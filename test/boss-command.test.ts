@@ -9,6 +9,10 @@ import {
 test("Boss command parser is exact and defaults to status", () => {
   assert.deepEqual(parseBossCommand(""), { action: "status" });
   assert.deepEqual(parseBossCommand("status"), { action: "status" });
+  assert.deepEqual(parseBossCommand("doctor"), { action: "doctor" });
+  assert.deepEqual(parseBossCommand("plan"), { action: "plan" });
+  assert.throws(() => parseBossCommand("doctor extra"), /does not accept arguments/);
+  assert.throws(() => parseBossCommand("plan extra"), /does not accept arguments/);
   assert.deepEqual(parseBossCommand("status boss-run_123"), { action: "status", bossRunId: "boss-run_123" });
   assert.deepEqual(parseBossCommand("create implement one exact goal"), {
     action: "create",

@@ -18,6 +18,8 @@ pi install npm:@dataforxyz/agent-intercom-orchestrator
 
 Verify with `pi list`, then call `agent_fleet({ action: "doctor" })`. The package automatically loads both this Agent Skill and the Pi extension that provides `agent_fleet` plus `/agents*`. Linux systemd user services are required.
 
+Orc Boss additionally requires global Pi installs of `dataforxyz/pi-extensions` with `pi-ralph-wiggum/index.ts` enabled and `dataforxyz/pi-return-on`. Use the packaged `agent-intercom-boss-setup --plan` before `--apply`; never replace a dirty or pinned install to satisfy setup. Boss onboarding requires explicit Manager, Worker, Scout, and Adversary model/effort choices and a lowercase handle prefix.
+
 ## Core rules
 
 - Coworkers are independent Agent Intercom peers. A Pi advisor is not a child subagent.
@@ -55,6 +57,31 @@ agent_fleet({ action: "list", all: true }) // explicit cross-manager diagnostics
 ```
 
 Normalized effort values are `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; `capabilities` reports the subset supported by each harness.
+
+## Orc Boss
+
+Use the Controller-owned `boss` tool only when the user asks to create or manage a Boss run. Do not ask the user to type `/boss`; the slash command is the direct-user alternative.
+
+```typescript
+boss({ action: "plan" }) // read-only package/setup preview
+boss({ action: "doctor" }) // read-only live readiness report
+boss({ action: "create", goal: "Implement and independently verify the requested change" })
+boss({ action: "status" })
+boss({ action: "proof", bossRunId: "<handle-or-exact-run-id>" })
+boss({ action: "approve", bossRunId: "<handle-or-exact-run-id>", note: "Evidence reviewed" })
+boss({ action: "cancel", bossRunId: "<handle-or-exact-run-id>", note: "Stop requested" })
+```
+
+Rules:
+
+- **TRUSTED LOCAL MODE:** same-user agents and files are trusted; evidence is advisory, never tamper-proof or hostile-agent-resistant.
+- `plan` and `doctor` are read-only. `create` fails before run-state mutation unless the required Intercom Pi, Orchestrator, Ralph, and Return On stack, host, Controller identity, onboarding, known model catalog, and writable state roots pass readiness.
+- If model enumeration is unavailable, report the explicit warning; do not claim the configured models were verified. If a live catalog omits a chosen role model, treat that as blocking.
+- Boss currently launches Manager, Worker, Scout, and Adversary as independent Pi peers with orchestration disabled. Their configured model identifiers may use any provider exposed by Pi. Ordinary fleet routing remains cross-harness.
+- Multiple runs may coexist. Use the deterministic handle returned by status for convenience, but retain the exact `bossRunId` from mutation results for durable correlation.
+- Return On is isolated per run and role. Do not point participants at a shared `PI_RETURN_ON_STATE_DIR`.
+- Only the exact creating top-level Controller can inspect or mutate a run. Manager, Worker, Scout, and Adversary participants cannot call `boss` or recursively create fleet workers.
+- Approval and rejection are advisory decisions bound to the latest unchanged proof revision and require explicit notes.
 
 ## Automatic routing and lifecycle
 

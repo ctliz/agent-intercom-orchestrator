@@ -65,14 +65,48 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     const orchestratorDir = join(agentDir, "intercom", "orchestrator");
     const intercomExtension = join(agentDir, "git", "github.com", "dataforxyz", "agent-intercom-pi", "index.ts");
     const ralphExtension = join(agentDir, "git", "github.com", "dataforxyz", "pi-extensions", "pi-ralph-wiggum", "index.ts");
+    const returnOnExtension = join(agentDir, "git", "github.com", "dataforxyz", "pi-return-on", "src", "index.ts");
+    const resources = [
+      [dirname(intercomExtension), "@dataforxyz/agent-intercom-pi"],
+      [join(agentDir, "git", "github.com", "dataforxyz", "agent-intercom-orchestrator"), "@dataforxyz/agent-intercom-orchestrator"],
+      [join(agentDir, "git", "github.com", "dataforxyz", "pi-extensions"), "pi-extensions"],
+      [join(agentDir, "git", "github.com", "dataforxyz", "pi-return-on"), "pi-return-on"],
+    ] as const;
     await mkdir(orchestratorDir, { recursive: true });
     await mkdir(dirname(intercomExtension), { recursive: true });
+    await mkdir(join(resources[1][0], "src"), { recursive: true });
     await mkdir(dirname(ralphExtension), { recursive: true });
+    await mkdir(dirname(returnOnExtension), { recursive: true });
     await writeFile(intercomExtension, "export default function () {}\n");
+    await writeFile(join(resources[1][0], "src", "index.ts"), "export default function () {}\n");
     await writeFile(ralphExtension, "export default function () {}\n");
+    await writeFile(returnOnExtension, "export default function () {}\n");
+    for (const [root, name] of resources) {
+      await writeFile(join(root, "package.json"), JSON.stringify({ name, version: "1.0.0" }));
+      spawnSync("git", ["init", "-q", root]);
+      spawnSync("git", ["-C", root, "config", "user.email", "test@example.invalid"]);
+      spawnSync("git", ["-C", root, "config", "user.name", "Test"]);
+      spawnSync("git", ["-C", root, "add", "."]);
+      spawnSync("git", ["-C", root, "commit", "-qm", "fixture"]);
+    }
+    await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: [
+      "git:github.com/dataforxyz/agent-intercom-pi",
+      "git:github.com/dataforxyz/agent-intercom-orchestrator",
+      { source: "git:github.com/dataforxyz/pi-extensions", extensions: ["pi-ralph-wiggum/index.ts"] },
+      "git:github.com/dataforxyz/pi-return-on",
+    ] }));
     await writeFile(join(orchestratorDir, "config.json"), JSON.stringify({
       profiles: {
         "pi-peer": { harness: "pi", command: "/bin/true", args: ["--mode", "rpc", "--exclude-tools", "agent_fleet"], mode: "persistent", maxRuntime: "12h" },
+      },
+      boss: {
+        onboarding: { version: "orc.boss-onboarding.v1", completedAt: "2026-03-01T12:34:56.000Z" },
+        roles: {
+          manager: { model: "provider/manager", effort: "high" },
+          worker: { model: "provider/worker", effort: "medium" },
+          scout: { model: "provider/scout", effort: "low" },
+          adversary: { model: "provider/adversary", effort: "xhigh" },
+        },
       },
     }));
 
@@ -80,6 +114,7 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     const tools = new Map<string, any>();
     const launches: string[][] = [];
     const intercomDeliveries: Array<{ to: string; message: string }> = [];
+    let contextStale = false;
     const pi: any = {
       on(name: string, handler: (...args: any[]) => any) { lifecycle.set(name, handler); },
       events: {
@@ -102,12 +137,19 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     const ctx: any = {
       cwd: "/tmp", mode: "rpc", hasUI: false,
       sessionManager: { getSessionId: () => "controller-exact-target", getSessionFile: () => undefined },
-      ui: { setStatus() {}, notify() {} },
+      ui: { setStatus() { if (contextStale) throw new Error("stale context used during reload shutdown"); }, notify() {} },
     };
     const extensionUrl = new URL(`../src/index.ts?boss-launch=${Date.now()}`, import.meta.url);
     const { default: extension } = await import(extensionUrl.href);
     extension(pi);
     await lifecycle.get("session_start")?.({}, ctx);
+    const planned = await tools.get("boss").execute("boss-plan-test", { action: "plan" }, new AbortController().signal, () => {}, ctx);
+    assert.match(planned.content[0].text, /Orc Boss setup plan: ready/);
+    assert.match(planned.content[0].text, /No automatic install changes are proposed/);
+    const diagnosed = await tools.get("boss").execute("boss-doctor-test", { action: "doctor" }, new AbortController().signal, () => {}, ctx);
+    assert.match(diagnosed.content[0].text, /Orc Boss trusted-local readiness: warning/);
+    assert.match(diagnosed.content[0].text, /required-stack: ready/);
+    assert.match(diagnosed.content[0].text, /models: warning/);
     const created = await tools.get("boss").execute(
       "boss-launch-test",
       { action: "create", goal: "ship supervised Ralph loops" },
@@ -127,19 +169,26 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       assert.ok(launch.includes("--setenv=AGENT_INTERCOM_BOSS_CONTROLLER_TARGET=controller-exact-target"));
       assert.ok(launch.includes(`--setenv=AGENT_INTERCOM_BOSS_MANAGER_TARGET=boss-manager-${suffix}`));
       assert.ok(launch.includes(`--setenv=PI_RALPH_STATE_ROOT=${join(runtimeDir, "agent-intercom-worker", "boss-ralph", bossRunId, role)}`));
+      assert.ok(launch.includes(`--setenv=PI_RETURN_ON_STATE_DIR=${join(runtimeDir, "agent-intercom-worker", "boss-return-on", bossRunId, role)}`));
       assert.ok(launch.includes("--no-extensions"));
-      for (const extensionPath of [intercomExtension, orchestratorExtension, ralphExtension]) {
+      for (const extensionPath of [intercomExtension, orchestratorExtension, ralphExtension, returnOnExtension]) {
         assert.ok(launch.includes(extensionPath), `${role} missing extension ${extensionPath}`);
       }
       const toolsIndex = launch.indexOf("--tools");
       assert.notEqual(toolsIndex, -1);
       const allowedTools = launch[toolsIndex + 1].split(",");
-      assert.deepEqual(allowedTools.slice(-3), ["ralph_start", "ralph_update", "ralph_done"]);
+      for (const requiredTool of ["ralph_start", "ralph_update", "ralph_done", "return_on", "return_on_cancel", "return_on_list", "return_on_status"]) {
+        assert.ok(allowedTools.includes(requiredTool), `${role} missing ${requiredTool}`);
+      }
       assert.equal(allowedTools.includes("agent_fleet"), false);
       assert.equal(allowedTools.includes("boss"), false);
       const prompt = launch.join("\n");
       assert.match(prompt, new RegExp(`Immediately start the isolated Ralph loop named boss-${suffix}-${role}`));
       assert.match(prompt, /itemsPerIteration=3, reflectEvery=5, maxIterations=100/);
+      const modelIndex = launch.indexOf("--model");
+      const thinkingIndex = launch.indexOf("--thinking");
+      assert.equal(launch[modelIndex + 1], `provider/${role}`);
+      assert.equal(launch[thinkingIndex + 1], role === "manager" ? "high" : role === "worker" ? "medium" : "low");
     }
     const managerPrompt = launches.find((args) => args.includes("--setenv=AGENT_INTERCOM_BOSS_ROLE=manager"))!.join("\n");
     assert.match(managerPrompt, /At the start of every Ralph iteration, call intercom_team/);
@@ -158,6 +207,7 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       assert.match(delivery.message, /Begin now using the isolated Ralph protocol/);
     }
 
+    contextStale = true;
     await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
   } finally {
     if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;

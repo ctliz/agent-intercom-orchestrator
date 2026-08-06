@@ -9,10 +9,11 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DEFAULT_CONFIG, readConfig, resolveProfileCommand, writeConfigDefaults } from "./config.ts";
 import { assertDirectInteractiveBossCommand, parseBossCommand } from "./boss-command.ts";
-import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossRalphEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
+import { formatBossReadinessReport, formatBossSetupReport, inspectBossSetup, inspectTrustedLocalBossReadiness } from "./boss-setup.ts";
+import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossSupervisionEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
 import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore } from "./boss-trusted-local.ts";
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
-import { addPiTools, buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy, SAFE_PI_BOSS_RALPH_TOOLS } from "./permissions.ts";
+import { addPiTools, buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy, SAFE_PI_BOSS_SUPERVISION_TOOLS } from "./permissions.ts";
 import { resolvePiRuntime } from "./pi-runtime.ts";
 import { prepareWorkerRuntime, workerRuntimeRoot, workerSocketRuntimeRoot } from "./runtime.ts";
 import { INTERCOM_CONTROL_RECEIVED_EVENT, INTERCOM_CONTROL_REGISTER_EVENT, INTERCOM_CONTROL_SEND_EVENT, registerOwnedWorkerReadinessProbeType, registerOwnedWorkerReadinessResponder, WORKER_READINESS_ACK, WORKER_READINESS_PROBE, WorkerReadinessAckTracker } from "./readiness.ts";
@@ -294,6 +295,12 @@ async function resolvePiRalphExtension(agentDir: string): Promise<string> {
   ], "Trusted-local Boss Pi participants require pi-ralph-wiggum in the Pi git or npm package cache");
 }
 
+async function resolvePiReturnOnExtension(agentDir: string): Promise<string> {
+  return resolveInstalledPiExtension([
+    join(agentDir, "git", "github.com", "dataforxyz", "pi-return-on", "src", "index.ts"),
+  ], "Trusted-local Boss Pi participants require pi-return-on from https://github.com/dataforxyz/pi-return-on in the Pi git package cache");
+}
+
 function formatTime(timestamp: number): string {
   return new Date(timestamp).toISOString();
 }
@@ -572,6 +579,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   const unsubscribeReadinessAcks = pi.events.on(INTERCOM_CONTROL_RECEIVED_EVENT, (payload) => readinessAcks.record(payload));
   let config: OrchestratorConfig;
   let currentCtx: ExtensionContext | undefined;
+  let currentManagerSessionId: string | undefined;
   let heartbeat: NodeJS.Timeout | undefined;
   let heartbeatRunning = false;
   const bossBindingsInFlight = new Set<string>();
@@ -1362,10 +1370,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       let harnessArgs = buildWorkerArgs({ harness, profile, profileName, workerId: id, cwd, role, task, model, effort, instructions, managerTarget: worker.managerSessionId, permissionProfile });
       if (runtime?.extraArgs.length) harnessArgs.push(...runtime.extraArgs);
       const gitMetadataPaths = permissionProfile.git === "read-only" ? await discoverGitMetadataPaths(runner, cwd) : [];
-      if (harness === "pi" && params.bossTeam) harnessArgs = addPiTools(harnessArgs, SAFE_PI_BOSS_RALPH_TOOLS);
+      if (harness === "pi" && params.bossTeam) harnessArgs = addPiTools(harnessArgs, SAFE_PI_BOSS_SUPERVISION_TOOLS);
       if (harness === "pi" && (permissionProfile.hardened || params.bossTeam)) {
         const extensions = [await resolvePiIntercomExtension(agentDir), ORCHESTRATOR_EXTENSION];
-        if (params.bossTeam) extensions.push(await resolvePiRalphExtension(agentDir));
+        if (params.bossTeam) extensions.push(await resolvePiRalphExtension(agentDir), await resolvePiReturnOnExtension(agentDir));
         harnessArgs.push("--no-extensions", ...extensions.flatMap((extension) => ["--extension", extension]));
       }
       const permissionEnvironment = buildPermissionEnvironment(permissionProfileName, permissionProfile);
@@ -1422,7 +1430,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           fresh: params.fresh,
         }),
         ...buildOptionalTrustedLocalBossTeamEnvironment(params.bossTeam),
-        ...(params.bossTeam ? buildTrustedLocalBossRalphEnvironment(params.bossTeam, runtimeWorkerRoot!) : {}),
+        ...(params.bossTeam ? buildTrustedLocalBossSupervisionEnvironment(params.bossTeam, runtimeWorkerRoot!) : {}),
         ...(persistentOpenCode ? {
           AGENT_INTERCOM_OPENCODE_HEALTH_PATH: workerHealthPath!,
           AGENT_INTERCOM_OPENCODE_STATE_PATH: workerStatePath!,
@@ -1910,10 +1918,60 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     },
   });
 
+  async function trustedLocalBossReadiness(ctx: ExtensionContext) {
+    const available = await systemdAvailable(runner);
+    const managerHealth = available ? await getUserManagerHealth(runner) : { responsive: false, error: "systemd user manager unavailable" };
+    let availablePiModels: string[] | undefined;
+    const piProfileName = config.defaultProfiles.pi;
+    const piCommand = piProfileName ? resolveProfileCommand(config.profiles[piProfileName]?.command || "") : undefined;
+    if (piCommand) {
+      const modelResult = await runner.exec(piCommand, ["--list-models"], { timeout: 30_000 }).catch(() => undefined);
+      if (modelResult?.code === 0) {
+        const parsed = parsePiModels(modelResult.stdout);
+        if (parsed.length) availablePiModels = parsed;
+      }
+    }
+    return inspectTrustedLocalBossReadiness({
+      agentDir,
+      config,
+      host: {
+        systemdAvailable: available,
+        userManagerResponsive: managerHealth.responsive,
+        detail: managerHealth.error ?? `responsive=${managerHealth.responsive} settled=${managerHealth.settled ?? "unknown"} jobs=${managerHealth.jobCount ?? "unknown"}`,
+      },
+      intercom: {
+        controllerRegistered: Boolean(currentManagerSessionId && currentManagerSessionId === managerSessionId(ctx)),
+        detail: currentManagerSessionId ? `Controller session: ${currentManagerSessionId}` : "No active Controller session identity is registered.",
+      },
+      statePaths: [
+        trustedLocalBossStatePath,
+        workerRuntimeRoot("boss-readiness", agentDir),
+        join(workerSocketRuntimeRoot("boss-readiness"), "boss-ralph"),
+        join(workerSocketRuntimeRoot("boss-readiness"), "boss-return-on"),
+      ],
+      availablePiModels,
+    });
+  }
+
   async function executeTrustedLocalBoss(args: string, ctx: ExtensionContext) {
     if (!config) await loadConfig();
-    await synchronizeTrustedLocalBossWorkers();
+    trustedLocalBossStore.setHandlePrefix(config.boss.handlePrefix);
     const request = parseBossCommand(args);
+    if (request.action === "plan") {
+      const report = await inspectBossSetup({ agentDir });
+      return { title: "Orc Boss setup plan", message: formatBossSetupReport(report, "plan") };
+    }
+    if (request.action === "doctor") {
+      const report = await trustedLocalBossReadiness(ctx);
+      return { title: "Orc Boss readiness", message: formatBossReadinessReport(report) };
+    }
+    await synchronizeTrustedLocalBossWorkers();
+    if (request.action === "create") {
+      const readiness = await trustedLocalBossReadiness(ctx);
+      if (readiness.status === "blocked") {
+        throw new Error(`BOSS_TRUSTED_LOCAL_NOT_READY:\n${formatBossReadinessReport(readiness)}`);
+      }
+    }
     let result = await trustedLocalBossStore.execute(request, managerSessionId(ctx));
 
     if (request.action === "proof" && result.run) {
@@ -1933,7 +1991,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           ].join("\n"),
           cwd: ctx.cwd,
           harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
-          effort: "auto",
+          model: config.boss.roles.adversary?.model,
+          effort: config.boss.roles.adversary?.effort ?? "auto",
           subagents: "auto",
           bossTeam: { bossRunId: result.run.bossRunId, role: "adversary", controllerTarget: result.run.managerSessionId },
         };
@@ -2058,7 +2117,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         ].join("\n"),
         cwd: ctx.cwd,
         harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
-        effort: "auto",
+        model: config.boss.roles[member.role]?.model,
+        effort: config.boss.roles[member.role]?.effort ?? "auto",
         subagents: "auto",
         bossTeam: { bossRunId, role: member.role, controllerTarget: result.run.managerSessionId },
       };
@@ -2117,7 +2177,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       "Use exact bossRunId values returned by boss for status, pause, resume, proof, approval, rejection, and cancellation.",
     ],
     parameters: Type.Object({
-      action: StringEnum(["create", "status", "resume", "pause", "cancel", "proof", "approve", "reject"] as const),
+      action: StringEnum(["create", "doctor", "plan", "status", "resume", "pause", "cancel", "proof", "approve", "reject"] as const),
       goal: Type.Optional(Type.String({ description: "Explicit goal; required for create." })),
       bossRunId: Type.Optional(Type.String({ description: "Exact Boss run id; required except for create and status-all." })),
       note: Type.Optional(Type.String({ description: "Optional control or decision note." })),
@@ -2146,7 +2206,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   pi.registerCommand("boss", {
     description: "Create and manage a trusted-local Boss run (same-user agents trusted; advisory evidence)",
     getArgumentCompletions: (prefix) => {
-      const actions = ["create", "status", "resume", "pause", "cancel", "proof", "approve", "reject"];
+      const actions = ["create", "doctor", "plan", "status", "resume", "pause", "cancel", "proof", "approve", "reject"];
       const filtered = actions.filter((action) => action.startsWith(prefix.trim().toLowerCase()));
       return filtered.length ? filtered.map((action) => ({ value: action, label: action })) : null;
     },
@@ -2369,6 +2429,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
+    currentManagerSessionId = managerSessionId(ctx);
     pi.events.emit(INTERCOM_CONTROL_REGISTER_EVENT, { type: WORKER_READINESS_ACK, version: 1 });
     registerOwnedWorkerReadinessProbeType(pi);
     await loadConfig();
@@ -2404,7 +2465,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     heartbeat.unref?.();
   });
 
-  pi.on("session_shutdown", async (event, ctx) => {
+  pi.on("session_shutdown", async (event, _ctx) => {
     clearInterval(heartbeat);
     heartbeat = undefined;
     heartbeatRunning = false;
@@ -2412,9 +2473,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     unsubscribeReadinessAcks();
     unsubscribeWorkerReadiness?.();
     readinessAcks.clear();
-    ctx.ui.setStatus(STATUS_KEY, undefined);
-    if (config?.cleanupOnShutdown && event.reason !== "reload") {
-      const sessionId = managerSessionId(ctx);
+    // Pi invalidates command/session contexts before emitting shutdown during a
+    // session replacement or reload. Do not touch ctx.ui here; the host clears
+    // extension status as part of disposing the old extension instance.
+    if (config?.cleanupOnShutdown && event.reason !== "reload" && currentManagerSessionId) {
+      const sessionId = currentManagerSessionId;
       const state = await store.read();
       for (const worker of state.workers) {
         if (worker.managerSessionId === sessionId && worker.owned && isLiveState(worker.state)) {
@@ -2427,5 +2490,6 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       }
     }
     currentCtx = undefined;
+    currentManagerSessionId = undefined;
   });
 }

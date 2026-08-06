@@ -24,7 +24,7 @@ import {
   isReadOnlyTeaInvocation,
   legacySessionIpcPaths,
   privilegedRuntimePaths,
-  SAFE_PI_BOSS_RALPH_TOOLS,
+  SAFE_PI_BOSS_SUPERVISION_TOOLS,
 } from "../src/permissions.ts";
 
 test("built-in roles choose conservative permission profiles", () => {
@@ -68,8 +68,8 @@ test("permission profiles compile to Pi tool allowlists and systemd properties",
   const args = applyPiPermissionArgs(["--mode", "rpc"], reviewer);
   assert.deepEqual(args.slice(-2), ["--tools", reviewer.piTools?.join(",")]);
   assert.equal(args.at(-1)?.includes("bash"), false);
-  const bossArgs = addPiTools(args, SAFE_PI_BOSS_RALPH_TOOLS);
-  assert.deepEqual(bossArgs.at(-1)?.split(",").slice(-3), ["ralph_start", "ralph_update", "ralph_done"]);
+  const bossArgs = addPiTools(args, SAFE_PI_BOSS_SUPERVISION_TOOLS);
+  for (const tool of SAFE_PI_BOSS_SUPERVISION_TOOLS) assert.ok(bossArgs.at(-1)?.split(",").includes(tool));
   assert.equal(bossArgs.at(-1)?.includes("agent_fleet"), false);
   assert.equal(bossArgs.at(-1)?.includes("boss"), false);
 

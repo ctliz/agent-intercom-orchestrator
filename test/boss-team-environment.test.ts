@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossRalphEnvironment, buildTrustedLocalBossTeamEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, trustedLocalBossRalphLoopName } from "../src/boss-team-environment.ts";
+import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossSupervisionEnvironment, buildTrustedLocalBossTeamEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, trustedLocalBossRalphLoopName } from "../src/boss-team-environment.ts";
 import { buildWorkerEnvironment } from "../src/workers.ts";
 
 test("Boss team environment binds every role to one deterministic Pi team including prospective adversary", () => {
@@ -35,8 +35,9 @@ test("Boss team environment binds every role to one deterministic Pi team includ
     assert.equal(JSON.parse(environment.AGENT_INTERCOM_BOSS_TEAM_TARGETS).includes("controller-exact-target"), false);
     assert.equal(environment.AGENT_INTERCOM_BOSS_VISIBILITY, "team-only");
     assert.equal(environment.AGENT_INTERCOM_ORCHESTRATOR_DISABLED, "1");
-    assert.deepEqual(buildTrustedLocalBossRalphEnvironment({ bossRunId, role, controllerTarget: "controller-exact-target" }, "/run/private-worker"), {
+    assert.deepEqual(buildTrustedLocalBossSupervisionEnvironment({ bossRunId, role, controllerTarget: "controller-exact-target" }, "/run/private-worker"), {
       PI_RALPH_STATE_ROOT: `/run/private-worker/boss-ralph/${bossRunId}/${role}`,
+      PI_RETURN_ON_STATE_DIR: `/run/private-worker/boss-return-on/${bossRunId}/${role}`,
     });
     for (const harness of ["pi", "codex", "claude", "opencode"] as const) {
       const ordinary = {

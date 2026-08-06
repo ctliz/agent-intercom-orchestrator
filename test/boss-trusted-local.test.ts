@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
 import { parseBossCommand, type BossCommandRequest } from "../src/boss-command.ts";
-import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, type TrustedLocalBossResult } from "../src/boss-trusted-local.ts";
+import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, deterministicBossRunHandle, type TrustedLocalBossResult } from "../src/boss-trusted-local.ts";
 import type { WorkerRecord } from "../src/types.ts";
 
 const testRunOwners = new Map<string, string>();
@@ -50,19 +50,36 @@ test("trusted-local Boss creates and reports an explicitly advisory run", async 
     const created = await store.execute(parseBossCommand("create ship the useful workflow"), "manager-session-1");
     assert.equal(created.run?.state, "active");
     assert.match(created.run?.bossRunId ?? "", /^boss-[0-9a-f-]{36}$/);
+    assert.equal(created.run?.handle, deterministicBossRunHandle(created.run!.bossRunId));
     assert.match(created.message, new RegExp(TRUSTED_LOCAL_BOSS_WARNING.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
     assert.match(created.message, /evidence is advisory, not tamper-proof/);
 
     const status = await store.execute(parseBossCommand("status"), "manager-session-1");
     assert.deepEqual(status.runs?.map((run) => run.bossRunId), [created.run?.bossRunId]);
-    assert.match(status.message, /Use \/boss status <exact-run-id> for details/);
+    assert.match(status.message, /Use \/boss status <handle-or-exact-run-id> for details/);
 
     const disk = JSON.parse(await readFile(join(dir, "runs.json"), "utf8"));
     assert.equal(disk.revision, 1);
-    assert.equal(disk.version, "orc.boss-trusted-local.v2");
+    assert.equal(disk.version, "orc.boss-trusted-local.v3");
     assert.equal(disk.currentRunId, undefined);
     assert.equal(disk.runs[0].assignments[0].role, "manager");
     assert.equal(disk.runs[0].assignments[0].state, "requested");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("trusted-local Boss accepts stable handles as aliases while retaining exact ids", async () => {
+  const { dir, store } = await fixture();
+  try {
+    store.setHandlePrefix("orc");
+    const created = await store.execute(parseBossCommand("create alias-addressable run"), "manager-alias");
+    const handle = created.run!.handle;
+    assert.match(handle, /^orc-[a-z2-7]{10}$/);
+    assert.equal((await store.execute(parseBossCommand(`status ${handle}`), "manager-alias")).run?.bossRunId, created.run!.bossRunId);
+    assert.equal((await store.execute(parseBossCommand(`pause ${handle}`), "manager-alias")).run?.state, "paused");
+    store.setHandlePrefix("changed");
+    assert.equal((await store.execute(parseBossCommand(`status ${handle}`), "manager-alias")).run?.handle, handle, "stored handles do not change with later configuration");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -203,10 +220,34 @@ test("trusted-local Boss reads v1 state and migrates it on the next write", asyn
     assert.equal(JSON.parse(await readFile(path, "utf8")).version, "orc.boss-trusted-local.v1", "read-only status keeps the compatible v1 file intact");
     await reopened.execute(parseBossCommand("create migrated sibling run"), "controller-legacy");
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.version, "orc.boss-trusted-local.v2");
+    assert.equal(migrated.version, "orc.boss-trusted-local.v3");
     assert.equal(migrated.currentRunId, undefined);
     assert.equal(migrated.runs.length, 2);
     assert.deepEqual((await readdir(dir)).filter((entry) => entry.includes(".tmp-")), [], "atomic rename leaves no partial migration file");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("trusted-local Boss assigns deterministic handles while migrating v2 run records", async () => {
+  const { dir, store } = await fixture();
+  const path = join(dir, "runs.json");
+  try {
+    const created = await store.execute(parseBossCommand("create pre-handle run"), "controller-handle-migration");
+    const legacy = JSON.parse(await readFile(path, "utf8"));
+    legacy.version = "orc.boss-trusted-local.v2";
+    legacy.runs[0].version = "orc.boss-trusted-local.v1";
+    delete legacy.runs[0].handle;
+    await writeFile(path, JSON.stringify(legacy));
+
+    const reopened = new TrustedLocalBossStore(path, undefined, "legacy");
+    const migratedHandle = deterministicBossRunHandle(created.run!.bossRunId, "legacy");
+    assert.equal((await reopened.execute(parseBossCommand(`status ${migratedHandle}`), "controller-handle-migration")).run?.handle, migratedHandle);
+    await reopened.execute(parseBossCommand("create migration writer"), "controller-handle-migration");
+    const migrated = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(migrated.version, "orc.boss-trusted-local.v3");
+    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v2");
+    assert.equal(migrated.runs[0].handle, migratedHandle);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

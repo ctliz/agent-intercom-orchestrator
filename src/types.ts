@@ -124,6 +124,24 @@ export interface RolePreset {
   instructions?: string;
 }
 
+export type BossBaselineRole = "manager" | "worker" | "scout" | "adversary";
+
+export interface BossRolePreference {
+  model?: string;
+  effort?: Effort;
+}
+
+export interface BossOnboardingRecord {
+  version: "orc.boss-onboarding.v1";
+  completedAt: string;
+}
+
+export interface BossConfig {
+  roles: Partial<Record<BossBaselineRole, BossRolePreference>>;
+  handlePrefix: string;
+  onboarding?: BossOnboardingRecord;
+}
+
 export interface ModelRoutingRule {
   harness: Harness;
   /** Exact model identifiers or prefix patterns ending in one `*`. */
@@ -175,6 +193,7 @@ export interface OrchestratorConfig {
   profiles: Record<string, LaunchProfile>;
   permissionProfiles: Record<string, PermissionProfile>;
   roles: Record<string, RolePreset>;
+  boss: BossConfig;
   routing: RoutingConfig;
   supervision: SupervisionConfig;
   leaseMinutes: number;

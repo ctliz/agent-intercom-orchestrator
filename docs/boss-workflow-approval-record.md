@@ -1,5 +1,7 @@
 # `/boss` change-plan approval record
 
+> **Supersession note (2026-08-06):** This is a historical approval record for the protected-workflow planning artifacts and their exact hashes. Later explicit user direction supersedes the recorded Ralph/Return On no-change boundary for the supported trusted-local **Orc Boss** release: Agent Intercom Pi, Orchestrator, Ralph, and Return On are now required runtime-stack components. The historical verdicts and hashes remain unchanged below; see [`boss-public-release-plan.md`](./boss-public-release-plan.md) for current implementation and release requirements. No historical approval grants protected-service, installation, publishing, or elevated-action authority.
+
 > **CURRENT STATUS:** Revision 17 remains the fully approved base specification at SHA-256 `ee871327a61f3ec39df684e27eace1328f2f4e21b69d126fcae15cabc58c0c03`; Revision 18 remains the protected-repository/trusted-admin amendment at `600bf7bbf9f9889197e432a5e0efc46d10ca7bea197fe3c6954769053fdd957e`; and Revision 19 remains the witnessed-transparency/artifact-cardinality amendment at `38feaf5d6a3b75bec5e848a38e4496fdb082d4ece750767e7d6eed90a4fa8eb8`. Revision 20 is approved at SHA-256 `2d8395a3545159980487fdcd9eaa3aed644c88006e6523dd83455f42ed874f89` and records the user's governance decision that every review after Revision 19 uses unchanged-hash Pi Fable 5 `max` → Codex Sol `xhigh`; Opus is no longer required. These approvals create no signing, installation, elevated-action, service, runtime, or production authority.
 
 Formerly approved artifact:

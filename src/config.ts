@@ -4,10 +4,18 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { DEFAULT_PERMISSION_PROFILES } from "./permissions.ts";
 import { BOSS_SYMBOLIC_PROFILE_NAMES, bossSymbolicRolePresets, DEFAULT_MODEL_ROUTING, isSafeModelPattern } from "./routing.ts";
-import type { Effort, GitPolicy, Harness, LaunchProfile, ModelRoutingRule, OrchestratorConfig, PermissionProfile, RolePreset, RoutingConfig, WorkspacePolicy } from "./types.ts";
+import type { BossBaselineRole, BossConfig, Effort, GitPolicy, Harness, LaunchProfile, ModelRoutingRule, OrchestratorConfig, PermissionProfile, RolePreset, RoutingConfig, WorkspacePolicy } from "./types.ts";
 
 const HARNESSES: Harness[] = ["pi", "codex", "claude", "opencode"];
 const EFFORTS: Effort[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const BOSS_BASELINE_ROLES: BossBaselineRole[] = ["manager", "worker", "scout", "adversary"];
+export const BOSS_ONBOARDING_VERSION = "orc.boss-onboarding.v1" as const;
+
+export function isBossOnboardingComplete(config: Pick<OrchestratorConfig, "boss">): boolean {
+  return config.boss.onboarding?.version === BOSS_ONBOARDING_VERSION;
+}
+
+const BOSS_HANDLE_PREFIX = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
 const RETIRED_SUPERVISION_FIELDS = [
   "recommendRalphForSubstantialWork",
   "recommendReturnOnAfterSpawn",
@@ -73,7 +81,7 @@ function migrationDiagnosticsForSafeConfig(value: unknown): ConfigMigrationDiagn
     ? [{
       code: "retired-supervision-recommendation",
       path: `supervision.${field}`,
-      message: `supervision.${field} is retired and ignored; intentional config serialization will remove it. Orc does not recommend or install Ralph or return-on.`,
+      message: `supervision.${field} is retired and ignored; intentional config serialization will remove it. Orc Boss now verifies Ralph and Return On through its dedicated setup and readiness surfaces rather than legacy supervision flags.`,
     }]
     : []);
 }
@@ -207,6 +215,10 @@ export const DEFAULT_CONFIG: OrchestratorConfig = {
       effort: "medium",
       instructions: "Research the assigned question independently, cite concrete evidence, and report uncertainty clearly.",
     },
+  },
+  boss: {
+    roles: {},
+    handlePrefix: "boss",
   },
   routing: {
     preference: ["pi", "codex", "claude", "opencode"],
@@ -342,6 +354,31 @@ function mergeRole(value: unknown): RolePreset | undefined {
     ...(isEffort(value.effort) ? { effort: value.effort } : {}),
     ...(typeof value.instructions === "string" ? { instructions: value.instructions } : {}),
   };
+}
+
+function mergeBoss(value: unknown): BossConfig {
+  if (!isRecord(value)) return structuredClone(DEFAULT_CONFIG.boss);
+  const roles: BossConfig["roles"] = {};
+  if (isRecord(value.roles)) {
+    for (const role of BOSS_BASELINE_ROLES) {
+      const preference = value.roles[role];
+      if (!isRecord(preference)) continue;
+      const model = typeof preference.model === "string" ? preference.model.trim() : "";
+      const effort = isEffort(preference.effort) ? preference.effort : undefined;
+      if (model || effort) roles[role] = { ...(model ? { model } : {}), ...(effort ? { effort } : {}) };
+    }
+  }
+  const handlePrefix = typeof value.handlePrefix === "string" && BOSS_HANDLE_PREFIX.test(value.handlePrefix)
+    ? value.handlePrefix
+    : DEFAULT_CONFIG.boss.handlePrefix;
+  let onboarding: BossConfig["onboarding"];
+  if (isRecord(value.onboarding)
+    && value.onboarding.version === BOSS_ONBOARDING_VERSION
+    && typeof value.onboarding.completedAt === "string"
+    && Number.isFinite(Date.parse(value.onboarding.completedAt))) {
+    onboarding = { version: BOSS_ONBOARDING_VERSION, completedAt: new Date(value.onboarding.completedAt).toISOString() };
+  }
+  return { roles, handlePrefix, ...(onboarding ? { onboarding } : {}) };
 }
 
 function mergeHarnessStrings(
@@ -530,6 +567,7 @@ function mergeSafeConfig(value: unknown): OrchestratorConfig {
     profiles,
     permissionProfiles,
     roles,
+    boss: mergeBoss(value.boss),
     routing: mergeRouting(value.routing, defaultProfiles, !isRecord(value.routing) && isHarness(value.defaultHarness) ? defaultHarness : undefined),
     supervision: mergeSupervision(value.supervision),
     leaseMinutes: positiveNumber(value.leaseMinutes, DEFAULT_CONFIG.leaseMinutes),
@@ -638,6 +676,17 @@ export async function writeConfigDefaults(path: string, config: OrchestratorConf
       return Object.keys(delta).length ? [[name, delta]] : [];
     }),
   );
+  const hadBossObject = isRecord(existing.boss);
+  const existingBoss = hadBossObject ? structuredClone(existing.boss as Record<string, unknown>) : {};
+  delete existingBoss.roles;
+  delete existingBoss.handlePrefix;
+  delete existingBoss.onboarding;
+  const boss = {
+    ...existingBoss,
+    ...(Object.keys(config.boss.roles).length ? { roles: config.boss.roles } : {}),
+    ...(config.boss.handlePrefix !== DEFAULT_CONFIG.boss.handlePrefix ? { handlePrefix: config.boss.handlePrefix } : {}),
+    ...(config.boss.onboarding ? { onboarding: config.boss.onboarding } : {}),
+  };
   const hadRoutingObject = isRecord(existing.routing);
   const existingRouting = hadRoutingObject ? structuredClone(existing.routing as Record<string, unknown>) : {};
   const routingRoles = Object.fromEntries(
@@ -728,6 +777,7 @@ export async function writeConfigDefaults(path: string, config: OrchestratorConf
     defaultEfforts: config.defaultEfforts,
     permissionProfiles,
     roles,
+    boss: Object.keys(boss).length ? boss : hadBossObject ? {} : undefined,
     routing: Object.keys(routing).length ? routing : hadRoutingObject ? {} : undefined,
     supervision: Object.keys(supervision).length ? supervision : hadSupervisionObject ? {} : undefined,
     leaseMinutes: config.leaseMinutes,
