@@ -10,6 +10,7 @@ const LEGACY_TRUSTED_LOCAL_BOSS_RUN_VERSION = "orc.boss-trusted-local.v1" as con
 export const TRUSTED_LOCAL_BOSS_STORE_VERSION = "orc.boss-trusted-local.v3" as const;
 const LEGACY_TRUSTED_LOCAL_BOSS_STORE_VERSIONS = new Set(["orc.boss-trusted-local.v1", "orc.boss-trusted-local.v2"]);
 export const TRUSTED_LOCAL_BOSS_WARNING = "TRUSTED LOCAL MODE — same-user agents and local files are trusted; evidence is advisory, not tamper-proof.";
+export const TRUSTED_LOCAL_BOSS_FIRST_ACTION_DEADLINE_MS = 10 * 60_000;
 
 export type TrustedLocalBossRunState = "active" | "paused" | "cancelled" | "failed" | "approved" | "rejected";
 export type TrustedLocalBossAssignmentState = "requested" | "assigned" | "failed" | "cancelled";
@@ -68,7 +69,23 @@ export interface TrustedLocalBossLifecycleObservation {
   workerIncarnationId: string;
   workerState: WorkerState;
   observedAt: string;
+  authenticatedIntercomBaselineAt?: string;
+  authenticatedIntercomActivityAt?: string;
   detail?: string;
+}
+
+export type TrustedLocalBossFirstActionStatus = "not_assigned" | "deadline_unavailable" | "awaiting_first_action" | "first_action_stale" | "activity_observed" | "suspended";
+
+export interface TrustedLocalBossAssignmentActivity {
+  assignmentId: string;
+  role: TrustedLocalBossAssignmentRole;
+  workerId: string | null;
+  workerState: WorkerState | null;
+  transportProcessReadiness: "not_launched" | "observed" | "unavailable";
+  activityEvidence: "authenticated_intercom" | "none_observed" | "unavailable";
+  activityObservedAt: string | null;
+  firstActionDeadlineAt: string | null;
+  firstActionStatus: TrustedLocalBossFirstActionStatus;
 }
 
 export interface TrustedLocalBossProofPacket {
@@ -132,6 +149,7 @@ export interface TrustedLocalBossResult {
   message: string;
   run?: TrustedLocalBossRun;
   runs?: TrustedLocalBossRun[];
+  activity?: TrustedLocalBossAssignmentActivity[];
 }
 
 export interface TrustedLocalBossOrphanedWorker {
@@ -217,16 +235,25 @@ function parseAssignmentResult(value: unknown): TrustedLocalBossAssignmentResult
 function parseLifecycleObservation(value: unknown): TrustedLocalBossLifecycleObservation {
   if (!isPlainRecord(value)) throw new Error("Trusted-local Boss state contains an invalid lifecycle observation");
   const required = ["assignmentId", "observationId", "observedAt", "workerId", "workerIncarnationId", "workerState"];
-  const expected = "detail" in value ? [...required, "detail"] : required;
+  const expected = [...required,
+    ...(value.authenticatedIntercomBaselineAt !== undefined ? ["authenticatedIntercomBaselineAt"] : []),
+    ...(value.authenticatedIntercomActivityAt !== undefined ? ["authenticatedIntercomActivityAt"] : []),
+    ...(value.detail !== undefined ? ["detail"] : []),
+  ];
   if (!exactKeys(value, expected)) throw new Error("Trusted-local Boss state contains an invalid lifecycle observation");
-  const { assignmentId, detail, observationId, observedAt, workerId, workerIncarnationId, workerState } = value;
+  const { assignmentId, authenticatedIntercomActivityAt, authenticatedIntercomBaselineAt, detail, observationId, observedAt, workerId, workerIncarnationId, workerState } = value;
   if (typeof observationId !== "string" || !/^observation-[0-9a-f-]{36}$/.test(observationId)
     || typeof assignmentId !== "string" || !/^assignment-[0-9a-f-]{36}$/.test(assignmentId)
     || typeof workerId !== "string" || workerId.length < 1 || workerId.length > 128
     || typeof workerIncarnationId !== "string" || workerIncarnationId.length < 1 || workerIncarnationId.length > 128
     || typeof workerState !== "string" || !TRUSTED_LOCAL_WORKER_STATES.has(workerState as WorkerState)
+    || (authenticatedIntercomBaselineAt !== undefined && typeof authenticatedIntercomBaselineAt !== "string")
+    || (authenticatedIntercomActivityAt !== undefined && typeof authenticatedIntercomActivityAt !== "string")
     || (detail !== undefined && (typeof detail !== "string" || detail.length < 1 || detail.length > 4_096))) throw new Error("Trusted-local Boss state contains invalid lifecycle observation fields");
-  return { observationId, assignmentId, workerId, workerIncarnationId, workerState: workerState as WorkerState, observedAt: parseTimestamp(observedAt, "lifecycle observedAt"), ...(detail !== undefined ? { detail } : {}) };
+  const parsedBaseline = authenticatedIntercomBaselineAt === undefined ? undefined : parseTimestamp(authenticatedIntercomBaselineAt, "authenticated Intercom baseline");
+  const parsedActivity = authenticatedIntercomActivityAt === undefined ? undefined : parseTimestamp(authenticatedIntercomActivityAt, "authenticated Intercom activity");
+  if (parsedActivity && parsedBaseline && Date.parse(parsedActivity) <= Date.parse(parsedBaseline)) throw new Error("Trusted-local Boss state contains invalid authenticated Intercom activity evidence");
+  return { observationId, assignmentId, workerId, workerIncarnationId, workerState: workerState as WorkerState, observedAt: parseTimestamp(observedAt, "lifecycle observedAt"), ...(parsedBaseline ? { authenticatedIntercomBaselineAt: parsedBaseline } : {}), ...(parsedActivity ? { authenticatedIntercomActivityAt: parsedActivity } : {}), ...(detail !== undefined ? { detail } : {}) };
 }
 
 function parseProofPacket(value: unknown): TrustedLocalBossProofPacket {
@@ -344,24 +371,83 @@ function compareRunsForOwnedSummary(left: TrustedLocalBossRun, right: TrustedLoc
   return right.createdAt.localeCompare(left.createdAt) || left.bossRunId.localeCompare(right.bossRunId);
 }
 
-function formatRunList(runs: readonly TrustedLocalBossRun[]): string {
-  if (runs.length === 0) return `${TRUSTED_LOCAL_BOSS_WARNING}\n\nNo Boss runs are owned by this Controller.`;
-  const entries = runs.map((run) => `- ${run.handle} (${run.bossRunId}) [${run.state}] ${run.goal}`);
-  return `${TRUSTED_LOCAL_BOSS_WARNING}\n\nOwned Boss runs (${runs.length}):\n${entries.join("\n")}\n\nUse /boss status <handle-or-exact-run-id> for details; mutation results always include the exact run id.`;
+function assignmentActivity(run: TrustedLocalBossRun, assignment: TrustedLocalBossAssignment, now: string): TrustedLocalBossAssignmentActivity {
+  const observations = run.lifecycle.filter((entry) => entry.assignmentId === assignment.assignmentId);
+  const latest = observations.at(-1);
+  const observedActivity = [...observations].reverse().find((entry) => entry.authenticatedIntercomActivityAt)?.authenticatedIntercomActivityAt ?? null;
+  if (assignment.state !== "assigned" || !assignment.workerId) {
+    return {
+      assignmentId: assignment.assignmentId,
+      role: assignment.role,
+      workerId: assignment.workerId,
+      workerState: latest?.workerState ?? null,
+      transportProcessReadiness: latest ? "observed" : assignment.workerId ? "unavailable" : "not_launched",
+      activityEvidence: observedActivity ? "authenticated_intercom" : assignment.workerId ? "none_observed" : "unavailable",
+      activityObservedAt: observedActivity,
+      firstActionDeadlineAt: null,
+      firstActionStatus: "not_assigned",
+    };
+  }
+  const launchObservation = observations.find((entry) => entry.detail === `${assignment.role} launch recorded from ordinary agent_fleet state`);
+  const deadline = launchObservation ? new Date(Date.parse(launchObservation.observedAt) + TRUSTED_LOCAL_BOSS_FIRST_ACTION_DEADLINE_MS).toISOString() : null;
+  const active = run.state === "active";
+  return {
+    assignmentId: assignment.assignmentId,
+    role: assignment.role,
+    workerId: assignment.workerId,
+    workerState: latest?.workerState ?? null,
+    transportProcessReadiness: latest ? "observed" : "unavailable",
+    activityEvidence: observedActivity ? "authenticated_intercom" : "none_observed",
+    activityObservedAt: observedActivity,
+    firstActionDeadlineAt: deadline,
+    firstActionStatus: observedActivity
+      ? "activity_observed"
+      : !active
+        ? "suspended"
+        : deadline === null
+          ? "deadline_unavailable"
+          : Date.parse(now) >= Date.parse(deadline)
+          ? "first_action_stale"
+          : "awaiting_first_action",
+  };
 }
 
-function formatRun(run: TrustedLocalBossRun): string {
+function runActivity(run: TrustedLocalBossRun, now: string): TrustedLocalBossAssignmentActivity[] {
+  return run.assignments.map((assignment) => assignmentActivity(run, assignment, now));
+}
+
+function formatRunList(runs: readonly TrustedLocalBossRun[], now: string): string {
+  if (runs.length === 0) return `${TRUSTED_LOCAL_BOSS_WARNING}\n\nNo Boss runs are owned by this Controller.`;
+  const entries = runs.map((run) => {
+    const activityStates = [...new Set(runActivity(run, now).map((entry) => entry.firstActionStatus))];
+    return `- ${run.handle} (${run.bossRunId}) [${run.state}; first-action=${activityStates.join(",")}] ${run.goal}`;
+  });
+  return `${TRUSTED_LOCAL_BOSS_WARNING}\n\nOwned Boss runs (${runs.length}):\n${entries.join("\n")}\n\nWorker lifecycle is process/transport evidence only. Use /boss status <handle-or-exact-run-id> for details, exact activity evidence, and deadlines; mutation results always include the exact run id.`;
+}
+
+function formatRun(run: TrustedLocalBossRun, now: string): string {
   const manager = run.assignments.find((assignment) => assignment.role === "manager")!;
   const reviewer = run.assignments.find((assignment) => assignment.role === "adversary");
   const latestProof = run.proofPackets.at(-1);
   const latestDecision = run.decisions.at(-1);
   const lifecycle = run.lifecycle.length ? run.lifecycle.slice(-8).map((entry) => `- ${entry.observedAt} ${entry.workerId} ${entry.workerState}${entry.detail ? ` — ${entry.detail}` : ""}`).join("\n") : "- no worker lifecycle observations recorded";
   const staffing = run.assignments.map((assignment) => `- ${assignment.role} revision ${assignment.revision}: ${assignment.state}; worker=${assignment.workerId ?? "not launched"}${assignment.lastError ? `; error=${assignment.lastError}` : ""}`).join("\n");
+  const activity = runActivity(run, now).map((entry) => {
+    const transport = entry.workerState === null ? entry.transportProcessReadiness : `${entry.transportProcessReadiness} (${entry.workerState})`;
+    const evidence = entry.activityObservedAt ? `authenticated Intercom activity at ${entry.activityObservedAt}` : entry.activityEvidence.replaceAll("_", " ");
+    return `- ${entry.role}: transport/process=${transport}; activity=${evidence}; first-action=${entry.firstActionStatus.replaceAll("_", "-")}${entry.firstActionDeadlineAt ? `; deadline=${entry.firstActionDeadlineAt}` : ""}`;
+  }).join("\n");
   const latestDelivery = run.deliveries.at(-1);
-  return [TRUSTED_LOCAL_BOSS_WARNING, `handle: ${run.handle}`, `run: ${run.bossRunId}`, `state: ${run.state}`, `goal: ${run.goal}`, `manager session: ${run.managerSessionId}`, "staffing:", staffing, `adversary assignment: ${reviewer ? `${reviewer.assignmentId} (${reviewer.state})` : "not requested"}`, `assignment delivery: ${latestDelivery ? `${latestDelivery.kind} ${latestDelivery.state} to ${latestDelivery.targetWorkerId} at revision ${latestDelivery.assignmentRevision}` : "none"}`, `assignment results: ${run.assignmentResults.length}`, `latest proof: ${latestProof ? `${latestProof.proofPacketId} revision ${latestProof.revision} sha256:${latestProof.snapshotSha256}` : "none"}`, `latest decision: ${latestDecision ? `${latestDecision.outcome} on proof revision ${latestDecision.proofRevision} — ${latestDecision.note}` : "none"}`, `cancellation: ${run.cancellation ? `${run.cancellation.state}${run.cancellation.error ? ` — ${run.cancellation.error}` : ""}` : "not requested"}`, `created: ${run.createdAt}`, `updated: ${run.updatedAt}`, "lifecycle:", lifecycle].join("\n");
+  return [TRUSTED_LOCAL_BOSS_WARNING, `handle: ${run.handle}`, `run: ${run.bossRunId}`, `state: ${run.state}`, `goal: ${run.goal}`, `manager session: ${run.managerSessionId}`, "readiness: WorkerStore lifecycle reports process/transport state only; it does not prove productive task activity.", "activity evidence: authenticated worker Intercom traffic only; Orc does not observe source edits or tool calls.", "staffing:", staffing, "activity:", activity, `adversary assignment: ${reviewer ? `${reviewer.assignmentId} (${reviewer.state})` : "not requested"}`, `assignment delivery: ${latestDelivery ? `${latestDelivery.kind} ${latestDelivery.state} to ${latestDelivery.targetWorkerId} at revision ${latestDelivery.assignmentRevision}` : "none"}`, `assignment results: ${run.assignmentResults.length}`, `latest proof: ${latestProof ? `${latestProof.proofPacketId} revision ${latestProof.revision} sha256:${latestProof.snapshotSha256}` : "none"}`, `latest decision: ${latestDecision ? `${latestDecision.outcome} on proof revision ${latestDecision.proofRevision} — ${latestDecision.note}` : "none"}`, `cancellation: ${run.cancellation ? `${run.cancellation.state}${run.cancellation.error ? ` — ${run.cancellation.error}` : ""}` : "not requested"}`, `created: ${run.createdAt}`, `updated: ${run.updatedAt}`, "lifecycle:", lifecycle].join("\n");
 }
 
 function workerIncarnation(worker: WorkerRecord): string { return worker.workerIncarnationId ?? worker.runId; }
+function authenticatedIntercomActivityTimestamp(worker: WorkerRecord): string | undefined {
+  const value = worker.lastAuthenticatedIntercomActivityAt;
+  if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+  const timestamp = new Date(value);
+  return Number.isNaN(timestamp.valueOf()) ? undefined : timestamp.toISOString();
+}
 function assignmentForRole(run: TrustedLocalBossRun, role: TrustedLocalBossAssignmentRole): TrustedLocalBossAssignment { const assignment = run.assignments.find((candidate) => candidate.role === role); if (!assignment) throw new Error(`Trusted-local Boss ${role} assignment is unavailable`); return assignment; }
 function assertOwningSession(run: TrustedLocalBossRun, managerSessionId: string): void { if (run.managerSessionId !== managerSessionId) throw new Error("Trusted-local Boss access requires the owning Controller session."); }
 function isTerminalWorkerState(state: WorkerState): boolean { return state === "completed" || state === "failed" || state === "stopped" || state === "lost"; }
@@ -407,7 +493,8 @@ export class TrustedLocalBossStore {
       run.deliveries.push({ deliveryId, assignmentId: assignment.assignmentId, assignmentRevision: assignment.revision, kind: "launch-mandate", state: "delivered", targetWorkerId: worker.id, attemptedAt: timestamp, completedAt: timestamp });
       run.assignmentResults.push({ resultId: `result-${randomUUID()}`, deliveryId, assignmentId: assignment.assignmentId, assignmentRevision: assignment.revision, outcome: "accepted", observedAt: timestamp, detail: `${role} launch mandate accepted by ordinary agent_fleet readiness` });
       run.updatedAt = timestamp;
-      run.lifecycle.push({ observationId: `observation-${randomUUID()}`, assignmentId: assignment.assignmentId, workerId: worker.id, workerIncarnationId: incarnation, workerState: worker.state, observedAt: timestamp, detail: `${role} launch recorded from ordinary agent_fleet state` });
+      const activityBaseline = authenticatedIntercomActivityTimestamp(worker);
+      run.lifecycle.push({ observationId: `observation-${randomUUID()}`, assignmentId: assignment.assignmentId, workerId: worker.id, workerIncarnationId: incarnation, workerState: worker.state, observedAt: timestamp, ...(activityBaseline ? { authenticatedIntercomBaselineAt: activityBaseline } : {}), detail: `${role} launch recorded from ordinary agent_fleet state` });
       if (run.lifecycle.length > 256) run.lifecycle.splice(0, run.lifecycle.length - 256);
       state.revision += 1;
       return structuredClone(run);
@@ -506,12 +593,19 @@ export class TrustedLocalBossStore {
       let changed = false;
       for (const run of state.runs) {
         for (const assignment of run.assignments.filter((candidate) => candidate.state === "assigned" && candidate.workerId && candidate.workerIncarnationId)) {
-          const worker = workers.find((candidate) => candidate.id === assignment.workerId && workerIncarnation(candidate) === assignment.workerIncarnationId && candidate.bossRunId === run.bossRunId && candidate.managerSessionId === run.managerSessionId);
+          const worker = workers.find((candidate) => candidate.id === assignment.workerId && workerIncarnation(candidate) === assignment.workerIncarnationId && candidate.owned && candidate.bossRunId === run.bossRunId && candidate.managerSessionId === run.managerSessionId);
           const workerState: WorkerState = worker?.state ?? "lost";
           const detail = worker ? worker.lastError ?? worker.stopReason ?? worker.stateReason : `${assignment.role} exact WorkerStore incarnation is missing`;
           const previous = [...run.lifecycle].reverse().find((entry) => entry.assignmentId === assignment.assignmentId);
-          if (previous?.workerState !== workerState || previous.detail !== detail) {
-            run.lifecycle.push({ observationId: `observation-${randomUUID()}`, assignmentId: assignment.assignmentId, workerId: assignment.workerId!, workerIncarnationId: assignment.workerIncarnationId!, workerState, observedAt: timestamp, ...(detail ? { detail: detail.slice(0, 4_096) } : {}) });
+          const currentActivity = worker ? authenticatedIntercomActivityTimestamp(worker) : undefined;
+          const activityBaseline = previous?.authenticatedIntercomBaselineAt;
+          const activityObservedAt = currentActivity
+            && (!activityBaseline || Date.parse(currentActivity) > Date.parse(activityBaseline))
+            && (!previous?.authenticatedIntercomActivityAt || Date.parse(currentActivity) > Date.parse(previous.authenticatedIntercomActivityAt))
+            ? currentActivity
+            : previous?.authenticatedIntercomActivityAt;
+          if (previous?.workerState !== workerState || previous.detail !== detail || previous?.authenticatedIntercomActivityAt !== activityObservedAt) {
+            run.lifecycle.push({ observationId: `observation-${randomUUID()}`, assignmentId: assignment.assignmentId, workerId: assignment.workerId!, workerIncarnationId: assignment.workerIncarnationId!, workerState, observedAt: timestamp, ...(activityBaseline ? { authenticatedIntercomBaselineAt: activityBaseline } : {}), ...(activityObservedAt ? { authenticatedIntercomActivityAt: activityObservedAt } : {}), ...(detail ? { detail: detail.slice(0, 4_096) } : {}) });
             if (run.lifecycle.length > 256) run.lifecycle.splice(0, run.lifecycle.length - 256);
             run.updatedAt = timestamp;
             changed = true;
@@ -556,11 +650,11 @@ export class TrustedLocalBossStore {
             .filter((run) => run.managerSessionId === managerSessionId)
             .map((run) => structuredClone(run))
             .sort(compareRunsForOwnedSummary);
-          return { title: "Boss trusted-local runs", message: formatRunList(owned), runs: owned };
+          return { title: "Boss trusted-local runs", message: formatRunList(owned, timestamp), runs: owned };
         }
         if (!selected) throw new Error("No matching trusted-local Boss run exists.");
         assertOwningSession(selected, managerSessionId);
-        return { title: "Boss trusted-local status", message: formatRun(selected), run: structuredClone(selected) };
+        return { title: "Boss trusted-local status", message: formatRun(selected, timestamp), run: structuredClone(selected), activity: runActivity(selected, timestamp) };
       }
       if (request.action === "create") {
         if (request.goal.length > MAX_GOAL_LENGTH) throw new Error(`Trusted-local Boss goal exceeds ${MAX_GOAL_LENGTH} characters.`);
@@ -570,7 +664,7 @@ export class TrustedLocalBossStore {
         const handle = deterministicBossRunHandle(bossRunId, this.handlePrefix);
         if (state.runs.some((candidate) => candidate.handle === handle)) throw new Error("Trusted-local Boss deterministic handle collision; no run was created");
         const run: TrustedLocalBossRun = { version: TRUSTED_LOCAL_BOSS_RUN_VERSION, bossRunId, handle, goal: request.goal, state: "active", managerSessionId, assignments, deliveries: [], assignmentResults: [], lifecycle: [], proofPackets: [], decisions: [], cancellation: null, createdAt: timestamp, updatedAt: timestamp };
-        state.runs.push(run); state.revision += 1; return { title: "Boss trusted-local run created", message: formatRun(run), run: structuredClone(run) };
+        state.runs.push(run); state.revision += 1; return { title: "Boss trusted-local run created", message: formatRun(run, timestamp), run: structuredClone(run) };
       }
       if (!selected) throw new Error("No matching trusted-local Boss run exists.");
       assertOwningSession(selected, managerSessionId);
@@ -582,17 +676,17 @@ export class TrustedLocalBossStore {
           selected.assignments.push(reviewer);
           selected.updatedAt = timestamp;
           state.revision += 1;
-          return { title: "Boss adversary staffing requested", message: `${formatRun(selected)}\n\nThe adversary must be assigned before an exact proof revision can be generated and delivered.`, run: structuredClone(selected) };
+          return { title: "Boss adversary staffing requested", message: `${formatRun(selected, timestamp)}\n\nThe adversary must be assigned before an exact proof revision can be generated and delivered.`, run: structuredClone(selected) };
         }
         if (reviewer.state === "failed") {
           reviewer.state = "requested"; reviewer.revision += 1; reviewer.workerId = null; reviewer.workerIncarnationId = null; delete reviewer.lastError; reviewer.updatedAt = timestamp; selected.updatedAt = timestamp; state.revision += 1;
-          return { title: "Boss adversary staffing retry requested", message: `${formatRun(selected)}\n\nThe failed adversary assignment was advanced to a new requested revision for ordinary fleet retry.`, run: structuredClone(selected) };
+          return { title: "Boss adversary staffing retry requested", message: `${formatRun(selected, timestamp)}\n\nThe failed adversary assignment was advanced to a new requested revision for ordinary fleet retry.`, run: structuredClone(selected) };
         }
-        if (reviewer.state !== "assigned" || !reviewer.workerId) return { title: "Boss adversary staffing pending", message: `${formatRun(selected)}\n\nThe adversary must be assigned before an exact proof revision can be generated and delivered.`, run: structuredClone(selected) };
+        if (reviewer.state !== "assigned" || !reviewer.workerId) return { title: "Boss adversary staffing pending", message: `${formatRun(selected, timestamp)}\n\nThe adversary must be assigned before an exact proof revision can be generated and delivered.`, run: structuredClone(selected) };
         const latestProof = selected.proofPackets.at(-1);
         if (latestProof && latestProof.snapshotSha256 === proofDigest(selected, reviewer)) {
           const latestDelivery = selected.deliveries.find((delivery) => delivery.kind === "proof-review" && delivery.proofPacketId === latestProof.proofPacketId);
-          if (!latestDelivery || latestDelivery.state === "failed") return { title: "Advisory proof delivery retry", message: `${formatRun(selected)}\n\nProof revision ${latestProof.revision} remains current and requires exact local review delivery retry.`, run: structuredClone(selected) };
+          if (!latestDelivery || latestDelivery.state === "failed") return { title: "Advisory proof delivery retry", message: `${formatRun(selected, timestamp)}\n\nProof revision ${latestProof.revision} remains current and requires exact local review delivery retry.`, run: structuredClone(selected) };
         }
         if (selected.proofPackets.length >= MAX_PROOF_PACKETS) throw new Error(`Trusted-local Boss proof packet limit ${MAX_PROOF_PACKETS} reached.`);
         while (selected.deliveries.length >= 256) pruneOldestDeliveryPair(selected);
@@ -600,7 +694,7 @@ export class TrustedLocalBossStore {
         const proofPacketId = `proof-${randomUUID()}`;
         const packet: TrustedLocalBossProofPacket = { proofPacketId, revision: selected.proofPackets.length + 1, bossRunId: selected.bossRunId, runState: selected.state, managerAssignmentId: manager.assignmentId, reviewerAssignmentId: reviewer.assignmentId, lifecycleCount: selected.lifecycle.length, generatedAt: timestamp, snapshotSha256: proofDigest(selected, reviewer) };
         selected.proofPackets.push(packet); selected.updatedAt = timestamp; state.revision += 1;
-        return { title: "Advisory proof packet", message: `${formatRun(selected)}\n\nProof revision ${packet.revision} is bound to sha256:${packet.snapshotSha256} and awaits exact local review delivery. No protected attestation is claimed.`, run: structuredClone(selected) };
+        return { title: "Advisory proof packet", message: `${formatRun(selected, timestamp)}\n\nProof revision ${packet.revision} is bound to sha256:${packet.snapshotSha256} and awaits exact local review delivery. No protected attestation is claimed.`, run: structuredClone(selected) };
       }
       if (request.action === "approve" || request.action === "reject") {
         if (!request.note) throw new Error(`Trusted-local ${request.action} requires an explicit review note.`);
@@ -615,23 +709,23 @@ export class TrustedLocalBossStore {
         const outcome = request.action === "approve" ? "approved" : "rejected";
         selected.decisions.push({ decisionId: `decision-${randomUUID()}`, proofPacketId: proof.proofPacketId, proofRevision: proof.revision, reviewerAssignmentId: reviewer.assignmentId, reviewerWorkerId: reviewer.workerId, outcome, note: request.note.slice(0, 4_096), decidedBySessionId: managerSessionId, decidedAt: timestamp });
         selected.state = outcome; selected.updatedAt = timestamp; state.revision += 1;
-        return { title: `Boss trusted-local run ${outcome}`, message: formatRun(selected), run: structuredClone(selected) };
+        return { title: `Boss trusted-local run ${outcome}`, message: formatRun(selected, timestamp), run: structuredClone(selected) };
       }
       const nextState = request.action === "pause" ? "paused" : request.action === "resume" ? "active" : "cancelled";
       if (request.action === "pause" && selected.state !== "active") throw new Error(`Cannot pause Boss run from ${selected.state}.`);
       if (request.action === "resume" && selected.state !== "paused") throw new Error(`Cannot resume Boss run from ${selected.state}.`);
-      if (request.action === "cancel" && selected.state === "cancelled" && selected.cancellation?.state === "pending") return { title: "Boss trusted-local cancellation pending", message: formatRun(selected), run: structuredClone(selected) };
+      if (request.action === "cancel" && selected.state === "cancelled" && selected.cancellation?.state === "pending") return { title: "Boss trusted-local cancellation pending", message: formatRun(selected, timestamp), run: structuredClone(selected) };
       if (request.action === "cancel" && selected.state === "cancelled" && selected.cancellation?.state === "failed") {
         selected.cancellation = { actionId: `cancel-${randomUUID()}`, state: "pending", requestedAt: timestamp };
         selected.updatedAt = timestamp;
         state.revision += 1;
-        return { title: "Boss trusted-local cancellation retry requested", message: formatRun(selected), run: structuredClone(selected) };
+        return { title: "Boss trusted-local cancellation retry requested", message: formatRun(selected, timestamp), run: structuredClone(selected) };
       }
       if (request.action === "cancel" && TERMINAL_RUN_STATES.has(selected.state)) throw new Error(`Boss run is already ${selected.state}.`);
       selected.state = nextState; selected.updatedAt = timestamp;
       if (nextState === "cancelled") { selected.cancellation = { actionId: `cancel-${randomUUID()}`, state: "pending", requestedAt: timestamp }; for (const assignment of selected.assignments) { if (assignment.state === "requested") { assignment.state = "cancelled"; assignment.updatedAt = timestamp; } } }
       state.revision += 1; const titleAction = request.action === "pause" ? "paused" : request.action === "resume" ? "resumed" : "cancellation requested";
-      return { title: `Boss trusted-local run ${titleAction}`, message: formatRun(selected), run: structuredClone(selected) };
+      return { title: `Boss trusted-local run ${titleAction}`, message: formatRun(selected, timestamp), run: structuredClone(selected) };
     });
   }
 }

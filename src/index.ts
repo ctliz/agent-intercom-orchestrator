@@ -456,6 +456,7 @@ export function recordIntercomWorkerActivity(
   });
   if (!worker) return undefined;
   recordWorkerActivity(worker, config, now);
+  worker.lastAuthenticatedIntercomActivityAt = now;
   return structuredClone(worker);
 }
 
@@ -2189,7 +2190,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       const result = await executeTrustedLocalBoss(args, ctx);
       return {
         content: [{ type: "text", text: result.message }],
-        details: { title: result.title, run: result.run, runs: result.runs },
+        details: { title: result.title, run: result.run, runs: result.runs, activity: result.activity },
       };
     },
     renderCall(args, theme) {

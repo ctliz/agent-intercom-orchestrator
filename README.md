@@ -89,6 +89,8 @@ boss({ action: "cancel", bossRunId: "<handle-or-exact-run-id>" })
 
 The interactive `/boss` command remains available for direct user control. The tool uses the calling top-level Pi session as the exact creating Controller and is absent from Manager, Worker, Scout, and Adversary participants because they launch with orchestration disabled. Only the creating Controller can inspect or mutate its runs. Boss participants currently use independent Pi peers for the exact team contract, even when their configured model identifiers route to different providers; ordinary `agent_fleet` continues to support Pi, Codex, Claude, and OpenCode coworkers.
 
+Boss status treats `ready` as process/transport lifecycle evidence, not productive work. Detailed status exposes a ten-minute first-action deadline per exact assigned worker and marks it stale until WorkerStore observes later authenticated inbound Intercom activity. Manual lease renewal and adoption do not satisfy this deadline. Orc does not claim source-edit, tool-call, or productivity telemetry it does not own.
+
 Every Boss participant receives the verified Intercom, Orchestrator, Ralph, and Return On extensions. Return On state is isolated per run and role, and Ralph/Return On state roots are checked for writability before create. Model catalog evidence is live when Pi exposes enumeration; an unavailable catalog is reported as a warning rather than fabricated as proof, while a known catalog missing a selected model blocks create.
 
 **TRUSTED LOCAL MODE — same-user agents and local files are trusted; evidence is advisory, not tamper-proof.** Team metadata provides logical trusted-local scoping, not hostile-agent-resistant authority.

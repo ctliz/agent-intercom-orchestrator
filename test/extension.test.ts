@@ -691,6 +691,7 @@ test("manager-received worker Intercom metadata renews only the matching owned w
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
     assert.ok(saved.workers[0].lastWorkerActivityAt > before);
+    assert.equal(saved.workers[0].lastAuthenticatedIntercomActivityAt, saved.workers[0].lastWorkerActivityAt);
     assert.equal(saved.workers[0].checkpointRequestedAt, undefined);
     assert.ok(saved.workers[0].leaseExpiresAt > before + 30 * 60_000);
     await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
