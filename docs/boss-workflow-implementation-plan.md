@@ -1,5 +1,7 @@
 # Agent Intercom Orchestrator — Boss Workflow Change Plan
 
+> **Supersession note (2026-08-06):** This is a historical, hash-reviewed planning record. Later explicit user direction supersedes its Ralph/Return On no-change boundary for the supported trusted-local **Orc Boss** product: Agent Intercom Pi, Orchestrator, Ralph, and Return On are now required runtime-stack components. The original text remains unchanged below as decision history; current implementation and release requirements are defined in [`boss-public-release-plan.md`](./boss-public-release-plan.md). This supersession does not revive or imply the deferred protected-service authority design.
+
 **Status:** Revision 17 corrected-scope implementation-specification candidate; implementation has not started. Revision 16 received unchanged-hash Opus and Fable approval, but Sol rejected it with two deterministic-subscription delivery blockers. Revision 17 defines the complete delivery-group equivalence/sealing/intent-arbitration contract and the broker-authoritative subscriber-rebind migration contract. Formal approval restarts with Opus on the Revision 17 SHA-256.  
 **Repository:** `agent-intercom-orchestrator`  
 **Prepared:** 2026-07-27  

@@ -1,5 +1,7 @@
 export const BOSS_COMMAND_ACTIONS = [
   "create",
+  "doctor",
+  "plan",
   "status",
   "resume",
   "pause",
@@ -13,6 +15,7 @@ export type BossCommandAction = typeof BOSS_COMMAND_ACTIONS[number];
 
 export type BossCommandRequest =
   | { action: "status"; bossRunId?: string }
+  | { action: "doctor" | "plan" }
   | { action: "create"; goal: string }
   | { action: "resume" | "pause" | "cancel" | "proof" | "approve" | "reject"; bossRunId: string; note?: string };
 
@@ -44,6 +47,10 @@ export function parseBossCommand(input: string): BossCommandRequest {
   if (action === "create") {
     if (!remainder) throw new Error("/boss create requires one explicit goal.");
     return { action, goal: remainder };
+  }
+  if (action === "doctor" || action === "plan") {
+    if (remainder) throw new Error(`/boss ${action} does not accept arguments.`);
+    return { action };
   }
   if (action === "status") {
     return remainder ? { action, bossRunId: parseRunId(remainder) } : { action };

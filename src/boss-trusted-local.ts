@@ -5,9 +5,10 @@ import { acquireKernelFileLock } from "./file-lock.ts";
 import type { BossCommandRequest } from "./boss-command.ts";
 import type { WorkerRecord, WorkerState } from "./types.ts";
 
-export const TRUSTED_LOCAL_BOSS_RUN_VERSION = "orc.boss-trusted-local.v1" as const;
-export const TRUSTED_LOCAL_BOSS_STORE_VERSION = "orc.boss-trusted-local.v2" as const;
-const LEGACY_TRUSTED_LOCAL_BOSS_STORE_VERSION = "orc.boss-trusted-local.v1" as const;
+export const TRUSTED_LOCAL_BOSS_RUN_VERSION = "orc.boss-trusted-local.v2" as const;
+const LEGACY_TRUSTED_LOCAL_BOSS_RUN_VERSION = "orc.boss-trusted-local.v1" as const;
+export const TRUSTED_LOCAL_BOSS_STORE_VERSION = "orc.boss-trusted-local.v3" as const;
+const LEGACY_TRUSTED_LOCAL_BOSS_STORE_VERSIONS = new Set(["orc.boss-trusted-local.v1", "orc.boss-trusted-local.v2"]);
 export const TRUSTED_LOCAL_BOSS_WARNING = "TRUSTED LOCAL MODE — same-user agents and local files are trusted; evidence is advisory, not tamper-proof.";
 
 export type TrustedLocalBossRunState = "active" | "paused" | "cancelled" | "failed" | "approved" | "rejected";
@@ -105,6 +106,7 @@ export interface TrustedLocalBossCancellation {
 export interface TrustedLocalBossRun {
   version: typeof TRUSTED_LOCAL_BOSS_RUN_VERSION;
   bossRunId: string;
+  handle: string;
   goal: string;
   state: TrustedLocalBossRunState;
   managerSessionId: string;
@@ -263,11 +265,36 @@ function parseCancellation(value: unknown): TrustedLocalBossCancellation | null 
   return { actionId, state, requestedAt: parseTimestamp(requestedAt, "cancellation requestedAt"), ...(completedAt !== undefined ? { completedAt: parseTimestamp(completedAt, "cancellation completedAt") } : {}), ...(error !== undefined ? { error } : {}) };
 }
 
-function parseRun(value: unknown): TrustedLocalBossRun {
-  const keys = ["assignmentResults", "assignments", "bossRunId", "cancellation", "createdAt", "decisions", "deliveries", "goal", "lifecycle", "managerSessionId", "proofPackets", "state", "updatedAt", "version"];
-  if (!isPlainRecord(value) || !exactKeys(value, keys)) throw new Error("Trusted-local Boss state contains an invalid run record");
-  const { assignmentResults, assignments, bossRunId, cancellation, createdAt, decisions, deliveries, goal, lifecycle, managerSessionId, proofPackets, state, updatedAt, version } = value;
-  if (version !== TRUSTED_LOCAL_BOSS_RUN_VERSION || typeof bossRunId !== "string" || !/^boss-[0-9a-f-]{36}$/.test(bossRunId)
+const BOSS_HANDLE = /^[a-z0-9](?:[a-z0-9-]{0,46}[a-z0-9])?-[a-z2-7]{10}$/;
+const BOSS_HANDLE_PREFIX = /^[a-z0-9](?:[a-z0-9-]{0,30}[a-z0-9])?$/;
+const BASE32_ALPHABET = "abcdefghijklmnopqrstuvwxyz234567";
+
+export function deterministicBossRunHandle(bossRunId: string, prefix = "boss"): string {
+  if (!/^boss-[0-9a-f-]{36}$/.test(bossRunId)) throw new Error("Trusted-local Boss handle requires an exact run id");
+  if (!BOSS_HANDLE_PREFIX.test(prefix)) throw new Error("Trusted-local Boss handle prefix is invalid");
+  const digest = createHash("sha256").update(`orc-boss-handle-v1\0${bossRunId}`).digest();
+  let bits = 0;
+  let value = 0;
+  let suffix = "";
+  for (const byte of digest) {
+    value = (value << 8) | byte;
+    bits += 8;
+    while (bits >= 5 && suffix.length < 10) {
+      suffix += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+      bits -= 5;
+    }
+    if (suffix.length === 10) break;
+  }
+  return `${prefix}-${suffix}`;
+}
+
+function parseRun(value: unknown, handlePrefix: string): TrustedLocalBossRun {
+  if (!isPlainRecord(value)) throw new Error("Trusted-local Boss state contains an invalid run record");
+  const legacy = value.version === LEGACY_TRUSTED_LOCAL_BOSS_RUN_VERSION;
+  const keys = ["assignmentResults", "assignments", "bossRunId", "cancellation", "createdAt", "decisions", "deliveries", "goal", "lifecycle", "managerSessionId", "proofPackets", "state", "updatedAt", "version", ...(legacy ? [] : ["handle"])];
+  if (!exactKeys(value, keys)) throw new Error("Trusted-local Boss state contains an invalid run record");
+  const { assignmentResults, assignments, bossRunId, cancellation, createdAt, decisions, deliveries, goal, lifecycle, managerSessionId, proofPackets, state, updatedAt } = value;
+  if ((!legacy && value.version !== TRUSTED_LOCAL_BOSS_RUN_VERSION) || typeof bossRunId !== "string" || !/^boss-[0-9a-f-]{36}$/.test(bossRunId)
     || typeof goal !== "string" || goal.length < 1 || goal.length > MAX_GOAL_LENGTH || typeof managerSessionId !== "string" || managerSessionId.length < 1 || managerSessionId.length > 1_024
     || (state !== "active" && state !== "paused" && !TERMINAL_RUN_STATES.has(state as TrustedLocalBossRunState))
     || !Array.isArray(assignments) || assignments.length < 3 || assignments.length > 4 || !Array.isArray(deliveries) || deliveries.length > 256 || !Array.isArray(assignmentResults) || assignmentResults.length > 256 || !Array.isArray(lifecycle) || lifecycle.length > 256
@@ -289,19 +316,24 @@ function parseRun(value: unknown): TrustedLocalBossRun {
   const proofById = new Map(parsedProofs.map((packet) => [packet.proofPacketId, packet]));
   if (parsedProofs.some((proof) => { const matches = parsedDeliveries.filter((delivery) => delivery.kind === "proof-review" && delivery.proofPacketId === proof.proofPacketId); if (matches.length > 1) return true; if (matches.length === 0) return false; const delivery = matches[0]; const reviewer = assignmentById.get(proof.reviewerAssignmentId); const result = parsedResults.find((candidate) => candidate.deliveryId === delivery.deliveryId); return !reviewer || delivery.assignmentId !== reviewer.assignmentId || delivery.targetWorkerId !== reviewer.workerId || !result; })) throw new Error("Trusted-local Boss state contains invalid proof delivery correlation");
   if (parsedDecisions.some((decision) => { const proof = proofById.get(decision.proofPacketId); return !proof || proof.revision !== decision.proofRevision || proof.reviewerAssignmentId !== decision.reviewerAssignmentId; })) throw new Error("Trusted-local Boss state contains invalid decision correlation");
-  return { version, bossRunId, goal, state: state as TrustedLocalBossRunState, managerSessionId, assignments: parsedAssignments, deliveries: parsedDeliveries, assignmentResults: parsedResults, lifecycle: parsedLifecycle, proofPackets: parsedProofs, decisions: parsedDecisions, cancellation: parseCancellation(cancellation), createdAt: parseTimestamp(createdAt, "run createdAt"), updatedAt: parseTimestamp(updatedAt, "run updatedAt") };
+  const handle = legacy ? deterministicBossRunHandle(bossRunId, handlePrefix) : value.handle;
+  if (typeof handle !== "string" || !BOSS_HANDLE.test(handle)) throw new Error("Trusted-local Boss state contains an invalid run handle");
+  return { version: TRUSTED_LOCAL_BOSS_RUN_VERSION, bossRunId, handle, goal, state: state as TrustedLocalBossRunState, managerSessionId, assignments: parsedAssignments, deliveries: parsedDeliveries, assignmentResults: parsedResults, lifecycle: parsedLifecycle, proofPackets: parsedProofs, decisions: parsedDecisions, cancellation: parseCancellation(cancellation), createdAt: parseTimestamp(createdAt, "run createdAt"), updatedAt: parseTimestamp(updatedAt, "run updatedAt") };
 }
 
-function parseState(value: unknown): TrustedLocalBossState {
+function parseState(value: unknown, handlePrefix: string): TrustedLocalBossState {
   if (!isPlainRecord(value)) throw new Error("Trusted-local Boss state has an invalid top-level shape");
-  const legacy = value.version === LEGACY_TRUSTED_LOCAL_BOSS_STORE_VERSION;
-  const expectedKeys = legacy ? ["currentRunId", "revision", "runs", "version"] : ["revision", "runs", "version"];
+  const legacyVersion = typeof value.version === "string" && LEGACY_TRUSTED_LOCAL_BOSS_STORE_VERSIONS.has(value.version);
+  const hasLegacyCurrent = value.version === "orc.boss-trusted-local.v1";
+  const expectedKeys = hasLegacyCurrent ? ["currentRunId", "revision", "runs", "version"] : ["revision", "runs", "version"];
   if (!exactKeys(value, expectedKeys)) throw new Error("Trusted-local Boss state has an invalid top-level shape");
-  if ((!legacy && value.version !== TRUSTED_LOCAL_BOSS_STORE_VERSION) || !Number.isSafeInteger(value.revision) || (value.revision as number) < 0 || !Array.isArray(value.runs)) throw new Error("Trusted-local Boss state has invalid metadata");
-  const runs = value.runs.map(parseRun);
+  if ((!legacyVersion && value.version !== TRUSTED_LOCAL_BOSS_STORE_VERSION) || !Number.isSafeInteger(value.revision) || (value.revision as number) < 0 || !Array.isArray(value.runs)) throw new Error("Trusted-local Boss state has invalid metadata");
+  const runs = value.runs.map((run) => parseRun(run, handlePrefix));
   const ids = new Set(runs.map((run) => run.bossRunId));
+  const handles = new Set(runs.map((run) => run.handle));
   if (ids.size !== runs.length) throw new Error("Trusted-local Boss state contains duplicate run ids");
-  if (legacy) {
+  if (handles.size !== runs.length) throw new Error("Trusted-local Boss state contains duplicate run handles");
+  if (hasLegacyCurrent) {
     const currentRunId = value.currentRunId;
     if (currentRunId !== null && (typeof currentRunId !== "string" || !ids.has(currentRunId))) throw new Error("Trusted-local Boss legacy current run is invalid");
   }
@@ -314,8 +346,8 @@ function compareRunsForOwnedSummary(left: TrustedLocalBossRun, right: TrustedLoc
 
 function formatRunList(runs: readonly TrustedLocalBossRun[]): string {
   if (runs.length === 0) return `${TRUSTED_LOCAL_BOSS_WARNING}\n\nNo Boss runs are owned by this Controller.`;
-  const entries = runs.map((run) => `- ${run.bossRunId} [${run.state}] ${run.goal}`);
-  return `${TRUSTED_LOCAL_BOSS_WARNING}\n\nOwned Boss runs (${runs.length}):\n${entries.join("\n")}\n\nUse /boss status <exact-run-id> for details.`;
+  const entries = runs.map((run) => `- ${run.handle} (${run.bossRunId}) [${run.state}] ${run.goal}`);
+  return `${TRUSTED_LOCAL_BOSS_WARNING}\n\nOwned Boss runs (${runs.length}):\n${entries.join("\n")}\n\nUse /boss status <handle-or-exact-run-id> for details; mutation results always include the exact run id.`;
 }
 
 function formatRun(run: TrustedLocalBossRun): string {
@@ -326,7 +358,7 @@ function formatRun(run: TrustedLocalBossRun): string {
   const lifecycle = run.lifecycle.length ? run.lifecycle.slice(-8).map((entry) => `- ${entry.observedAt} ${entry.workerId} ${entry.workerState}${entry.detail ? ` — ${entry.detail}` : ""}`).join("\n") : "- no worker lifecycle observations recorded";
   const staffing = run.assignments.map((assignment) => `- ${assignment.role} revision ${assignment.revision}: ${assignment.state}; worker=${assignment.workerId ?? "not launched"}${assignment.lastError ? `; error=${assignment.lastError}` : ""}`).join("\n");
   const latestDelivery = run.deliveries.at(-1);
-  return [TRUSTED_LOCAL_BOSS_WARNING, `run: ${run.bossRunId}`, `state: ${run.state}`, `goal: ${run.goal}`, `manager session: ${run.managerSessionId}`, "staffing:", staffing, `adversary assignment: ${reviewer ? `${reviewer.assignmentId} (${reviewer.state})` : "not requested"}`, `assignment delivery: ${latestDelivery ? `${latestDelivery.kind} ${latestDelivery.state} to ${latestDelivery.targetWorkerId} at revision ${latestDelivery.assignmentRevision}` : "none"}`, `assignment results: ${run.assignmentResults.length}`, `latest proof: ${latestProof ? `${latestProof.proofPacketId} revision ${latestProof.revision} sha256:${latestProof.snapshotSha256}` : "none"}`, `latest decision: ${latestDecision ? `${latestDecision.outcome} on proof revision ${latestDecision.proofRevision} — ${latestDecision.note}` : "none"}`, `cancellation: ${run.cancellation ? `${run.cancellation.state}${run.cancellation.error ? ` — ${run.cancellation.error}` : ""}` : "not requested"}`, `created: ${run.createdAt}`, `updated: ${run.updatedAt}`, "lifecycle:", lifecycle].join("\n");
+  return [TRUSTED_LOCAL_BOSS_WARNING, `handle: ${run.handle}`, `run: ${run.bossRunId}`, `state: ${run.state}`, `goal: ${run.goal}`, `manager session: ${run.managerSessionId}`, "staffing:", staffing, `adversary assignment: ${reviewer ? `${reviewer.assignmentId} (${reviewer.state})` : "not requested"}`, `assignment delivery: ${latestDelivery ? `${latestDelivery.kind} ${latestDelivery.state} to ${latestDelivery.targetWorkerId} at revision ${latestDelivery.assignmentRevision}` : "none"}`, `assignment results: ${run.assignmentResults.length}`, `latest proof: ${latestProof ? `${latestProof.proofPacketId} revision ${latestProof.revision} sha256:${latestProof.snapshotSha256}` : "none"}`, `latest decision: ${latestDecision ? `${latestDecision.outcome} on proof revision ${latestDecision.proofRevision} — ${latestDecision.note}` : "none"}`, `cancellation: ${run.cancellation ? `${run.cancellation.state}${run.cancellation.error ? ` — ${run.cancellation.error}` : ""}` : "not requested"}`, `created: ${run.createdAt}`, `updated: ${run.updatedAt}`, "lifecycle:", lifecycle].join("\n");
 }
 
 function workerIncarnation(worker: WorkerRecord): string { return worker.workerIncarnationId ?? worker.runId; }
@@ -346,11 +378,13 @@ function proofDigest(run: TrustedLocalBossRun, reviewer: TrustedLocalBossAssignm
 export class TrustedLocalBossStore {
   readonly path: string;
   private readonly now: () => Date;
-  constructor(path: string, now: () => Date = () => new Date()) { this.path = path; this.now = now; }
+  private handlePrefix: string;
+  constructor(path: string, now: () => Date = () => new Date(), handlePrefix = "boss") { this.path = path; this.now = now; this.handlePrefix = handlePrefix; this.setHandlePrefix(handlePrefix); }
+  setHandlePrefix(prefix: string): void { if (!BOSS_HANDLE_PREFIX.test(prefix)) throw new Error("Trusted-local Boss handle prefix is invalid"); this.handlePrefix = prefix; }
 
-  private async readState(): Promise<TrustedLocalBossState> { try { return parseState(JSON.parse(await readFile(this.path, "utf8"))); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return initialState(); throw error; } }
+  private async readState(): Promise<TrustedLocalBossState> { try { return parseState(JSON.parse(await readFile(this.path, "utf8")), this.handlePrefix); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return initialState(); throw error; } }
   private async writeState(state: TrustedLocalBossState): Promise<void> { await mkdir(dirname(this.path), { recursive: true, mode: 0o700 }); const temp = `${this.path}.tmp-${process.pid}-${randomUUID()}`; try { await writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" }); await rename(temp, this.path); } finally { await rm(temp, { force: true }).catch(() => undefined); } }
-  private async mutate<T>(operation: (state: TrustedLocalBossState, timestamp: string) => T | Promise<T>): Promise<T> { await mkdir(dirname(this.path), { recursive: true, mode: 0o700 }); const release = await acquireKernelFileLock(`${this.path}.lock`, 5_000); try { const state = await this.readState(); const before = JSON.stringify(state); const result = await operation(state, canonicalTimestamp(this.now)); parseState(structuredClone(state)); if (JSON.stringify(state) !== before) await this.writeState(state); return result; } finally { await release(); } }
+  private async mutate<T>(operation: (state: TrustedLocalBossState, timestamp: string) => T | Promise<T>): Promise<T> { await mkdir(dirname(this.path), { recursive: true, mode: 0o700 }); const release = await acquireKernelFileLock(`${this.path}.lock`, 5_000); try { const state = await this.readState(); const before = JSON.stringify(state); const result = await operation(state, canonicalTimestamp(this.now)); parseState(structuredClone(state), this.handlePrefix); if (JSON.stringify(state) !== before) await this.writeState(state); return result; } finally { await release(); } }
 
   private async recordAssignmentStarted(bossRunId: string, role: TrustedLocalBossAssignmentRole, worker: WorkerRecord): Promise<TrustedLocalBossRun> {
     return this.mutate((state, timestamp) => {
@@ -515,7 +549,7 @@ export class TrustedLocalBossStore {
   async execute(request: BossCommandRequest, managerSessionId: string): Promise<TrustedLocalBossResult> {
     return this.mutate((state, timestamp) => {
       const requestedId = "bossRunId" in request ? request.bossRunId : undefined;
-      const selected = requestedId ? state.runs.find((run) => run.bossRunId === requestedId) : undefined;
+      const selected = requestedId ? state.runs.find((run) => run.bossRunId === requestedId || run.handle === requestedId) : undefined;
       if (request.action === "status") {
         if (!requestedId) {
           const owned = state.runs
@@ -532,7 +566,10 @@ export class TrustedLocalBossStore {
         if (request.goal.length > MAX_GOAL_LENGTH) throw new Error(`Trusted-local Boss goal exceeds ${MAX_GOAL_LENGTH} characters.`);
         const assignment = (role: "manager" | "worker" | "scout", task: string): TrustedLocalBossAssignment => ({ assignmentId: `assignment-${randomUUID()}`, role, task, revision: 1, state: "requested", workerId: null, workerIncarnationId: null, createdAt: timestamp, updatedAt: timestamp });
         const assignments = [assignment("manager", `Manage the trusted-local Boss goal: ${request.goal}`), assignment("worker", `Implement the highest-priority bounded work for: ${request.goal}`), assignment("scout", `Scout risks, dependencies, and verification gaps for: ${request.goal}`)];
-        const run: TrustedLocalBossRun = { version: TRUSTED_LOCAL_BOSS_RUN_VERSION, bossRunId: `boss-${randomUUID()}`, goal: request.goal, state: "active", managerSessionId, assignments, deliveries: [], assignmentResults: [], lifecycle: [], proofPackets: [], decisions: [], cancellation: null, createdAt: timestamp, updatedAt: timestamp };
+        const bossRunId = `boss-${randomUUID()}`;
+        const handle = deterministicBossRunHandle(bossRunId, this.handlePrefix);
+        if (state.runs.some((candidate) => candidate.handle === handle)) throw new Error("Trusted-local Boss deterministic handle collision; no run was created");
+        const run: TrustedLocalBossRun = { version: TRUSTED_LOCAL_BOSS_RUN_VERSION, bossRunId, handle, goal: request.goal, state: "active", managerSessionId, assignments, deliveries: [], assignmentResults: [], lifecycle: [], proofPackets: [], decisions: [], cancellation: null, createdAt: timestamp, updatedAt: timestamp };
         state.runs.push(run); state.revision += 1; return { title: "Boss trusted-local run created", message: formatRun(run), run: structuredClone(run) };
       }
       if (!selected) throw new Error("No matching trusted-local Boss run exists.");

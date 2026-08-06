@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { configMigrationDiagnostics, DEFAULT_CONFIG, mergeConfig, readConfig, readConfigWithDiagnostics, writeConfig, writeConfigDefaults } from "../src/config.ts";
+import { configMigrationDiagnostics, DEFAULT_CONFIG, isBossOnboardingComplete, mergeConfig, readConfig, readConfigWithDiagnostics, writeConfig, writeConfigDefaults } from "../src/config.ts";
 
 test("policy config merges partial values without dropping typed defaults", () => {
   assert.equal(mergeConfig({}).routing.modelRouting.unmatchedHarness, null);
@@ -33,6 +33,36 @@ test("policy config merges partial values without dropping typed defaults", () =
   assert.deepEqual(config.supervision, {});
 });
 
+test("Boss preferences merge only baseline model and effort fields", () => {
+  const config = mergeConfig({
+    boss: {
+      roles: {
+        manager: { model: "  provider/manager  ", effort: "high", instructions: "ignored" },
+        worker: { model: "provider/worker", effort: "medium" },
+        scout: { effort: "low" },
+        adversary: { model: "provider/adversary", effort: "max" },
+        council: { model: "ignored" },
+      },
+      handlePrefix: "team-boss",
+      onboarding: { version: "orc.boss-onboarding.v1", completedAt: "2026-03-01T12:34:56Z", future: true },
+    },
+  });
+  assert.deepEqual(config.boss, {
+    roles: {
+      manager: { model: "provider/manager", effort: "high" },
+      worker: { model: "provider/worker", effort: "medium" },
+      scout: { effort: "low" },
+      adversary: { model: "provider/adversary", effort: "max" },
+    },
+    handlePrefix: "team-boss",
+    onboarding: { version: "orc.boss-onboarding.v1", completedAt: "2026-03-01T12:34:56.000Z" },
+  });
+  assert.equal(isBossOnboardingComplete(config), true);
+  const incomplete = mergeConfig({ boss: { handlePrefix: "Unsafe Prefix!", onboarding: { version: "old", completedAt: "today" } } });
+  assert.deepEqual(incomplete.boss, DEFAULT_CONFIG.boss);
+  assert.equal(isBossOnboardingComplete(incomplete), false);
+});
+
 test("legacy defaultProfiles migrate into ordered fallback without overriding explicit new policy", () => {
   const legacy = mergeConfig({ defaultProfiles: { claude: "team-claude" } });
   assert.deepEqual(legacy.routing.profilePreferences.claude, ["team-claude", "claude-safe", "claude-minimal"]);
@@ -57,6 +87,7 @@ test("default-policy writes preserve unknown config and round-trip policy deltas
         capabilities: { futureCapability: true },
       },
       supervision: { futureGuidance: "keep" },
+      boss: { futureBossField: { keep: true } },
     }), { mode: 0o644 });
     const config = await readConfig(path);
     config.routing.explicitOnly = [];
@@ -66,6 +97,9 @@ test("default-policy writes preserve unknown config and round-trip policy deltas
     config.routing.modelRouting.rules = [{ harness: "pi", patterns: ["google/*"] }];
     config.routing.modelRouting.stripPrefixes.pi = ["google/"];
     config.routing.fallback.preserveRoleInstructions = false;
+    config.boss.roles.manager = { model: "provider/manager", effort: "high" };
+    config.boss.handlePrefix = "team-boss";
+    config.boss.onboarding = { version: "orc.boss-onboarding.v1", completedAt: "2026-03-01T12:34:56.000Z" };
     await writeConfigDefaults(path, config);
 
     const raw = JSON.parse(await readFile(path, "utf8"));
@@ -84,6 +118,10 @@ test("default-policy writes preserve unknown config and round-trip policy deltas
     assert.equal(raw.routing.fallback.futureFallback, true);
     assert.equal(raw.routing.capabilities.futureCapability, true);
     assert.equal(raw.supervision.futureGuidance, "keep");
+    assert.deepEqual(raw.boss.futureBossField, { keep: true });
+    assert.deepEqual(raw.boss.roles.manager, { model: "provider/manager", effort: "high" });
+    assert.equal(raw.boss.handlePrefix, "team-boss");
+    assert.equal(raw.boss.onboarding.version, "orc.boss-onboarding.v1");
     assert.equal(Object.hasOwn(raw.supervision, "recommendRalphForSubstantialWork"), false);
     assert.equal(Object.hasOwn(raw.supervision, "recommendReturnOnAfterSpawn"), false);
     assert.equal((await stat(path)).mode & 0o777, 0o600);
@@ -93,6 +131,7 @@ test("default-policy writes preserve unknown config and round-trip policy deltas
     assert.deepEqual(roundTrip.routing.profilePreferences, config.routing.profilePreferences);
     assert.deepEqual(roundTrip.routing.roleRequirements, config.routing.roleRequirements);
     assert.deepEqual(roundTrip.supervision, config.supervision);
+    assert.deepEqual(roundTrip.boss, config.boss);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

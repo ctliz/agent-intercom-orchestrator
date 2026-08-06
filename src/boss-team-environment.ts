@@ -43,9 +43,10 @@ export function trustedLocalBossRalphLoopName(identity: Pick<TrustedLocalBossTea
   return `boss-${identity.bossRunId.slice(-12)}-${identity.role}`;
 }
 
-export function buildTrustedLocalBossRalphEnvironment(identity: TrustedLocalBossTeamIdentity, privateRuntimeRoot: string): Record<string, string> {
+export function buildTrustedLocalBossSupervisionEnvironment(identity: TrustedLocalBossTeamIdentity, privateRuntimeRoot: string): Record<string, string> {
   return {
     PI_RALPH_STATE_ROOT: join(privateRuntimeRoot, "boss-ralph", identity.bossRunId, identity.role),
+    PI_RETURN_ON_STATE_DIR: join(privateRuntimeRoot, "boss-return-on", identity.bossRunId, identity.role),
   };
 }
 
