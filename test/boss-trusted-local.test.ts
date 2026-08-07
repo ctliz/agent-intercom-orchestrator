@@ -60,7 +60,9 @@ test("trusted-local Boss creates and reports an explicitly advisory run", async 
 
     const disk = JSON.parse(await readFile(join(dir, "runs.json"), "utf8"));
     assert.equal(disk.revision, 1);
-    assert.equal(disk.version, "orc.boss-trusted-local.v4");
+    assert.equal(disk.version, "orc.boss-trusted-local.v5");
+    assert.equal(disk.runs[0].version, "orc.boss-trusted-local.v3");
+    assert.equal(disk.runs[0].resource, null);
     assert.equal(disk.currentRunId, undefined);
     assert.equal(disk.runs[0].assignments[0].role, "manager");
     assert.equal(disk.runs[0].assignments[0].state, "requested");
@@ -220,8 +222,10 @@ test("trusted-local Boss reads v1 state and migrates it on the next write", asyn
     assert.equal(JSON.parse(await readFile(path, "utf8")).version, "orc.boss-trusted-local.v1", "read-only status keeps the compatible v1 file intact");
     await reopened.execute(parseBossCommand("create migrated sibling run"), "controller-legacy");
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.version, "orc.boss-trusted-local.v4");
+    assert.equal(migrated.version, "orc.boss-trusted-local.v5");
     assert.equal(migrated.currentRunId, undefined);
+    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v3");
+    assert.equal(migrated.runs[0].resource, null);
     assert.equal(migrated.runs.length, 2);
     assert.deepEqual((await readdir(dir)).filter((entry) => entry.includes(".tmp-")), [], "atomic rename leaves no partial migration file");
   } finally {
@@ -250,7 +254,9 @@ test("trusted-local Boss reads v3 activity state and upgrades it without inventi
     const afterControl = await reopened.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "controller-v3-migration");
     assert.equal(afterControl.communication?.find((entry) => entry.role === "manager")?.communicationStatus, "deadline_unavailable", "Controller controls cannot mint or reset a legacy deadline");
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.version, "orc.boss-trusted-local.v4");
+    assert.equal(migrated.version, "orc.boss-trusted-local.v5");
+    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v3");
+    assert.equal(migrated.runs[0].resource, null, "migration does not invent a canonical resource");
     assert.equal(migrated.runs[0].assignments[0].workerBoundAt, undefined, "migration does not invent a historical bind timestamp");
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -266,6 +272,8 @@ test("trusted-local Boss assigns deterministic handles while migrating v2 run re
     legacy.version = "orc.boss-trusted-local.v2";
     legacy.runs[0].version = "orc.boss-trusted-local.v1";
     delete legacy.runs[0].handle;
+    delete legacy.runs[0].resource;
+    for (const assignment of legacy.runs[0].assignments) delete assignment.resourceRevision;
     await writeFile(path, JSON.stringify(legacy));
 
     const reopened = new TrustedLocalBossStore(path, undefined, "legacy");
@@ -273,8 +281,10 @@ test("trusted-local Boss assigns deterministic handles while migrating v2 run re
     assert.equal((await reopened.execute(parseBossCommand(`status ${migratedHandle}`), "controller-handle-migration")).run?.handle, migratedHandle);
     await reopened.execute(parseBossCommand("create migration writer"), "controller-handle-migration");
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.version, "orc.boss-trusted-local.v4");
-    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v2");
+    assert.equal(migrated.version, "orc.boss-trusted-local.v5");
+    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v3");
+    assert.equal(migrated.runs[0].resource, null);
+    assert.equal(migrated.runs[0].assignments[0].resourceRevision, null);
     assert.equal(migrated.runs[0].handle, migratedHandle);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -449,6 +459,11 @@ test("trusted-local Boss binds advisory proof revisions to an assigned adversary
     assert.equal(approved.run?.decisions[0].proofRevision, 1);
     assert.equal(approved.run?.decisions[0].reviewerWorkerId, reviewerWorker.id);
     assert.match(approved.message, /latest decision: approved on proof revision 1/);
+    const cleanupRetry = await store.execute(parseBossCommand(`approve ${created.run!.bossRunId} retry exact terminal cleanup`), "manager-session-8");
+    assert.equal(cleanupRetry.run?.state, "approved");
+    assert.equal(cleanupRetry.run?.decisions.length, 1, "cleanup retry must not create a second decision");
+    assert.match(cleanupRetry.title, /cleanup retry/);
+    assert.match(cleanupRetry.message, /participant shutdown and canonical resource cleanup may be retried/);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

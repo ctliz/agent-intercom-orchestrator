@@ -100,6 +100,7 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
         "pi-peer": { harness: "pi", command: "/bin/true", args: ["--mode", "rpc", "--exclude-tools", "agent_fleet"], mode: "persistent", maxRuntime: "12h" },
       },
       boss: {
+        worktreeRoot: join(agentDir, "boss-worktrees"),
         onboarding: { version: "orc.boss-onboarding.v1", completedAt: "2026-03-01T12:34:56.000Z" },
         roles: {
           manager: { model: "provider/manager", effort: "high" },
@@ -113,8 +114,11 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     const lifecycle = new Map<string, (...args: any[]) => any>();
     const tools = new Map<string, any>();
     const launches: string[][] = [];
+    const stoppedUnits = new Set<string>();
     const intercomDeliveries: Array<{ to: string; message: string }> = [];
     let contextStale = false;
+    let failNextBossLaunch = false;
+    let failNextBossStop = false;
     const pi: any = {
       on(name: string, handler: (...args: any[]) => any) { lifecycle.set(name, handler); },
       events: {
@@ -126,16 +130,33 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       registerTool(tool: any) { tools.set(tool.name, tool); },
       registerCommand() {},
       async exec(command: string, args: string[]) {
-        if (command === "systemd-run" && args.some((arg) => arg.startsWith("--unit=agent-intercom-worker-boss-"))) launches.push([...args]);
+        if (command === "systemd-run" && args.some((arg) => arg.startsWith("--unit=agent-intercom-worker-boss-"))) {
+          if (failNextBossLaunch) {
+            failNextBossLaunch = false;
+            return { ...commandResult(), code: 1, stderr: "injected Manager launch failure" };
+          }
+          launches.push([...args]);
+        }
         if (command === "systemd") return { ...commandResult(), stdout: "systemd 257\n" };
+        if (command === "systemctl" && args.includes("stop")) {
+          if (failNextBossStop) {
+            failNextBossStop = false;
+            return { ...commandResult(), code: 1, stderr: "injected participant stop failure" };
+          }
+          stoppedUnits.add(args.at(-1)!);
+          return commandResult();
+        }
         if (command === "systemctl" && args.includes("show")) {
-          return { ...commandResult(), stdout: "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nResult=success\nExecMainStatus=0\nJob=\nExecMainStartTimestampMonotonic=10\n" };
+          const stopped = stoppedUnits.has(args[args.indexOf("show") + 1]);
+          return { ...commandResult(), stdout: stopped
+            ? "LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nResult=success\nExecMainStatus=0\nJob=\nInactiveEnterTimestampMonotonic=20\n"
+            : "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nResult=success\nExecMainStatus=0\nJob=\nExecMainStartTimestampMonotonic=10\n" };
         }
         return commandResult();
       },
     };
     const ctx: any = {
-      cwd: "/tmp", mode: "rpc", hasUI: false,
+      cwd: resources[1][0], mode: "rpc", hasUI: false,
       sessionManager: { getSessionId: () => "controller-exact-target", getSessionFile: () => undefined },
       ui: { setStatus() { if (contextStale) throw new Error("stale context used during reload shutdown"); }, notify() {} },
     };
@@ -170,7 +191,7 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     assert.match(afterGap.content[0].text, /No Boss runs are owned by this Controller/);
     const created = await tools.get("boss").execute(
       "boss-launch-test",
-      { action: "create", goal: "ship supervised Ralph loops", requirements: { edit: true } },
+      { action: "create", goal: "ship supervised Ralph loops", requirements: { worktree: "write", edit: true } },
       new AbortController().signal,
       () => {},
       ctx,
@@ -179,6 +200,8 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     assert.equal(created.details.created, true);
     assert.equal(created.details.capabilityReport.status, "ready");
     assert.deepEqual(created.details.capabilityReport.probes.map((finding: any) => [finding.capability, finding.requested, finding.availability]), [
+      ["worktree-identity", "required", "verified"],
+      ["worktree-write", "write", "configured"],
       ["edit", "required", "configured"],
     ]);
     assert.deepEqual(created.details.gaps, []);
@@ -187,6 +210,10 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
 
     assert.equal(launches.length, 3);
     const bossRunId = created.details.run.bossRunId as string;
+    const canonicalCwd = created.details.run.resource.path as string;
+    assert.equal(created.details.run.resource.revision, 1);
+    assert.equal(canonicalCwd, join(agentDir, "boss-worktrees", bossRunId));
+    assert.deepEqual(created.details.run.assignments.map((assignment: any) => assignment.resourceRevision), [1, 1, 1]);
     const suffix = bossRunId.slice(-12);
     const orchestratorExtension = new URL("../src/index.ts", import.meta.url).pathname;
     for (const role of ["manager", "worker", "scout"] as const) {
@@ -195,6 +222,7 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       assert.ok(launch.includes(`--setenv=AGENT_INTERCOM_BOSS_RUN_ID=${bossRunId}`));
       assert.ok(launch.includes("--setenv=AGENT_INTERCOM_BOSS_CONTROLLER_TARGET=controller-exact-target"));
       assert.ok(launch.includes(`--setenv=AGENT_INTERCOM_BOSS_MANAGER_TARGET=boss-manager-${suffix}`));
+      assert.ok(launch.includes(`--working-directory=${canonicalCwd}`), `${role} did not launch in the canonical resource`);
       assert.ok(launch.includes(`--setenv=PI_RALPH_STATE_ROOT=${join(runtimeDir, "agent-intercom-worker", "boss-ralph", bossRunId, role)}`));
       assert.ok(launch.includes(`--setenv=PI_RETURN_ON_STATE_DIR=${join(runtimeDir, "agent-intercom-worker", "boss-return-on", bossRunId, role)}`));
       assert.ok(launch.includes("--no-extensions"));
@@ -212,6 +240,7 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       const prompt = launch.join("\n");
       assert.match(prompt, new RegExp(`Immediately start the isolated Ralph loop named boss-${suffix}-${role}`));
       assert.match(prompt, /itemsPerIteration=3, reflectEvery=5, maxIterations=100/);
+      assert.ok(prompt.includes(`Canonical resource: ${canonicalCwd} at resource revision 1`));
       const modelIndex = launch.indexOf("--model");
       const thinkingIndex = launch.indexOf("--thinking");
       assert.equal(launch[modelIndex + 1], `provider/${role}`);
@@ -231,8 +260,24 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     ].sort());
     for (const delivery of intercomDeliveries) {
       assert.match(delivery.message, /Initial (manager|worker|scout) assignment/);
+      assert.match(delivery.message, /resource revision 1/);
+      assert.ok(delivery.message.includes(`Canonical cwd: ${canonicalCwd}`));
       assert.match(delivery.message, /Begin now using the isolated Ralph protocol/);
     }
+
+    const cancelled = await tools.get("boss").execute(
+      "boss-clean-resource-test",
+      { action: "cancel", bossRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(cancelled.details.run.cancellation.state, "succeeded");
+    assert.equal(cancelled.details.run.resource.revision, 2);
+    assert.equal(cancelled.details.run.resource.leaseState, "released");
+    assert.equal(cancelled.details.run.resource.existence, "missing");
+    assert.match(cancelled.content[0].text, /clean worktree and branch were removed/);
+    await assert.rejects(access(canonicalCwd));
 
     const defaultCreated = await tools.get("boss").execute(
       "boss-default-create-test",
@@ -246,6 +291,75 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     assert.ok(defaultCreated.details.run?.bossRunId);
     assert.doesNotMatch(defaultCreated.content[0].text, /Boss create capability report/);
     assert.equal(launches.length, 6, "omitting requirements preserves ordinary three-role staffing");
+
+    const reviewable = await tools.get("boss").execute(
+      "boss-review-cleanup-retry-create",
+      { action: "create", goal: "retry terminal cleanup after transient stop failure", requirements: { worktree: "write" } },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    const reviewableRunId = reviewable.details.run.bossRunId as string;
+    const reviewableCwd = reviewable.details.run.resource.path as string;
+    const proof = await tools.get("boss").execute(
+      "boss-review-cleanup-retry-proof",
+      { action: "proof", bossRunId: reviewableRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(proof.details.run.proofPackets.length, 1);
+    const freshProof = await tools.get("boss").execute(
+      "boss-review-cleanup-fresh-proof",
+      { action: "proof", bossRunId: reviewableRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.ok(freshProof.details.run.proofPackets.length >= 1);
+    failNextBossStop = true;
+    const firstApproval = await tools.get("boss").execute(
+      "boss-review-cleanup-first-approval",
+      { action: "approve", bossRunId: reviewableRunId, note: "exact proof reviewed" },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(firstApproval.details.run.state, "approved");
+    assert.equal(firstApproval.details.run.resource.leaseState, "active");
+    assert.match(firstApproval.content[0].text, /cleanup was not attempted because exact participant shutdown failed/);
+    assert.equal(await access(reviewableCwd).then(() => true), true);
+    const retriedApproval = await tools.get("boss").execute(
+      "boss-review-cleanup-retried-approval",
+      { action: "approve", bossRunId: reviewableRunId, note: "retry exact terminal cleanup" },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(retriedApproval.details.run.state, "approved");
+    assert.equal(retriedApproval.details.run.decisions.length, 1);
+    assert.equal(retriedApproval.details.run.resource.leaseState, "released");
+    assert.equal(retriedApproval.details.run.resource.existence, "missing");
+    await assert.rejects(access(reviewableCwd));
+
+    const launchesBeforeManagerFailure = launches.length;
+    failNextBossLaunch = true;
+    const managerFailed = await tools.get("boss").execute(
+      "boss-manager-failure-cleanup-test",
+      { action: "create", goal: "fail initial Manager launch safely", requirements: { worktree: "write" } },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    const failedCanonicalCwd = managerFailed.details.run.resource.path as string;
+    assert.equal(managerFailed.details.run.state, "failed");
+    assert.equal(managerFailed.details.run.assignments[0].state, "failed");
+    assert.equal(managerFailed.details.run.resource.revision, 2);
+    assert.equal(managerFailed.details.run.resource.leaseState, "released");
+    assert.equal(managerFailed.details.run.resource.existence, "missing");
+    assert.match(managerFailed.content[0].text, /clean worktree and branch were removed/);
+    await assert.rejects(access(failedCanonicalCwd));
+    assert.equal(launches.length, launchesBeforeManagerFailure, "Manager launch failure must not continue staffing Worker or Scout");
 
     contextStale = true;
     await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);

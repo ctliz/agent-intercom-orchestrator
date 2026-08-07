@@ -10,6 +10,7 @@ import { Type } from "typebox";
 import { DEFAULT_CONFIG, readConfig, resolveProfileCommand, writeConfigDefaults } from "./config.ts";
 import { BOSS_CREATE_ACCESS_LEVELS, assertDirectInteractiveBossCommand, bossCreateRequest, parseBossCommand, type BossCommandRequest } from "./boss-command.ts";
 import { formatBossCreateCapabilityReport, inspectBossCreateCapabilities, type BossCreateCapabilityReport } from "./boss-create-capabilities.ts";
+import { cleanupProvisionedBossResource, observeProvisionedBossResource, provisionBossLinkedWorktree, rollbackProvisionedBossWorktree, type ProvisionedBossWorktree } from "./boss-resource.ts";
 import { formatBossReadinessReport, formatBossSetupReport, inspectBossSetup, inspectTrustedLocalBossReadiness } from "./boss-setup.ts";
 import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossSupervisionEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
 import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, type TrustedLocalBossResult } from "./boss-trusted-local.ts";
@@ -1955,6 +1956,46 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     });
   }
 
+  async function stopBossAssignedWorkers(run: NonNullable<TrustedLocalBossResult["run"]>): Promise<unknown | undefined> {
+    try {
+      const snapshot = await store.read();
+      const failures: string[] = [];
+      for (const assignment of run.assignments.filter((candidate) => candidate.state === "assigned" && candidate.workerId && candidate.workerIncarnationId)) {
+        try {
+          const worker = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && workerIncarnation(candidate) === assignment.workerIncarnationId && candidate.bossRunId === run.bossRunId && candidate.managerSessionId === run.managerSessionId);
+          if (!worker) {
+            const conflicting = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && candidate.bossRunId === run.bossRunId && candidate.managerSessionId === run.managerSessionId);
+            throw new Error(conflicting
+              ? `Boss ${assignment.role} worker identity changed before terminal cleanup`
+              : `Exact assigned Boss ${assignment.role} worker is unavailable; process termination is unverified`);
+          }
+          if (isLiveState(worker.state)) await stopWorker(worker, { expectedManagerSessionId: run.managerSessionId, reason: "boss-run-terminal" });
+        } catch (error) {
+          failures.push(`${assignment.role}: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+      if (failures.length) throw new Error(failures.join("; "));
+      return undefined;
+    } catch (error) {
+      return error;
+    }
+  }
+
+  async function cleanupTerminalBossResource(result: TrustedLocalBossResult): Promise<TrustedLocalBossResult> {
+    const current = result.run?.resource;
+    if (!result.run || !current || current.leaseState === "released") return result;
+    const cleanup = await cleanupProvisionedBossResource(current);
+    const run = cleanup.resource.revision === current.revision
+      ? result.run
+      : await trustedLocalBossStore.recordResourceTransition(result.run.bossRunId, current.revision, cleanup.resource);
+    const detail = cleanup.dirty
+      ? `Canonical resource revision ${run.resource?.revision} was released but preserved because the candidate contains uncommitted or committed changes.\n${cleanup.dirtyStatus}`
+      : cleanup.removed
+        ? `Canonical resource revision ${run.resource?.revision} was released and its clean worktree and branch were removed.`
+        : `Canonical resource cleanup failed safely at revision ${run.resource?.revision}: ${cleanup.error ?? "unknown cleanup error"}`;
+    return { ...result, run, message: `${result.message}\n\n${detail}` };
+  }
+
   async function executeTrustedLocalBoss(request: BossCommandRequest, ctx: ExtensionContext): Promise<TrustedLocalBossResult & { capabilityReport?: BossCreateCapabilityReport; created?: boolean }> {
     if (!config) await loadConfig();
     trustedLocalBossStore.setHandlePrefix(config.boss.handlePrefix);
@@ -1968,32 +2009,75 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     }
     await synchronizeTrustedLocalBossWorkers();
     let capabilityReport: BossCreateCapabilityReport | undefined;
+    let provisionedWorktree: ProvisionedBossWorktree | undefined;
+    let result: TrustedLocalBossResult;
     if (request.action === "create") {
       const readiness = await trustedLocalBossReadiness(ctx);
       if (readiness.status === "blocked") {
         throw new Error(`BOSS_TRUSTED_LOCAL_NOT_READY:\n${formatBossReadinessReport(readiness)}`);
       }
-      if (request.requirements) {
-        const workerPermissionProfileName = config.roles.worker?.permissionProfile ?? "builder-restricted";
-        const workerPermissionProfile = config.permissionProfiles[workerPermissionProfileName];
-        if (!workerPermissionProfile) throw new Error(`BOSS_CAPABILITY_GAP: unknown Worker permission profile ${workerPermissionProfileName}; no run was created.`);
-        capabilityReport = await inspectBossCreateCapabilities({
-          cwd: ctx.cwd,
-          requirements: request.requirements,
-          workerPermissionProfileName,
-          workerPermissionProfile,
-        });
-        if (capabilityReport.status === "blocked") {
-          return {
-            title: "Boss create capability gap",
-            message: `BOSS_CAPABILITY_GAP:\n${formatBossCreateCapabilityReport(capabilityReport)}`,
-            capabilityReport,
-            created: false,
-          };
+      const workerPermissionProfileName = config.roles.worker?.permissionProfile ?? "builder-restricted";
+      const workerPermissionProfile = config.permissionProfiles[workerPermissionProfileName];
+      if (request.requirements && !workerPermissionProfile) throw new Error(`BOSS_CAPABILITY_GAP: unknown Worker permission profile ${workerPermissionProfileName}; no run was created.`);
+      if (request.requirements?.worktree) {
+        const bossRunId = `boss-${randomUUID()}`;
+        let canonicalResource: Awaited<ReturnType<typeof observeProvisionedBossResource>> | undefined;
+        try {
+          provisionedWorktree = await provisionBossLinkedWorktree({
+            bossRunId,
+            sourceCwd: ctx.cwd,
+            leaseRoot: config.boss.worktreeRoot,
+            observe: async (provisioned) => {
+              capabilityReport = await inspectBossCreateCapabilities({
+                cwd: provisioned.path,
+                requirements: request.requirements!,
+                workerPermissionProfileName,
+                workerPermissionProfile: workerPermissionProfile!,
+              });
+              if (capabilityReport.status === "blocked") throw new Error("BOSS_CAPABILITY_GAP_AFTER_PROVISIONING");
+              canonicalResource = await observeProvisionedBossResource({
+                bossRunId,
+                path: provisioned.path,
+                baseSha: provisioned.baseSha,
+                capabilityReport,
+                leaseDurationMs: config.boss.resourceLeaseMinutes * 60_000,
+              });
+            },
+          });
+        } catch (error) {
+          if (capabilityReport?.status === "blocked" && error instanceof Error && error.message === "BOSS_CAPABILITY_GAP_AFTER_PROVISIONING") {
+            return { title: "Boss create capability gap", message: `BOSS_CAPABILITY_GAP:\n${formatBossCreateCapabilityReport(capabilityReport)}`, capabilityReport, created: false };
+          }
+          throw error;
         }
+        if (!canonicalResource) throw new Error("Boss canonical resource observation did not complete");
+        try {
+          result = await trustedLocalBossStore.createProvisionedRun({ bossRunId, goal: request.goal, managerSessionId: managerSessionId(ctx), resource: canonicalResource });
+        } catch (error) {
+          try {
+            await rollbackProvisionedBossWorktree(provisionedWorktree);
+          } catch (rollbackError) {
+            throw new Error(`Boss run persistence failed and provisioned-resource rollback was incomplete: ${rollbackError instanceof Error ? rollbackError.message : String(rollbackError)}`, { cause: error });
+          }
+          throw error;
+        }
+      } else {
+        if (request.requirements) {
+          capabilityReport = await inspectBossCreateCapabilities({ cwd: ctx.cwd, requirements: request.requirements, workerPermissionProfileName, workerPermissionProfile: workerPermissionProfile! });
+          if (capabilityReport.status === "blocked") return { title: "Boss create capability gap", message: `BOSS_CAPABILITY_GAP:\n${formatBossCreateCapabilityReport(capabilityReport)}`, capabilityReport, created: false };
+        }
+        result = await trustedLocalBossStore.execute(request, managerSessionId(ctx));
       }
+    } else {
+      result = await trustedLocalBossStore.execute(request, managerSessionId(ctx));
     }
-    let result = await trustedLocalBossStore.execute(request, managerSessionId(ctx));
+
+    if ((request.action === "approve" || request.action === "reject") && result.run) {
+      const stopError = await stopBossAssignedWorkers(result.run);
+      result = stopError === undefined
+        ? await cleanupTerminalBossResource(result)
+        : { ...result, message: `${result.message}\n\nCanonical resource cleanup was not attempted because exact participant shutdown failed: ${stopError instanceof Error ? stopError.message : String(stopError)}` };
+    }
 
     if (request.action === "proof" && result.run) {
       const reviewer = result.run.assignments.find((assignment) => assignment.role === "adversary");
@@ -2008,9 +2092,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
             `Goal: ${result.run.goal}`,
             buildTrustedLocalBossParticipantPrompt({ bossRunId: result.run.bossRunId, role: "adversary", controllerTarget: result.run.managerSessionId }, result.run.goal),
             "Wait for the owning Pi session to deliver an exact advisory proof revision and digest before returning a decision.",
+            result.run.resource ? `Canonical resource: ${result.run.resource.path} at resource revision ${result.run.resource.revision}. Use no other cwd.` : "No canonical run resource is attached.",
             "Do not claim protected authority, independent attestation, or tamper-proof evidence.",
           ].join("\n"),
-          cwd: ctx.cwd,
+          cwd: result.run.resource?.path ?? ctx.cwd,
           harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
           model: config.boss.roles.adversary?.model,
           effort: config.boss.roles.adversary?.effort ?? "auto",
@@ -2066,29 +2151,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     }
 
     if (request.action === "cancel" && result.run) {
-      let stopError: unknown;
-      try {
-        const snapshot = await store.read();
-        const failures: string[] = [];
-        for (const assignment of result.run.assignments.filter((candidate) => candidate.state === "assigned" && candidate.workerId && candidate.workerIncarnationId)) {
-          try {
-            const worker = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && workerIncarnation(candidate) === assignment.workerIncarnationId && candidate.bossRunId === result.run!.bossRunId && candidate.managerSessionId === result.run!.managerSessionId);
-            if (!worker) {
-              const conflicting = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && candidate.bossRunId === result.run!.bossRunId && candidate.managerSessionId === result.run!.managerSessionId);
-              if (conflicting) throw new Error(`Boss ${assignment.role} worker identity changed before cancellation`);
-              continue;
-            }
-            if (isLiveState(worker.state)) await stopWorker(worker, { expectedManagerSessionId: result.run!.managerSessionId, reason: "boss-run-cancelled" });
-          } catch (error) {
-            failures.push(`${assignment.role}: ${error instanceof Error ? error.message : String(error)}`);
-          }
-        }
-        if (failures.length) throw new Error(failures.join("; "));
-      } catch (error) {
-        stopError = error;
-      }
+      const stopError = await stopBossAssignedWorkers(result.run);
       result = { title: result.title, message: result.message, run: await trustedLocalBossStore.recordCancellationResult(result.run.bossRunId, stopError) };
       result.message = `${result.run ? `${TRUSTED_LOCAL_BOSS_WARNING}\nrun: ${result.run.bossRunId}\nstate: ${result.run.state}\ncancellation: ${result.run.cancellation?.state}${result.run.cancellation?.error ? ` — ${result.run.cancellation.error}` : ""}` : result.message}`;
+      if (result.run?.cancellation?.state === "succeeded") result = await cleanupTerminalBossResource(result);
       return result;
     }
 
@@ -2134,9 +2200,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           member.task,
           `Goal: ${result.run.goal}`,
           buildTrustedLocalBossParticipantPrompt({ bossRunId, role: member.role, controllerTarget: result.run.managerSessionId }, result.run.goal),
+          result.run.resource ? `Canonical resource: ${result.run.resource.path} at resource revision ${result.run.resource.revision}. Use no other cwd.` : "No canonical run resource is attached.",
           "Do not claim protected authority or tamper-proof evidence.",
         ].join("\n"),
-        cwd: ctx.cwd,
+        cwd: result.run.resource?.path ?? ctx.cwd,
         harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
         model: config.boss.roles[member.role]?.model,
         effort: config.boss.roles[member.role]?.effort ?? "auto",
@@ -2169,7 +2236,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         if (member.role === "manager") break;
       }
     }
-    const staffed = await trustedLocalBossStore.execute({ action: "status", bossRunId }, managerSessionId(ctx));
+    let staffed = await trustedLocalBossStore.execute({ action: "status", bossRunId }, managerSessionId(ctx));
+    if (staffed.run?.state === "failed") staffed = await cleanupTerminalBossResource(staffed);
     if (staffed.run) {
       const snapshot = await store.read();
       for (const assignment of staffed.run.assignments.filter((candidate) => candidate.state === "assigned" && candidate.workerId && candidate.workerIncarnationId)) {
@@ -2180,7 +2248,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         if (!worker || !isLiveState(worker.state)) continue;
         pi.events.emit(INTERCOM_LIFECYCLE_SEND_EVENT, {
           to: worker.intercomTarget ?? worker.id,
-          message: `${TRUSTED_LOCAL_BOSS_WARNING}\nInitial ${assignment.role} assignment for Boss run ${bossRunId}: ${assignment.task}\nBegin now using the isolated Ralph protocol from your launch mandate.`,
+          message: `${TRUSTED_LOCAL_BOSS_WARNING}\nInitial ${assignment.role} assignment for Boss run ${bossRunId} at resource revision ${assignment.resourceRevision ?? "none"}: ${assignment.task}${staffed.run.resource ? `\nCanonical cwd: ${staffed.run.resource.path}` : ""}\nBegin now using the isolated Ralph protocol from your launch mandate.`,
         });
       }
     }
