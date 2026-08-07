@@ -115,6 +115,8 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     const tools = new Map<string, any>();
     const launches: string[][] = [];
     const stoppedUnits = new Set<string>();
+    const frozenUnits = new Set<string>();
+    const freezerActions: string[] = [];
     const intercomDeliveries: Array<{ to: string; message: string }> = [];
     let contextStale = false;
     let failNextBossLaunch = false;
@@ -146,11 +148,19 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
           stoppedUnits.add(args.at(-1)!);
           return commandResult();
         }
+        if (command === "systemctl" && (args.includes("freeze") || args.includes("thaw"))) {
+          const action = args.includes("freeze") ? "freeze" : "thaw";
+          const unit = args.at(-1)!;
+          freezerActions.push(`${action}:${unit}`);
+          if (action === "freeze") frozenUnits.add(unit); else frozenUnits.delete(unit);
+          return commandResult();
+        }
         if (command === "systemctl" && args.includes("show")) {
-          const stopped = stoppedUnits.has(args[args.indexOf("show") + 1]);
+          const unit = args[args.indexOf("show") + 1];
+          const stopped = stoppedUnits.has(unit);
           return { ...commandResult(), stdout: stopped
-            ? "LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nResult=success\nExecMainStatus=0\nJob=\nInactiveEnterTimestampMonotonic=20\n"
-            : "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nResult=success\nExecMainStatus=0\nJob=\nExecMainStartTimestampMonotonic=10\n" };
+            ? "LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nResult=success\nExecMainStatus=0\nJob=\nFreezerState=running\nInactiveEnterTimestampMonotonic=20\n"
+            : `LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nResult=success\nExecMainStatus=0\nJob=\nFreezerState=${frozenUnits.has(unit) ? "frozen" : "running"}\nExecMainStartTimestampMonotonic=10\n` };
         }
         return commandResult();
       },
@@ -265,6 +275,70 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       assert.match(delivery.message, /Begin now using the isolated Ralph protocol/);
     }
 
+    const paused = await tools.get("boss").execute(
+      "boss-systemd-pause-test",
+      { action: "pause", bossRunId, note: "hold exact managed units" },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(paused.details.run.state, "paused");
+    assert.deepEqual(paused.details.run.currentPause.targets.map((target: any) => target.role).sort(), ["scout", "worker"]);
+    assert.deepEqual([...frozenUnits].sort(), paused.details.run.currentPause.targets.map((target: any) => target.unit).sort());
+    assert.equal([...frozenUnits].some((unit) => unit.includes(`boss-manager-${suffix}`)), false);
+    assert.match(paused.content[0].text, /RuntimeMaxSec continues to elapse/);
+    const statePath = join(orchestratorDir, "workers.json");
+    const pausedKeys = new Set(paused.details.run.currentPause.targets.map((target: any) => `${target.workerId}\0${target.workerIncarnationId}`));
+    const fencedBefore = JSON.parse(await readFile(statePath, "utf8")).workers
+      .filter((worker: any) => pausedKeys.has(`${worker.id}\0${worker.workerIncarnationId ?? worker.runId}`))
+      .map((worker: any) => [worker.id, worker.leaseExpiresAt, worker.idleDeadlineAt, worker.checkpointDeadlineAt, worker.checkpointLastAttemptAt]);
+    const pausedRenewTarget = paused.details.run.currentPause.targets[0].workerId as string;
+    const pausedRenew = await tools.get("agent_fleet").execute("boss-paused-renew-test", { action: "renew", id: pausedRenewTarget }, new AbortController().signal, () => {}, ctx);
+    assert.equal(pausedRenew.details.workers.length, 0, "explicit renew must not cross an exact Boss pause fence");
+    await tools.get("agent_fleet").execute("boss-paused-heartbeat-test", { action: "_heartbeat" }, new AbortController().signal, () => {}, ctx);
+    await tools.get("agent_fleet").execute("boss-paused-cleanup-test", { action: "cleanup", execute: false }, new AbortController().signal, () => {}, ctx);
+    const fencedAfter = JSON.parse(await readFile(statePath, "utf8")).workers
+      .filter((worker: any) => pausedKeys.has(`${worker.id}\0${worker.workerIncarnationId ?? worker.runId}`))
+      .map((worker: any) => [worker.id, worker.leaseExpiresAt, worker.idleDeadlineAt, worker.checkpointDeadlineAt, worker.checkpointLastAttemptAt]);
+    assert.deepEqual(fencedAfter, fencedBefore, "renew, heartbeat, and cleanup must not normalize exact pause-fenced lifecycle budgets");
+    const mixedTimerState = JSON.parse(await readFile(statePath, "utf8"));
+    const mixedTimerWorker = mixedTimerState.workers.find((worker: any) => pausedKeys.has(`${worker.id}\0${worker.workerIncarnationId ?? worker.runId}`));
+    const suspendedLeaseDeadline = mixedTimerWorker.leaseExpiresAt;
+    mixedTimerWorker.leaseExpiresAt = Date.now() + 60_000;
+    await writeFile(statePath, `${JSON.stringify(mixedTimerState, null, 2)}\n`, "utf8");
+    const failedResume = await tools.get("boss").execute(
+      "boss-systemd-resume-restore-failure-test",
+      { action: "resume", bossRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(failedResume.details.run.state, "paused");
+    assert.equal(failedResume.details.run.pauseTransitions.at(-1).phase, "failed");
+    assert.match(failedResume.details.run.pauseTransitions.at(-1).reason, /mixed suspended timer state/);
+    assert.deepEqual([...frozenUnits].sort(), paused.details.run.currentPause.targets.map((target: any) => target.unit).sort(), "timer restoration failure after thaw must re-freeze every exact target before retaining enforced pause");
+    const repairedTimerState = JSON.parse(await readFile(statePath, "utf8"));
+    repairedTimerState.workers.find((worker: any) => worker.id === mixedTimerWorker.id && (worker.workerIncarnationId ?? worker.runId) === (mixedTimerWorker.workerIncarnationId ?? mixedTimerWorker.runId)).leaseExpiresAt = suspendedLeaseDeadline;
+    await writeFile(statePath, `${JSON.stringify(repairedTimerState, null, 2)}\n`, "utf8");
+    const resumed = await tools.get("boss").execute(
+      "boss-systemd-resume-test",
+      { action: "resume", bossRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(resumed.details.run.state, "active");
+    assert.equal(resumed.details.run.currentPause, null);
+    assert.equal(frozenUnits.size, 0);
+    const pausedForCancel = await tools.get("boss").execute(
+      "boss-systemd-terminal-thaw-test",
+      { action: "pause", bossRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(pausedForCancel.details.run.state, "paused");
+    const freezerActionsBeforeCancel = freezerActions.length;
     const cancelled = await tools.get("boss").execute(
       "boss-clean-resource-test",
       { action: "cancel", bossRunId },
@@ -273,6 +347,9 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       ctx,
     );
     assert.equal(cancelled.details.run.cancellation.state, "succeeded");
+    assert.equal(cancelled.details.run.currentPause, null);
+    assert.equal(frozenUnits.size, 0, "terminal cancellation thaws every exact managed unit before stop");
+    assert.deepEqual(freezerActions.slice(freezerActionsBeforeCancel).map((entry) => entry.split(":")[0]), ["thaw", "thaw"]);
     assert.equal(cancelled.details.run.resource.revision, 2);
     assert.equal(cancelled.details.run.resource.leaseState, "released");
     assert.equal(cancelled.details.run.resource.existence, "missing");
@@ -291,6 +368,208 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     assert.ok(defaultCreated.details.run?.bossRunId);
     assert.doesNotMatch(defaultCreated.content[0].text, /Boss create capability report/);
     assert.equal(launches.length, 6, "omitting requirements preserves ordinary three-role staffing");
+
+    const degradedRunId = defaultCreated.details.run.bossRunId as string;
+    const driftPaused = await tools.get("boss").execute(
+      "boss-accepted-pause-drift-pause",
+      { action: "pause", bossRunId: degradedRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    const driftedUnit = driftPaused.details.run.currentPause.targets[0].unit as string;
+    frozenUnits.delete(driftedUnit);
+    const degradedStatus = await tools.get("boss").execute(
+      "boss-accepted-pause-drift-status",
+      { action: "status", bossRunId: degradedRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(degradedStatus.details.run.state, "paused");
+    assert.equal(degradedStatus.details.run.currentPauseDegradation.outcome, "degraded");
+    assert.match(degradedStatus.content[0].text, /accepted pause drifted to FreezerState=running/);
+    assert.match(degradedStatus.content[0].text, /No new Controller authorization is implied/);
+    assert.equal(frozenUnits.size, 0, "accepted-pause degradation moves every surviving unit toward thaw");
+    const [deadTarget, missingTarget] = degradedStatus.details.run.currentPause.targets;
+    const degradedWorkerState = JSON.parse(await readFile(statePath, "utf8"));
+    const deadWorker = degradedWorkerState.workers.find((worker: any) => worker.id === deadTarget.workerId && (worker.workerIncarnationId ?? worker.runId) === deadTarget.workerIncarnationId);
+    deadWorker.state = "stopped";
+    deadWorker.stoppedAt = Date.now();
+    deadWorker.stopReason = "RuntimeMaxSec elapsed while cgroup-frozen";
+    deadWorker.updatedAt = deadWorker.stoppedAt;
+    degradedWorkerState.workers = degradedWorkerState.workers.filter((worker: any) => worker.id !== missingTarget.workerId || (worker.workerIncarnationId ?? worker.runId) !== missingTarget.workerIncarnationId);
+    await writeFile(statePath, `${JSON.stringify(degradedWorkerState, null, 2)}\n`, "utf8");
+    stoppedUnits.add(deadTarget.unit);
+    stoppedUnits.add(missingTarget.unit);
+    const { TrustedLocalBossStore } = await import("../src/boss-trusted-local.ts");
+    const restartStore = new TrustedLocalBossStore(join(orchestratorDir, "boss-trusted-local.json"));
+    await restartStore.beginPauseControl({
+      bossRunId: degradedRunId,
+      managerSessionId: "controller-exact-target",
+      action: "resume",
+      targets: degradedStatus.details.run.currentPause.targets,
+      intentionallyUnfrozenManagerWorkerId: degradedStatus.details.run.currentPause.intentionallyUnfrozenManagerWorkerId,
+      timers: degradedStatus.details.run.currentPause.timers,
+    });
+    const restartedLifecycle = new Map<string, (...args: any[]) => any>();
+    const restartedTools = new Map<string, any>();
+    const restartedPi: any = {
+      ...pi,
+      on(name: string, handler: (...args: any[]) => any) { restartedLifecycle.set(name, handler); },
+      registerTool(tool: any) { restartedTools.set(tool.name, tool); },
+    };
+    const { default: restartedExtension } = await import(new URL(`../src/index.ts?boss-degraded-restart=${Date.now()}`, import.meta.url).href);
+    restartedExtension(restartedPi);
+    await restartedLifecycle.get("session_start")?.({}, ctx);
+    const degradedResumed = await restartedTools.get("boss").execute(
+      "boss-degraded-dead-target-restart-status",
+      { action: "status", bossRunId: degradedRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(degradedResumed.details.run.state, "active", "accepted degraded-resume evidence keeps conclusively settled targets operable across restart synchronization");
+    assert.equal(degradedResumed.details.run.currentPause, null);
+    assert.equal(degradedResumed.details.run.pauseTransitions.at(-1).phase, "accepted");
+    assert.equal(degradedResumed.details.run.pauseTransitions.at(-1).authorizedBySessionId, "controller-exact-target");
+    const degradedCancelled = await restartedTools.get("boss").execute(
+      "boss-degraded-missing-target-cancel",
+      { action: "cancel", bossRunId: degradedRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(degradedCancelled.details.run.cancellation.state, "succeeded", "an accepted degraded resume durably settles an exact missing target for terminal shutdown");
+
+    const liveRecovered = await restartedTools.get("boss").execute(
+      "boss-degraded-live-recovery-create",
+      { action: "create", goal: "Do not mask failures after a live degraded resume" },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    const liveRecoveredRunId = liveRecovered.details.run.bossRunId as string;
+    const liveRecoveredPaused = await restartedTools.get("boss").execute(
+      "boss-degraded-live-recovery-pause",
+      { action: "pause", bossRunId: liveRecoveredRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    frozenUnits.delete(liveRecoveredPaused.details.run.currentPause.targets[0].unit);
+    await restartedTools.get("boss").execute(
+      "boss-degraded-live-recovery-status",
+      { action: "status", bossRunId: liveRecoveredRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    const liveRecoveredResumed = await restartedTools.get("boss").execute(
+      "boss-degraded-live-recovery-resume",
+      { action: "resume", bossRunId: liveRecoveredRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.deepEqual(liveRecoveredResumed.details.run.pauseTransitions.at(-1).settledTargets, [], "live thawed targets are not durably classified as terminal settlements");
+    const laterFailedTarget = liveRecoveredResumed.details.run.pauseTransitions.at(-1).targets[0];
+    const laterFailedState = JSON.parse(await readFile(statePath, "utf8"));
+    const laterFailedWorker = laterFailedState.workers.find((worker: any) => worker.id === laterFailedTarget.workerId && (worker.workerIncarnationId ?? worker.runId) === laterFailedTarget.workerIncarnationId);
+    laterFailedWorker.state = "stopped";
+    laterFailedWorker.stoppedAt = Date.now();
+    laterFailedWorker.stopReason = "failed after the degraded resume completed";
+    laterFailedWorker.updatedAt = laterFailedWorker.stoppedAt;
+    await writeFile(statePath, `${JSON.stringify(laterFailedState, null, 2)}\n`, "utf8");
+    stoppedUnits.add(laterFailedTarget.unit);
+    const liveRecoveredFailed = await restartedTools.get("boss").execute(
+      "boss-degraded-live-recovery-later-failure",
+      { action: "status", bossRunId: liveRecoveredRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(liveRecoveredFailed.details.run.state, "failed", "a historical degraded resume must not suppress a later failure of a target that was live during recovery");
+    assert.equal(liveRecoveredFailed.details.run.assignments.find((assignment: any) => assignment.workerId === laterFailedTarget.workerId).state, "failed");
+
+    const decideDegradedMissingTarget = async (outcome: "approve" | "reject") => {
+      const created = await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-create`,
+        { action: "create", goal: `${outcome} after degraded missing target`, requirements: { worktree: "write" } },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      const runId = created.details.run.bossRunId as string;
+      const paused = await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-pause`,
+        { action: "pause", bossRunId: runId },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      frozenUnits.delete(paused.details.run.currentPause.targets[0].unit);
+      const degraded = await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-status`,
+        { action: "status", bossRunId: runId },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      const [dead, missing] = degraded.details.run.currentPause.targets;
+      const workerState = JSON.parse(await readFile(statePath, "utf8"));
+      const deadRecord = workerState.workers.find((worker: any) => worker.id === dead.workerId && (worker.workerIncarnationId ?? worker.runId) === dead.workerIncarnationId);
+      deadRecord.state = "stopped";
+      deadRecord.stoppedAt = Date.now();
+      deadRecord.stopReason = "RuntimeMaxSec elapsed while cgroup-frozen";
+      deadRecord.updatedAt = deadRecord.stoppedAt;
+      workerState.workers = workerState.workers.filter((worker: any) => worker.id !== missing.workerId || (worker.workerIncarnationId ?? worker.runId) !== missing.workerIncarnationId);
+      await writeFile(statePath, `${JSON.stringify(workerState, null, 2)}\n`, "utf8");
+      stoppedUnits.add(dead.unit);
+      stoppedUnits.add(missing.unit);
+      const resumed = await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-resume`,
+        { action: "resume", bossRunId: runId },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      assert.equal(resumed.details.run.currentPause, null);
+      const frozen = await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-freeze`,
+        { action: "freeze", bossRunId: runId, expectedAcceptanceRevision: 1, expectedDesignRevision: 1 },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      assert.equal(frozen.details.run.currentFreeze.freezeRevision, 1);
+      await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-proof`,
+        { action: "proof", bossRunId: runId },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-fresh-proof`,
+        { action: "proof", bossRunId: runId },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      const decided = await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-decision`,
+        { action: outcome, bossRunId: runId, note: `${outcome} exact frozen proof` },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      assert.equal(decided.details.run.state, outcome === "approve" ? "approved" : "rejected");
+      assert.equal(decided.details.run.resource.leaseState, "released", `${outcome} must complete terminal resource cleanup after an accepted degraded resume settles the missing target`);
+      assert.equal(decided.details.run.resource.existence, "verified", "the Controller-frozen candidate is preserved rather than ambiguously deleted");
+    };
+    await decideDegradedMissingTarget("approve");
+    await decideDegradedMissingTarget("reject");
 
     const reviewable = await tools.get("boss").execute(
       "boss-review-cleanup-retry-create",

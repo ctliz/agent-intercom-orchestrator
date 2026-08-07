@@ -354,6 +354,8 @@ export interface UnitStatus {
   execMainStatus?: number;
   /** Non-empty while systemd still has a queued job for the unit. */
   job?: string;
+  /** systemd cgroup freezer projection: running, freezing, frozen, or thawing. */
+  freezerState?: string;
   activeEnterTimestampMonotonic?: number;
   inactiveEnterTimestampMonotonic?: number;
   execMainStartTimestampMonotonic?: number;

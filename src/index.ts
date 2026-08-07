@@ -13,8 +13,9 @@ import { BOSS_CREATE_ACCESS_LEVELS, assertDirectInteractiveBossCommand, bossCrea
 import { formatBossCreateCapabilityReport, inspectBossCreateCapabilities, type BossCreateCapabilityReport } from "./boss-create-capabilities.ts";
 import { cleanupProvisionedBossResource, observeProvisionedBossResource, preserveProvisionedBossResource, provisionBossLinkedWorktree, rollbackProvisionedBossWorktree, type ProvisionedBossWorktree } from "./boss-resource.ts";
 import { formatBossReadinessReport, formatBossSetupReport, inspectBossSetup, inspectTrustedLocalBossReadiness } from "./boss-setup.ts";
+import { applyBossSystemdPausePlan, bossWorkerTimersSuspended, captureBossPausedTimers, recoverBossSystemdPauseTargets, resolveBossSystemdPausePlan, restoreBossWorkerTimers, suspendBossWorkerTimers, validatePersistedBossSystemdPauseTargets, verifyAcceptedBossSystemdPause, type BossSystemdPauseTarget } from "./boss-systemd-pause.ts";
 import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossSupervisionEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
-import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, type TrustedLocalBossResult } from "./boss-trusted-local.ts";
+import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, type TrustedLocalBossAssignment, type TrustedLocalBossPausedTimer, type TrustedLocalBossPauseSettledTarget, type TrustedLocalBossResult, type TrustedLocalBossRun } from "./boss-trusted-local.ts";
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
 import { addPiTools, buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy, SAFE_PI_BOSS_SUPERVISION_TOOLS } from "./permissions.ts";
 import { resolvePiRuntime } from "./pi-runtime.ts";
@@ -406,6 +407,7 @@ export function renewObservedWorkerLeases(
   managerId: string,
   config: OrchestratorConfig,
   now = Date.now(),
+  pauseProtectedWorkerKeys: ReadonlySet<string> = new Set(),
 ): LeaseHeartbeatResult {
   const observedLiveRuns = new Set(observedWorkers
     .filter((worker) => worker.managerSessionId === managerId && worker.owned && isLiveState(worker.state) && worker.stateReason !== "stop_in_progress")
@@ -416,6 +418,7 @@ export function renewObservedWorkerLeases(
   for (const worker of state.workers) {
     if (!observedLiveRuns.has(`${worker.id}\u0000${worker.runId}`)) continue;
     if (worker.managerSessionId !== managerId || !worker.owned || !isLiveState(worker.state) || worker.stateReason === "stop_in_progress") continue;
+    if (bossWorkerTimersSuspended(worker) || pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) continue;
     changed = initializeWorkerLifecycle(worker, config, now) || changed;
     const lastActivity = worker.lastWorkerActivityAt!;
     const idleDeadline = worker.idleDeadlineAt!;
@@ -449,6 +452,7 @@ export function recordIntercomWorkerActivity(
   sender: { id?: string; name?: string },
   config: OrchestratorConfig,
   now = Date.now(),
+  pauseProtectedWorkerKeys: ReadonlySet<string> = new Set(),
 ): WorkerRecordV3 | undefined {
   const worker = state.workers.find((candidate) => {
     if (candidate.managerSessionId !== managerId || !candidate.owned || !isLiveState(candidate.state) || candidate.stateReason === "stop_in_progress") return false;
@@ -458,8 +462,10 @@ export function recordIntercomWorkerActivity(
     return sender.id === expectedSenderId || (!sender.id && sender.name === expectedSenderId);
   });
   if (!worker) return undefined;
-  recordWorkerActivity(worker, config, now);
+  const pauseProtected = pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`);
+  if (!bossWorkerTimersSuspended(worker) && !pauseProtected) recordWorkerActivity(worker, config, now);
   worker.lastAuthenticatedIntercomActivityAt = now;
+  worker.updatedAt = now;
   return structuredClone(worker);
 }
 
@@ -594,7 +600,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     const sender = parseInboundActivitySender(payload);
     if (!ctx || !config || !sender) return;
     const now = Date.now();
-    void store.mutate((state) => recordIntercomWorkerActivity(state as WorkerStateFileV3, managerSessionId(ctx), sender, config, now))
+    void trustedLocalBossStore.pauseProtectedWorkerKeys()
+      .then((keys) => store.mutate((state) => recordIntercomWorkerActivity(state as WorkerStateFileV3, managerSessionId(ctx), sender, config, now, new Set(keys))))
       .then((worker) => { if (worker) return updateStatus(ctx); })
       .catch(() => undefined);
   });
@@ -944,14 +951,19 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   const cleanupExpired = async (execute: boolean, now = Date.now()): Promise<CleanupExecution> => {
     await recoverCleanupClaims();
     await reconcile();
+    const pauseProtectedWorkerKeys = new Set(await trustedLocalBossStore.pauseProtectedWorkerKeys());
     await store.mutateConditionally((state) => {
       let changed = false;
-      for (const worker of state.workers) changed = initializeWorkerLifecycle(worker, config, now) || changed;
+      for (const worker of state.workers) {
+        if (bossWorkerTimersSuspended(worker) || pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) continue;
+        changed = initializeWorkerLifecycle(worker, config, now) || changed;
+      }
       return { value: undefined, changed };
     });
     const migrated = await store.read();
     const claimedIds = new Set((migrated.runtimeCleanupClaims ?? []).map((claim) => claim.workerId));
     const liveCandidates = migrated.workers.flatMap((worker) => {
+      if (bossWorkerTimersSuspended(worker) || pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) return [];
       const reason = cleanupReason(worker, now);
       return reason ? [{ worker, reason, kind: "stop" as const }] : [];
     });
@@ -1079,9 +1091,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       return { renewed: [], checkpointRequested: [], changed: false, checkpointRequests: [] };
     }
     const observedWorkers = await reconcile(sessionId, false);
+    const pauseProtectedWorkerKeys = new Set(await trustedLocalBossStore.pauseProtectedWorkerKeys());
     const now = Date.now();
     const result = await store.mutateConditionally((state) => {
-      const value = renewObservedWorkerLeases(state, observedWorkers, sessionId, config, now);
+      const value = renewObservedWorkerLeases(state, observedWorkers, sessionId, config, now, pauseProtectedWorkerKeys);
       return { value, changed: value.changed };
     });
     publishStatus(ctx, observedWorkers);
@@ -1795,12 +1808,14 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       if (params.action === "renew") {
         const owner = managerSessionId(ctx);
         const now = Date.now();
+        const pauseProtectedWorkerKeys = new Set(await trustedLocalBossStore.pauseProtectedWorkerKeys());
         const workers = await store.mutate((state) => {
           const selected = extractWorkers(state, params.id);
           const renewed: WorkerRecord[] = [];
           for (const worker of selected) {
             if (!worker.owned || !isLiveState(worker.state) || worker.stateReason === "stop_in_progress") continue;
             if (worker.managerSessionId !== owner) throw new Error(`Worker ${worker.id} belongs to another manager session; adopt it before renewing`);
+            if (bossWorkerTimersSuspended(worker) || pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) continue;
             recordWorkerActivity(worker, config, now);
             renewed.push(structuredClone(worker));
           }
@@ -1959,6 +1974,179 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     });
   }
 
+  let bossPauseReconciliation: Promise<void> | undefined;
+  async function reconcileApplyingBossPauseControls(): Promise<void> {
+    if (bossPauseReconciliation) return bossPauseReconciliation;
+    const operation = (async () => {
+      const pending = await trustedLocalBossStore.applyingPauseControls();
+      for (const { run, transition } of pending) {
+        const targets: BossSystemdPauseTarget[] = transition.targets.map((target) => ({
+          role: target.role,
+          workerId: target.workerId,
+          workerIncarnationId: target.workerIncarnationId,
+          unit: target.unit,
+          expectedMainPid: target.mainPid,
+        }));
+        let operationError: unknown;
+        let settledTargets: TrustedLocalBossPauseSettledTarget[] = [];
+        try {
+          const snapshot = await store.read();
+          if (transition.action === "resume" && run.currentPauseDegradation) {
+            settledTargets = await recoverDegradedBossResume(run, targets, transition.timers, snapshot);
+          } else {
+            validatePersistedBossSystemdPauseTargets(run, snapshot.workers, targets);
+            if (transition.action === "pause") {
+              await suspendBossWorkerTimers(store, transition.timers, Date.now());
+              await applyBossSystemdPausePlan(runner, targets, "frozen");
+            } else {
+              await applyBossSystemdPausePlan(runner, targets, "running");
+              await restoreBossWorkerTimers(store, transition.timers, Date.now());
+            }
+          }
+        } catch (error) {
+          const recoveryFailures = await recoverBossSystemdPauseTargets(runner, targets, "running");
+          try { await restoreBossWorkerTimers(store, transition.timers, Date.now()); }
+          catch (restoreError) { recoveryFailures.push(`timers: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`); }
+          operationError = new Error(`Boss restart reconciliation could not complete ${transition.action}: ${error instanceof Error ? error.message : String(error)}${recoveryFailures.length ? `; recovery incomplete: ${recoveryFailures.join("; ")}` : "; affected units were thawed and timers restored"}`);
+        }
+        await trustedLocalBossStore.finishPauseControl(run.bossRunId, transition.actionId, operationError, settledTargets);
+      }
+      for (const run of await trustedLocalBossStore.acceptedPauseControls()) {
+        const pause = run.currentPause!;
+        try {
+          const snapshot = await store.read();
+          await verifyAcceptedBossSystemdPause(runner, run, snapshot.workers);
+        } catch (error) {
+          const targets: BossSystemdPauseTarget[] = pause.targets.map((target) => ({ ...target, expectedMainPid: target.mainPid }));
+          const recoveryFailures = await recoverBossSystemdPauseTargets(runner, targets, "running");
+          try { await restoreBossWorkerTimers(store, pause.timers, Date.now()); }
+          catch (restoreError) { recoveryFailures.push(`timers: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`); }
+          const detail = `Accepted Boss pause enforcement became unverifiable: ${error instanceof Error ? error.message : String(error)}${recoveryFailures.length ? `; safe-direction recovery incomplete: ${recoveryFailures.join("; ")}` : "; affected units were thawed and timers restored"}`;
+          await trustedLocalBossStore.recordPauseDegradation(run.bossRunId, pause.pauseRevision, pause.transitionRevision, detail);
+        }
+      }
+    })();
+    bossPauseReconciliation = operation;
+    try { await operation; }
+    finally { if (bossPauseReconciliation === operation) bossPauseReconciliation = undefined; }
+  }
+
+  async function recoverDegradedBossResume(run: TrustedLocalBossRun, targets: BossSystemdPauseTarget[], timers: TrustedLocalBossPausedTimer[], snapshot: WorkerStateFile): Promise<TrustedLocalBossPauseSettledTarget[]> {
+    const liveTargets: BossSystemdPauseTarget[] = [];
+    const restorableTimers: TrustedLocalBossPausedTimer[] = [];
+    const settledTargets: TrustedLocalBossPauseSettledTarget[] = [];
+    for (const target of targets) {
+      const exactWorker = snapshot.workers.find((worker) => worker.id === target.workerId && workerIncarnation(worker) === target.workerIncarnationId);
+      if (exactWorker) {
+        if (!exactWorker.owned || exactWorker.bossRunId !== run.bossRunId || exactWorker.managerSessionId !== run.managerSessionId || exactWorker.backend !== "systemd" || exactWorker.unit !== target.unit) {
+          throw new Error(`Boss ${target.role} degraded resume found a conflicting exact WorkerStore identity`);
+        }
+        restorableTimers.push(...timers.filter((timer) => timer.workerId === target.workerId && timer.workerIncarnationId === target.workerIncarnationId));
+        if (isLiveState(exactWorker.state)) {
+          if (exactWorker.mainPid !== target.expectedMainPid) throw new Error(`Boss ${target.role} degraded resume main PID changed`);
+          liveTargets.push(target);
+          continue;
+        }
+      }
+      const status = await getUnitStatus(runner, target.unit);
+      if (status.verified === false || status.job || status.mainPid || (status.exists && status.activeState !== "inactive" && status.activeState !== "failed")) {
+        throw new Error(`Boss ${target.role} degraded resume cannot prove terminal unit ${target.unit} is inactive`);
+      }
+      settledTargets.push({ workerId: target.workerId, workerIncarnationId: target.workerIncarnationId, outcome: "terminal_inactive" });
+    }
+    await applyBossSystemdPausePlan(runner, liveTargets, "running");
+    await restoreBossWorkerTimers(store, restorableTimers, Date.now());
+    return settledTargets;
+  }
+
+  async function executeBossSystemdPauseControl(run: TrustedLocalBossRun, action: "pause" | "resume", ownerSessionId: string): Promise<TrustedLocalBossResult> {
+    const snapshot = await store.read();
+    const degradedResume = action === "resume" && Boolean(run.currentPauseDegradation);
+    const plan = degradedResume ? null : resolveBossSystemdPausePlan(run, snapshot.workers);
+    const targets: BossSystemdPauseTarget[] = degradedResume
+      ? run.currentPause!.targets.map((target) => ({ ...target, expectedMainPid: target.mainPid }))
+      : plan!.targets.map((target) => {
+        if (!target.expectedMainPid) throw new Error(`Boss ${target.role} exact main PID is unavailable for durable pause control`);
+        return target;
+      });
+    const persistedTargets = targets.map((target) => ({ role: target.role, workerId: target.workerId, workerIncarnationId: target.workerIncarnationId, unit: target.unit, mainPid: target.expectedMainPid! }));
+    const timerCaptureAt = Date.now();
+    const timers = action === "pause"
+      ? captureBossPausedTimers(snapshot, targets, timerCaptureAt, config.checkpointRetryMinutes * 60_000)
+      : run.currentPause?.timers;
+    if (!timers) throw new Error("Trusted-local Boss resume requires exact suspended timer budgets");
+    if (action === "resume" && JSON.stringify(persistedTargets) !== JSON.stringify(run.currentPause?.targets)) {
+      throw new Error("Trusted-local Boss resume target identity changed while paused");
+    }
+    const transition = await trustedLocalBossStore.beginPauseControl({
+      bossRunId: run.bossRunId,
+      managerSessionId: ownerSessionId,
+      action,
+      targets: persistedTargets,
+      intentionallyUnfrozenManagerWorkerId: degradedResume ? run.currentPause!.intentionallyUnfrozenManagerWorkerId : plan!.intentionallyUnfrozenManager?.workerId ?? null,
+      timers,
+    });
+    let operationError: unknown;
+    if (action === "pause") {
+      let timersSuspended = false;
+      try {
+        await suspendBossWorkerTimers(store, timers, Date.now(), { expectedCurrentAt: timerCaptureAt });
+        timersSuspended = true;
+        await applyBossSystemdPausePlan(runner, targets, "frozen");
+      } catch (error) {
+        operationError = error;
+        if (timersSuspended) {
+          try { await restoreBossWorkerTimers(store, timers, Date.now()); }
+          catch (restoreError) { operationError = new Error(`Boss pause failed and timer restoration was incomplete: ${error instanceof Error ? error.message : String(error)}; ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`); }
+        }
+      }
+    } else {
+      let thawed = false;
+      let compensationIncomplete = false;
+      let settledTargets: TrustedLocalBossPauseSettledTarget[] = [];
+      try {
+        if (degradedResume) {
+          settledTargets = await recoverDegradedBossResume(run, targets, timers, snapshot);
+        } else {
+          await applyBossSystemdPausePlan(runner, targets, "running");
+          thawed = true;
+          await restoreBossWorkerTimers(store, timers, Date.now());
+        }
+      } catch (error) {
+        operationError = error;
+        if (thawed) {
+          try { await applyBossSystemdPausePlan(runner, targets, "frozen"); }
+          catch (freezeError) {
+            compensationIncomplete = true;
+            operationError = new Error(`Boss resume failed and cgroup re-freeze was incomplete: ${error instanceof Error ? error.message : String(error)}; ${freezeError instanceof Error ? freezeError.message : String(freezeError)}`);
+          }
+        }
+      }
+      const finished = await trustedLocalBossStore.finishPauseControl(run.bossRunId, transition.actionId, operationError, settledTargets);
+      if (compensationIncomplete && finished.run?.currentPause) {
+        const pause = finished.run.currentPause;
+        const degraded = await trustedLocalBossStore.recordPauseDegradation(finished.run.bossRunId, pause.pauseRevision, pause.transitionRevision, operationError instanceof Error ? operationError.message : String(operationError));
+        return { ...finished, run: degraded };
+      }
+      return finished;
+    }
+    return trustedLocalBossStore.finishPauseControl(run.bossRunId, transition.actionId, operationError);
+  }
+
+  async function proveAcceptedResumeSettledMissingAssignment(run: NonNullable<TrustedLocalBossResult["run"]>, assignment: TrustedLocalBossAssignment): Promise<boolean> {
+    if (!assignment.workerId || !assignment.workerIncarnationId || run.currentPause) return false;
+    const acceptedResume = run.pauseTransitions.at(-1)?.action === "resume" && run.pauseTransitions.at(-1)?.phase === "accepted"
+      ? run.pauseTransitions.at(-1)!
+      : undefined;
+    if (!acceptedResume) return false;
+    const settled = acceptedResume.settledTargets.some((candidate) => candidate.workerId === assignment.workerId && candidate.workerIncarnationId === assignment.workerIncarnationId && candidate.outcome === "terminal_inactive");
+    if (!settled) return false;
+    const target = acceptedResume.targets.find((candidate) => candidate.workerId === assignment.workerId && candidate.workerIncarnationId === assignment.workerIncarnationId);
+    if (!target) return false;
+    const status = await getUnitStatus(runner, target.unit);
+    return status.verified !== false && !status.job && !status.mainPid && (!status.exists || status.activeState === "inactive" || status.activeState === "failed");
+  }
+
   async function stopBossAssignedWorkers(run: NonNullable<TrustedLocalBossResult["run"]>): Promise<unknown | undefined> {
     try {
       const snapshot = await store.read();
@@ -1968,9 +2156,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           const worker = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && workerIncarnation(candidate) === assignment.workerIncarnationId && candidate.bossRunId === run.bossRunId && candidate.managerSessionId === run.managerSessionId);
           if (!worker) {
             const conflicting = snapshot.workers.find((candidate) => candidate.id === assignment.workerId && candidate.bossRunId === run.bossRunId && candidate.managerSessionId === run.managerSessionId);
-            throw new Error(conflicting
-              ? `Boss ${assignment.role} worker identity changed before terminal cleanup`
-              : `Exact assigned Boss ${assignment.role} worker is unavailable; process termination is unverified`);
+            if (conflicting) throw new Error(`Boss ${assignment.role} worker identity changed before terminal cleanup`);
+            if (!await proveAcceptedResumeSettledMissingAssignment(run, assignment)) {
+              throw new Error(`Exact assigned Boss ${assignment.role} worker is unavailable; process termination is unverified`);
+            }
+            continue;
           }
           if (isLiveState(worker.state)) await stopWorker(worker, { expectedManagerSessionId: run.managerSessionId, reason: "boss-run-terminal" });
         } catch (error) {
@@ -2012,6 +2202,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       const report = await trustedLocalBossReadiness(ctx);
       return { title: "Orc Boss readiness", message: formatBossReadinessReport(report) };
     }
+    await reconcileApplyingBossPauseControls();
     await synchronizeTrustedLocalBossWorkers();
     let capabilityReport: BossCreateCapabilityReport | undefined;
     let provisionedWorktree: ProvisionedBossWorktree | undefined;
@@ -2081,12 +2272,31 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       result = request.action === "freeze"
         ? await trustedLocalBossStore.authorizeFreeze({ bossRunId: status.run.bossRunId, managerSessionId: ownerSessionId, expectedAcceptanceRevision: request.expectedAcceptanceRevision, expectedDesignRevision: request.expectedDesignRevision, fingerprint })
         : await trustedLocalBossStore.authorizeUnfreeze({ bossRunId: status.run.bossRunId, managerSessionId: ownerSessionId, expectedFreezeRevision: request.expectedFreezeRevision, expectedFingerprintSha256: request.expectedFingerprintSha256, fingerprint });
-    } else if (request.action === "proof" || request.action === "approve" || request.action === "reject") {
+    } else if (request.action === "pause" || request.action === "resume") {
       const ownerSessionId = managerSessionId(ctx);
       const status = await trustedLocalBossStore.execute({ action: "status", bossRunId: request.bossRunId }, ownerSessionId);
+      if (!status.run) throw new Error("No matching trusted-local Boss run exists.");
+      result = await executeBossSystemdPauseControl(status.run, request.action, ownerSessionId);
+    } else if (request.action === "proof" || request.action === "approve" || request.action === "reject") {
+      const ownerSessionId = managerSessionId(ctx);
+      let status = await trustedLocalBossStore.execute({ action: "status", bossRunId: request.bossRunId }, ownerSessionId);
+      if ((request.action === "approve" || request.action === "reject") && status.run?.currentPause) {
+        const resumed = await executeBossSystemdPauseControl(status.run, "resume", ownerSessionId);
+        if (resumed.pauseTransition?.phase !== "accepted" || !resumed.run) throw new Error(`Trusted-local Boss terminal ${request.action} requires a verified thaw; ${resumed.pauseTransition?.reason ?? "resume failed"}`);
+        status = { ...resumed, run: resumed.run };
+      }
       if (!status.run?.resource || !status.run.currentFreeze) throw new Error(`Trusted-local Boss ${request.action} requires a current Controller-authorized freeze on a canonical resource.`);
       const fingerprint = await observeBossCandidateFingerprint(status.run.resource);
       result = await trustedLocalBossStore.execute(request, ownerSessionId, fingerprint);
+    } else if (request.action === "cancel") {
+      const ownerSessionId = managerSessionId(ctx);
+      const status = await trustedLocalBossStore.execute({ action: "status", bossRunId: request.bossRunId }, ownerSessionId);
+      if (!status.run) throw new Error("No matching trusted-local Boss run exists.");
+      if (status.run.currentPause) {
+        const resumed = await executeBossSystemdPauseControl(status.run, "resume", ownerSessionId);
+        if (resumed.pauseTransition?.phase !== "accepted") throw new Error(`Trusted-local Boss cancellation requires a verified thaw; ${resumed.pauseTransition?.reason ?? "resume failed"}`);
+      }
+      result = await trustedLocalBossStore.execute(request, ownerSessionId);
     } else {
       result = await trustedLocalBossStore.execute(request, managerSessionId(ctx));
     }
@@ -2184,6 +2394,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     }
 
     if ((request.action === "pause" || request.action === "resume") && result.run) {
+      if (result.pauseTransition?.phase !== "accepted") return result;
       const kind = request.action === "pause" ? "pause-notice" : "resume-notice";
       const snapshot = await store.read();
       for (const assignment of result.run.assignments.filter((candidate) => candidate.state === "assigned" && candidate.workerId && candidate.workerIncarnationId)) {
@@ -2193,7 +2404,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           if (!worker || !isLiveState(worker.state)) throw new Error(`Exact live ${assignment.role} worker is unavailable`);
           pi.events.emit(INTERCOM_LIFECYCLE_SEND_EVENT, {
             to: worker.intercomTarget ?? worker.id,
-            message: `${TRUSTED_LOCAL_BOSS_WARNING}\nBoss run ${result.run.bossRunId} ${request.action} requested. ${request.note ?? "Apply this as a best-effort local workflow control and report your state."}`,
+            message: `${TRUSTED_LOCAL_BOSS_WARNING}\nBoss run ${result.run.bossRunId} ${request.action} completed with verified systemd cgroup control for managed non-Manager units. ${request.note ?? "Report any workflow-level consequence; this notice is not the enforcement mechanism."}`,
           });
         } catch (error) {
           deliveryError = error;
@@ -2585,6 +2796,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       });
     }
     await reconcile();
+    await reconcileApplyingBossPauseControls();
     await synchronizeTrustedLocalBossWorkers();
     if (config.cleanupExpiredOnStart && process.env.AGENT_INTERCOM_SKIP_STARTUP_CLEANUP !== "1") await cleanupExpired(true);
     clearInterval(heartbeat);
@@ -2594,6 +2806,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       heartbeatRunning = true;
       void runLifecycleHeartbeat(ctx).then(async (result) => {
         if (currentCtx !== ctx) return;
+        await reconcileApplyingBossPauseControls();
         await synchronizeTrustedLocalBossWorkers();
         for (const request of result.checkpointRequests) {
           pi.events.emit(INTERCOM_LIFECYCLE_SEND_EVENT, {

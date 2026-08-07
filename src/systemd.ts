@@ -187,7 +187,7 @@ export async function getUnitStatus(runner: CommandRunner, unit: string): Promis
       "show",
       unit,
       "--no-pager",
-      "--property=LoadState,ActiveState,SubState,MainPID,Result,ExecMainStatus,Job,ActiveEnterTimestampMonotonic,InactiveEnterTimestampMonotonic,ExecMainStartTimestampMonotonic",
+      "--property=LoadState,ActiveState,SubState,MainPID,Result,ExecMainStatus,Job,FreezerState,ActiveEnterTimestampMonotonic,InactiveEnterTimestampMonotonic,ExecMainStartTimestampMonotonic",
     ],
     { timeout: 5000 },
   );
@@ -217,6 +217,7 @@ export async function getUnitStatus(runner: CommandRunner, unit: string): Promis
     ...(values.Result ? { result: values.Result } : {}),
     ...(Number.isInteger(execMainStatus) ? { execMainStatus } : {}),
     ...(values.Job ? { job: values.Job } : {}),
+    ...(values.FreezerState ? { freezerState: values.FreezerState } : {}),
     ...(numeric(values.ActiveEnterTimestampMonotonic) ? { activeEnterTimestampMonotonic: numeric(values.ActiveEnterTimestampMonotonic) } : {}),
     ...(numeric(values.InactiveEnterTimestampMonotonic) ? { inactiveEnterTimestampMonotonic: numeric(values.InactiveEnterTimestampMonotonic) } : {}),
     ...(numeric(values.ExecMainStartTimestampMonotonic) ? { execMainStartTimestampMonotonic: numeric(values.ExecMainStartTimestampMonotonic) } : {}),

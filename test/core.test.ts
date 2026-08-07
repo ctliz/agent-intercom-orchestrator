@@ -293,6 +293,34 @@ test("heartbeat renewal is activity-gated, capped at the idle deadline, and requ
   assert.deepEqual(expired.renewed, []);
 });
 
+test("heartbeat leaves exact Boss pause-fenced lifecycle budgets untouched", () => {
+  const worker = createSystemdRecord({
+    id: "paused-worker", runId: "paused-run", harness: "codex", role: "builder", task: "test", cwd: "/tmp",
+    profile: "codex-safe", unit: "paused.service", managerSessionId: "session-a", config: DEFAULT_CONFIG, now: 1_000,
+  });
+  worker.state = "running";
+  const suspended = 8_640_000_000_000_000 - 1;
+  worker.leaseExpiresAt = suspended;
+  worker.idleDeadlineAt = suspended;
+  worker.checkpointDeadlineAt = suspended;
+  worker.checkpointLastAttemptAt = suspended;
+  const state = { version: 1 as const, workers: [worker] };
+  const result = renewObservedWorkerLeases(
+    state,
+    [structuredClone(worker)],
+    "session-a",
+    DEFAULT_CONFIG,
+    9_000_000,
+    new Set(),
+  );
+  assert.equal(result.changed, false);
+  assert.deepEqual(result.checkpointRequested, []);
+  assert.equal(worker.leaseExpiresAt, suspended);
+  assert.equal(worker.idleDeadlineAt, suspended);
+  assert.equal(worker.checkpointDeadlineAt, suspended);
+  assert.equal(worker.checkpointLastAttemptAt, suspended);
+});
+
 test("manager ownership rebind changes exact context and advances the binding epoch", () => {
   const worker = createSystemdRecord({
     id: "owner-worker", runId: "owner-run", harness: "codex", role: "builder", task: "test", cwd: "/tmp",
@@ -324,6 +352,46 @@ test("manager-received worker Intercom activity resets the idle budget but manag
   assert.equal(updated?.lastAuthenticatedIntercomActivityAt, 4_000);
   assert.equal(updated?.idleDeadlineAt, workerIdleDeadline(DEFAULT_CONFIG, 4_000));
   assert.equal(updated?.checkpointRequestedAt, undefined);
+});
+
+test("pause-protected inbound Intercom activity records communication without clobbering lifecycle fences", () => {
+  const worker = createSystemdRecord({
+    id: "paused-worker", runId: "paused-run", harness: "pi", role: "worker", task: "test", cwd: "/tmp", profile: "pi-peer",
+    unit: "paused-worker.service", managerSessionId: "manager-a", config: DEFAULT_CONFIG, now: 1_000,
+  }) as WorkerRecordV3;
+  worker.state = "ready";
+  worker.workerIncarnationId = "paused-incarnation";
+  worker.checkpointRequestedAt = 1_500;
+  worker.checkpointLastAttemptAt = 1_750;
+  worker.checkpointAttemptCount = 2;
+  const lifecycleBefore = {
+    lastWorkerActivityAt: worker.lastWorkerActivityAt,
+    idleDeadlineAt: worker.idleDeadlineAt,
+    checkpointDeadlineAt: worker.checkpointDeadlineAt,
+    leaseExpiresAt: worker.leaseExpiresAt,
+    checkpointRequestedAt: worker.checkpointRequestedAt,
+    checkpointLastAttemptAt: worker.checkpointLastAttemptAt,
+    checkpointAttemptCount: worker.checkpointAttemptCount,
+  };
+  const state = { version: 3 as const, generation: 0, workers: [worker], workerGenerations: [{ workerId: worker.id, generation: worker.workerGeneration! }] };
+  const updated = recordIntercomWorkerActivity(
+    state,
+    "manager-a",
+    { id: worker.id },
+    DEFAULT_CONFIG,
+    4_000,
+    new Set([`${worker.id}\0${worker.workerIncarnationId}`]),
+  );
+  assert.equal(updated?.lastAuthenticatedIntercomActivityAt, 4_000);
+  assert.deepEqual({
+    lastWorkerActivityAt: worker.lastWorkerActivityAt,
+    idleDeadlineAt: worker.idleDeadlineAt,
+    checkpointDeadlineAt: worker.checkpointDeadlineAt,
+    leaseExpiresAt: worker.leaseExpiresAt,
+    checkpointRequestedAt: worker.checkpointRequestedAt,
+    checkpointLastAttemptAt: worker.checkpointLastAttemptAt,
+    checkpointAttemptCount: worker.checkpointAttemptCount,
+  }, lifecycleBefore);
 });
 
 test("legacy live records receive a complete idle window during lifecycle migration", () => {
