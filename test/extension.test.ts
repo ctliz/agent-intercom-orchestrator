@@ -369,6 +369,28 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     assert.match(degradedStatus.content[0].text, /accepted pause drifted to FreezerState=running/);
     assert.match(degradedStatus.content[0].text, /No new Controller authorization is implied/);
     assert.equal(frozenUnits.size, 0, "accepted-pause degradation moves every surviving unit toward thaw");
+    const [deadTarget, missingTarget] = degradedStatus.details.run.currentPause.targets;
+    const degradedWorkerState = JSON.parse(await readFile(statePath, "utf8"));
+    const deadWorker = degradedWorkerState.workers.find((worker: any) => worker.id === deadTarget.workerId && (worker.workerIncarnationId ?? worker.runId) === deadTarget.workerIncarnationId);
+    deadWorker.state = "stopped";
+    deadWorker.stoppedAt = Date.now();
+    deadWorker.stopReason = "RuntimeMaxSec elapsed while cgroup-frozen";
+    deadWorker.updatedAt = deadWorker.stoppedAt;
+    degradedWorkerState.workers = degradedWorkerState.workers.filter((worker: any) => worker.id !== missingTarget.workerId || (worker.workerIncarnationId ?? worker.runId) !== missingTarget.workerIncarnationId);
+    await writeFile(statePath, `${JSON.stringify(degradedWorkerState, null, 2)}\n`, "utf8");
+    stoppedUnits.add(deadTarget.unit);
+    stoppedUnits.add(missingTarget.unit);
+    const degradedResumed = await tools.get("boss").execute(
+      "boss-degraded-dead-target-resume",
+      { action: "resume", bossRunId: degradedRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(degradedResumed.details.run.state, "active");
+    assert.equal(degradedResumed.details.run.currentPause, null);
+    assert.equal(degradedResumed.details.run.pauseTransitions.at(-1).phase, "accepted");
+    assert.equal(degradedResumed.details.run.pauseTransitions.at(-1).authorizedBySessionId, "controller-exact-target");
 
     const reviewable = await tools.get("boss").execute(
       "boss-review-cleanup-retry-create",

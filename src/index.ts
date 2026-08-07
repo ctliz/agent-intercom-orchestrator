@@ -15,7 +15,7 @@ import { cleanupProvisionedBossResource, observeProvisionedBossResource, preserv
 import { formatBossReadinessReport, formatBossSetupReport, inspectBossSetup, inspectTrustedLocalBossReadiness } from "./boss-setup.ts";
 import { applyBossSystemdPausePlan, captureBossPausedTimers, recoverBossSystemdPauseTargets, resolveBossSystemdPausePlan, restoreBossWorkerTimers, suspendBossWorkerTimers, validatePersistedBossSystemdPauseTargets, verifyAcceptedBossSystemdPause, type BossSystemdPauseTarget } from "./boss-systemd-pause.ts";
 import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossSupervisionEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
-import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, type TrustedLocalBossResult, type TrustedLocalBossRun } from "./boss-trusted-local.ts";
+import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, type TrustedLocalBossPausedTimer, type TrustedLocalBossResult, type TrustedLocalBossRun } from "./boss-trusted-local.ts";
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
 import { addPiTools, buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy, SAFE_PI_BOSS_SUPERVISION_TOOLS } from "./permissions.ts";
 import { resolvePiRuntime } from "./pi-runtime.ts";
@@ -1986,6 +1986,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           if (transition.action === "pause") {
             await suspendBossWorkerTimers(store, transition.timers, Date.now());
             await applyBossSystemdPausePlan(runner, targets, "frozen");
+          } else if (run.currentPauseDegradation) {
+            await recoverDegradedBossResume(run, targets, transition.timers, snapshot);
           } else {
             await applyBossSystemdPausePlan(runner, targets, "running");
             await restoreBossWorkerTimers(store, transition.timers, Date.now());
@@ -2018,13 +2020,41 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     finally { if (bossPauseReconciliation === operation) bossPauseReconciliation = undefined; }
   }
 
+  async function recoverDegradedBossResume(run: TrustedLocalBossRun, targets: BossSystemdPauseTarget[], timers: TrustedLocalBossPausedTimer[], snapshot: WorkerStateFile): Promise<void> {
+    const liveTargets: BossSystemdPauseTarget[] = [];
+    const restorableTimers: TrustedLocalBossPausedTimer[] = [];
+    for (const target of targets) {
+      const exactWorker = snapshot.workers.find((worker) => worker.id === target.workerId && workerIncarnation(worker) === target.workerIncarnationId);
+      if (exactWorker) {
+        if (!exactWorker.owned || exactWorker.bossRunId !== run.bossRunId || exactWorker.managerSessionId !== run.managerSessionId || exactWorker.backend !== "systemd" || exactWorker.unit !== target.unit) {
+          throw new Error(`Boss ${target.role} degraded resume found a conflicting exact WorkerStore identity`);
+        }
+        restorableTimers.push(...timers.filter((timer) => timer.workerId === target.workerId && timer.workerIncarnationId === target.workerIncarnationId));
+        if (isLiveState(exactWorker.state)) {
+          if (exactWorker.mainPid !== target.expectedMainPid) throw new Error(`Boss ${target.role} degraded resume main PID changed`);
+          liveTargets.push(target);
+          continue;
+        }
+      }
+      const status = await getUnitStatus(runner, target.unit);
+      if (status.verified === false || status.job || status.mainPid || (status.exists && status.activeState !== "inactive" && status.activeState !== "failed")) {
+        throw new Error(`Boss ${target.role} degraded resume cannot prove terminal unit ${target.unit} is inactive`);
+      }
+    }
+    await applyBossSystemdPausePlan(runner, liveTargets, "running");
+    await restoreBossWorkerTimers(store, restorableTimers, Date.now());
+  }
+
   async function executeBossSystemdPauseControl(run: TrustedLocalBossRun, action: "pause" | "resume", ownerSessionId: string): Promise<TrustedLocalBossResult> {
     const snapshot = await store.read();
-    const plan = resolveBossSystemdPausePlan(run, snapshot.workers);
-    const targets: BossSystemdPauseTarget[] = plan.targets.map((target) => {
-      if (!target.expectedMainPid) throw new Error(`Boss ${target.role} exact main PID is unavailable for durable pause control`);
-      return target;
-    });
+    const degradedResume = action === "resume" && Boolean(run.currentPauseDegradation);
+    const plan = degradedResume ? null : resolveBossSystemdPausePlan(run, snapshot.workers);
+    const targets: BossSystemdPauseTarget[] = degradedResume
+      ? run.currentPause!.targets.map((target) => ({ ...target, expectedMainPid: target.mainPid }))
+      : plan!.targets.map((target) => {
+        if (!target.expectedMainPid) throw new Error(`Boss ${target.role} exact main PID is unavailable for durable pause control`);
+        return target;
+      });
     const persistedTargets = targets.map((target) => ({ role: target.role, workerId: target.workerId, workerIncarnationId: target.workerIncarnationId, unit: target.unit, mainPid: target.expectedMainPid! }));
     const timers = action === "pause"
       ? captureBossPausedTimers(snapshot, targets, Date.now(), config.checkpointRetryMinutes * 60_000)
@@ -2038,7 +2068,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       managerSessionId: ownerSessionId,
       action,
       targets: persistedTargets,
-      intentionallyUnfrozenManagerWorkerId: plan.intentionallyUnfrozenManager?.workerId ?? null,
+      intentionallyUnfrozenManagerWorkerId: degradedResume ? run.currentPause!.intentionallyUnfrozenManagerWorkerId : plan!.intentionallyUnfrozenManager?.workerId ?? null,
       timers,
     });
     let operationError: unknown;
@@ -2058,9 +2088,12 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     } else {
       let thawed = false;
       try {
-        await applyBossSystemdPausePlan(runner, targets, "running");
+        if (degradedResume) await recoverDegradedBossResume(run, targets, timers, snapshot);
+        else {
+          await applyBossSystemdPausePlan(runner, targets, "running");
+          await restoreBossWorkerTimers(store, timers, Date.now());
+        }
         thawed = true;
-        await restoreBossWorkerTimers(store, timers, Date.now());
       } catch (error) {
         operationError = error;
         if (thawed) {

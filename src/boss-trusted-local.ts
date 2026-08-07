@@ -1093,6 +1093,7 @@ export class TrustedLocalBossStore {
           run.state = "paused";
         } else {
           run.currentPause = null;
+          run.currentPauseDegradation = null;
           run.state = "active";
         }
       }
@@ -1232,6 +1233,9 @@ export class TrustedLocalBossStore {
     return this.mutate((state, timestamp) => {
       let changed = false;
       for (const run of state.runs) {
+        const applyingPause = run.pauseTransitions.at(-1)?.phase === "applying" ? run.pauseTransitions.at(-1)! : null;
+        const pauseProtectedKeys = new Set([...(run.currentPause?.targets ?? []), ...(applyingPause?.targets ?? [])]
+          .map((target) => `${target.workerId}\0${target.workerIncarnationId}`));
         for (const assignment of run.assignments.filter((candidate) => candidate.state === "assigned" && candidate.workerId && candidate.workerIncarnationId)) {
           const worker = workers.find((candidate) => candidate.id === assignment.workerId && workerIncarnation(candidate) === assignment.workerIncarnationId && candidate.owned && candidate.bossRunId === run.bossRunId && candidate.managerSessionId === run.managerSessionId);
           const workerState: WorkerState = worker?.state ?? "lost";
@@ -1250,7 +1254,8 @@ export class TrustedLocalBossStore {
             run.updatedAt = timestamp;
             changed = true;
           }
-          if (!TERMINAL_RUN_STATES.has(run.state) && (workerState === "failed" || workerState === "lost" || workerState === "stopped")) {
+          const pauseProtected = pauseProtectedKeys.has(`${assignment.workerId}\0${assignment.workerIncarnationId}`);
+          if (!pauseProtected && !TERMINAL_RUN_STATES.has(run.state) && (workerState === "failed" || workerState === "lost" || workerState === "stopped")) {
             assignment.state = "failed";
             assignment.lastError = (detail ?? `${assignment.role} worker entered ${workerState}`).slice(0, 4_096);
             assignment.updatedAt = timestamp;
