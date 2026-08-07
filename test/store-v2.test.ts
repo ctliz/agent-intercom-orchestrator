@@ -9,11 +9,19 @@ import {
   WorkerStoreCorruptError,
   WorkerStoreMigrationPendingError,
   WorkerStorePoisonedError,
+  WorkerStoreUnsupportedFeatureError,
   WorkerStoreUnsupportedVersionError,
   WorkerStoreValidationError,
 } from "../src/store.ts";
-import type { LegacyWorkerState, WorkerRecord, WorkerStateFileV2 } from "../src/types.ts";
+import type { LegacyWorkerState, WorkerRecord, WorkerRecordV2, WorkerRecordV3, WorkerStateFileV3 } from "../src/types.ts";
 import { acquireKernelFileLock } from "../src/file-lock.ts";
+
+type AssertTrue<T extends true> = T;
+type AssertFalse<T extends false> = T;
+type V2HasAuthenticatedActivity = "lastAuthenticatedIntercomActivityAt" extends keyof WorkerRecordV2 ? true : false;
+type V3HasAuthenticatedActivity = "lastAuthenticatedIntercomActivityAt" extends keyof WorkerRecordV3 ? true : false;
+type _V2EvidenceBoundary = AssertFalse<V2HasAuthenticatedActivity>;
+type _V3EvidenceBoundary = AssertTrue<V3HasAuthenticatedActivity>;
 
 function legacyWorker(id: string, state: LegacyWorkerState, runId = `run-${id}`): Record<string, unknown> {
   return {
@@ -75,14 +83,15 @@ test("durable stop intent round-trips as a late-start fence", async () => {
   }
 });
 
-test("WorkerStore v1 migration maps every state, identity, owner, and audit field losslessly", async () => {
+test("WorkerStore v1 migration maps every state, identity, owner, and audit field while leaving activity evidence undefined", async () => {
   const root = await mkdtemp(join(tmpdir(), "worker-store-v2-mapping-"));
   const path = join(root, "workers.json");
   const states: LegacyWorkerState[] = [
     "provisioning", "running", "idle", "needs_attention", "completed", "failed", "stopping", "stopped", "lost",
   ];
   try {
-    await writeFile(path, JSON.stringify({ version: 1, workers: states.map((state) => legacyWorker(state, state)) }));
+    const workers = states.map((state) => legacyWorker(state, state));
+    await writeFile(path, JSON.stringify({ version: 1, workers }));
     const store = new WorkerStore(path, { now: () => 10_000 });
     const migrated = await store.read();
     const expected = new Map<LegacyWorkerState, WorkerRecord["state"]>([
@@ -96,7 +105,7 @@ test("WorkerStore v1 migration maps every state, identity, owner, and audit fiel
       ["stopped", "stopped"],
       ["lost", "lost"],
     ]);
-    assert.equal(migrated.version, 2);
+    assert.equal(migrated.version, 3);
     assert.equal(migrated.generation, 1);
     for (const worker of migrated.workers) {
       const original = worker.id as LegacyWorkerState;
@@ -122,14 +131,100 @@ test("WorkerStore v1 migration maps every state, identity, owner, and audit fiel
     assert.equal(migrated.workers.find((worker) => worker.id === "completed")?.migrationAudit?.originalOutcome.stopReason, "one-shot-complete");
     assert.equal(migrated.workers.find((worker) => worker.id === "stopping")?.migrationAudit?.dispatchDenied, true);
 
-    // A read is non-mutating; the named migration makes the v2 rename durable.
+    // A read is non-mutating; the named migration makes the v3 rename durable.
     assert.equal(JSON.parse(await readFile(path, "utf8")).version, 1);
     await store.migrate();
     const raw = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(raw.version, 2);
+    assert.equal(raw.version, 3);
     assert.equal(raw.workers[0].runId, undefined);
     assert.equal(raw.workers[0].managerSessionId, undefined);
     assert.equal(raw.workers[0].workerIncarnationId, "run-provisioning");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("WorkerStore v2 migration preserves canonical state while leaving activity evidence undefined", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-v2-migration-"));
+  const path = join(root, "workers.json");
+  const source = {
+    version: 2,
+    generation: 7,
+    workers: [{
+      id: "legacy-v2",
+      workerIncarnationId: "incarnation-v2",
+      workerGeneration: 4,
+      harness: "codex",
+      backend: "systemd",
+      role: "builder",
+      task: "preserve this task",
+      cwd: "/tmp",
+      state: "working",
+      owned: true,
+      managerOwner: { context: "pi", principalId: "manager", sessionId: "manager", bindingEpoch: 2 },
+      createdAt: 10,
+      updatedAt: 20,
+      leaseExpiresAt: 30,
+      lastWorkerActivityAt: 19,
+    }],
+    workerGenerations: [{ workerId: "legacy-v2", generation: 4 }],
+  };
+  try {
+    await writeFile(path, `${JSON.stringify(source)}\n`);
+    const store = new WorkerStore(path);
+    const migrated = await store.read();
+    assert.equal(migrated.version, 3);
+    assert.equal(migrated.generation, 7);
+    assert.equal(migrated.workers[0].task, "preserve this task");
+    assert.equal(migrated.workers[0].lastWorkerActivityAt, 19);
+    assert.equal(migrated.workers[0].lastAuthenticatedIntercomActivityAt, undefined);
+    assert.equal(JSON.parse(await readFile(path, "utf8")).version, 2, "read must not rewrite legacy state");
+
+    await store.migrate();
+    const raw = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(raw.version, 3);
+    assert.equal(raw.generation, 7);
+    assert.equal(raw.workers[0].lastAuthenticatedIntercomActivityAt, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("WorkerStore migrates the briefly shipped v2 timestamp as an untrusted compatibility field", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-v2-compat-"));
+  const path = join(root, "workers.json");
+  const source = {
+    version: 2,
+    generation: 1,
+    workers: [{
+      id: "compat-v2",
+      workerIncarnationId: "incarnation",
+      workerGeneration: 1,
+      harness: "pi",
+      backend: "systemd",
+      role: "builder",
+      task: "drop untrusted evidence",
+      cwd: "/tmp",
+      state: "working",
+      owned: true,
+      managerOwner: { context: "pi", principalId: "manager", sessionId: "manager", bindingEpoch: 0 },
+      createdAt: 1,
+      updatedAt: 2,
+      leaseExpiresAt: 3,
+      lastAuthenticatedIntercomActivityAt: 2,
+    }],
+    workerGenerations: [{ workerId: "compat-v2", generation: 1 }],
+  };
+  try {
+    await writeFile(path, JSON.stringify(source));
+    const store = new WorkerStore(path);
+    assert.equal((await store.read()).workers[0].lastAuthenticatedIntercomActivityAt, undefined);
+    assert.deepEqual(JSON.parse(await readFile(path, "utf8")), source, "compatibility reads do not rewrite or quarantine v2");
+    await store.migrate();
+    const migrated = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(migrated.version, 3);
+    assert.equal(migrated.workers[0].lastAuthenticatedIntercomActivityAt, undefined);
+    await assert.rejects(access(`${path}.poison.json`));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -163,26 +258,26 @@ test("programmatic writes reject proxies, accessors, inherited data, sparse arra
   const root = await mkdtemp(join(tmpdir(), "worker-store-v2-exact-data-"));
   const store = new WorkerStore(join(root, "workers.json"));
   try {
-    const valid: WorkerStateFileV2 = { version: 2, generation: 0, workers: [], workerGenerations: [] };
-    await assert.rejects(store.write(new Proxy(valid, {}) as WorkerStateFileV2), WorkerStoreValidationError);
+    const valid: WorkerStateFileV3 = { version: 3, generation: 0, workers: [], workerGenerations: [] };
+    await assert.rejects(store.write(new Proxy(valid, {}) as WorkerStateFileV3), WorkerStoreValidationError);
 
-    const accessor = { workers: [] } as unknown as WorkerStateFileV2;
-    Object.defineProperty(accessor, "version", { enumerable: true, get: () => 2 });
+    const accessor = { workers: [] } as unknown as WorkerStateFileV3;
+    Object.defineProperty(accessor, "version", { enumerable: true, get: () => 3 });
     Object.defineProperty(accessor, "generation", { enumerable: true, value: 0 });
     await assert.rejects(store.write(accessor), WorkerStoreValidationError);
 
-    const inherited = Object.assign(Object.create({ inherited: true }), valid) as WorkerStateFileV2;
+    const inherited = Object.assign(Object.create({ inherited: true }), valid) as WorkerStateFileV3;
     await assert.rejects(store.write(inherited), WorkerStoreValidationError);
 
     const sparse = [] as WorkerRecord[];
     sparse.length = 1;
-    await assert.rejects(store.write({ version: 2, generation: 0, workers: sparse }), WorkerStoreValidationError);
+    await assert.rejects(store.write({ version: 3, generation: 0, workers: sparse }), WorkerStoreValidationError);
 
     const nonIndex = [] as WorkerRecord[];
     Object.defineProperty(nonIndex, "4294967295", { enumerable: true, value: apiWorker("hidden") });
-    await assert.rejects(store.write({ version: 2, generation: 0, workers: nonIndex }), WorkerStoreValidationError);
+    await assert.rejects(store.write({ version: 3, generation: 0, workers: nonIndex }), WorkerStoreValidationError);
 
-    await assert.rejects(store.write({ ...valid, unknown: true } as WorkerStateFileV2), WorkerStoreValidationError);
+    await assert.rejects(store.write({ ...valid, unknown: true } as WorkerStateFileV3), WorkerStoreValidationError);
     assert.equal((await store.read()).generation, 0);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -194,9 +289,9 @@ test("corrupt state is quarantined durably while ENOENT alone reads as empty", a
   const path = join(root, "workers.json");
   try {
     const empty = await new WorkerStore(path).read();
-    assert.deepEqual(empty, { version: 2, generation: 0, workers: [], workerGenerations: [] });
+    assert.deepEqual(empty, { version: 3, generation: 0, workers: [], workerGenerations: [] });
 
-    await writeFile(path, JSON.stringify({ version: 2, generation: 0, workers: [], surprise: true }));
+    await writeFile(path, JSON.stringify({ version: 3, generation: 0, workers: [], workerGenerations: [], surprise: true }));
     const first = new WorkerStore(path, { now: () => 123 });
     let quarantinePath: string | undefined;
     await assert.rejects(first.read(), (error: unknown) => {
@@ -227,15 +322,63 @@ test("malformed poison markers remain fail-closed", async () => {
   }
 });
 
-test("newer schemas refuse downgrade without moving or rewriting the source", async () => {
+test("newer schemas refuse downgrade without rewriting, quarantining, or poisoning the source", async () => {
   const root = await mkdtemp(join(tmpdir(), "worker-store-v2-newer-"));
   const path = join(root, "workers.json");
-  const source = `${JSON.stringify({ version: 3, generation: 99, workers: [], future: true })}\n`;
+  const source = `${JSON.stringify({ version: 4, generation: "must not parse", workers: [null], future: true })}\n`;
   try {
     await writeFile(path, source);
     await assert.rejects(new WorkerStore(path).read(), WorkerStoreUnsupportedVersionError);
     assert.equal(await readFile(path, "utf8"), source);
     await assert.rejects(access(`${path}.poison.json`));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("unsupported active features refuse before exact nested parsing without quarantine", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-feature-gate-"));
+  const path = join(root, "workers.json");
+  const source = `${JSON.stringify({
+    version: 3,
+    generation: 1,
+    activeFeatures: ["future-worker-shape"],
+    workers: [{ futureNestedField: true }],
+    workerGenerations: [],
+    futureTopLevelField: true,
+  })}\n`;
+  try {
+    await writeFile(path, source);
+    await assert.rejects(new WorkerStore(path).read(), WorkerStoreUnsupportedFeatureError);
+    assert.equal(await readFile(path, "utf8"), source);
+    await assert.rejects(access(`${path}.poison.json`));
+    assert.equal((await new WorkerStore(path, { supportedFeatures: ["future-worker-shape"] }).read().catch((error) => error)).code, "WORKER_STORE_CORRUPT");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("malformed activeFeatures remains corrupt and quarantined instead of being assumed unsupported", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-malformed-feature-gate-"));
+  const path = join(root, "workers.json");
+  try {
+    await writeFile(path, JSON.stringify({
+      version: 3,
+      generation: 1,
+      activeFeatures: { 0: "future-worker-shape", length: 1 },
+      workers: [],
+      workerGenerations: [],
+    }));
+    let quarantinePath: string | undefined;
+    await assert.rejects(new WorkerStore(path).read(), (error: unknown) => {
+      assert.ok(error instanceof WorkerStoreCorruptError);
+      quarantinePath = error.quarantinePath;
+      assert.match(error.message, /activeFeatures.*plain array/);
+      return true;
+    });
+    assert.ok(quarantinePath);
+    await access(quarantinePath!);
+    await access(`${path}.poison.json`);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -389,11 +532,11 @@ test("forgotten worker ids retain generation history across later reuse", async 
 test("mutation snapshots publish only after persistence and remain detached afterward", async () => {
   const root = await mkdtemp(join(tmpdir(), "worker-store-v2-detached-"));
   const path = join(root, "workers.json");
-  let leaked: WorkerStateFileV2 | undefined;
+  let leaked: WorkerStateFileV3 | undefined;
   try {
     const store = new WorkerStore(path);
     await store.mutate((state) => {
-      leaked = state as WorkerStateFileV2;
+      leaked = state as WorkerStateFileV3;
       state.workers.push(apiWorker("detached"));
     });
     assert.equal(leaked?.generation, 1);
