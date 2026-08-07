@@ -1305,7 +1305,7 @@ export class TrustedLocalBossStore {
             changed = true;
           }
         }
-        if (!run.currentPause && !applyingPause && !TERMINAL_RUN_STATES.has(run.state) && run.assignments.some((assignment) => assignment.state === "failed")) {
+        if (!run.currentPause && !applyingPause && !TERMINAL_RUN_STATES.has(run.state) && run.assignments.some((assignment) => assignment.state === "failed" && assignment.workerId && assignment.workerIncarnationId)) {
           run.state = "failed";
           run.updatedAt = timestamp;
           changed = true;

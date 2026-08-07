@@ -806,6 +806,14 @@ test("trusted-local Boss fails the run when Manager launch or lifecycle fails", 
     assert.match(failed.assignments[0].lastError ?? "", /no launch profile/);
     const replacement = await first.store.execute(parseBossCommand("create retry after terminal failure"), "manager-session-6");
     assert.equal(replacement.run?.state, "active");
+
+    const nonManagerLaunchFailure = await first.store.execute(parseBossCommand("create preserve bounded worker launch failure"), "manager-session-6");
+    const liveManager = managerWorker(nonManagerLaunchFailure.run!.bossRunId);
+    await first.store.recordManagerStarted(nonManagerLaunchFailure.run!.bossRunId, liveManager);
+    await first.store.recordAssignmentFailedForRole(nonManagerLaunchFailure.run!.bossRunId, "worker", new Error("temporary worker launch failure"));
+    await first.store.synchronizeWorkers([liveManager]);
+    const stillActive = await first.store.execute(parseBossCommand(`status ${nonManagerLaunchFailure.run!.bossRunId}`), "manager-session-6");
+    assert.equal(stillActive.run?.state, "active", "an unbound non-Manager launch failure remains locally retryable");
   } finally {
     await rm(first.dir, { recursive: true, force: true });
   }
@@ -1041,6 +1049,9 @@ test("trusted-local Boss binds advisory proof revisions to an assigned adversary
     await store.execute(parseBossCommand(`proof ${created.run!.bossRunId}`), "manager-session-reviewer-retry");
     const failed = await store.recordReviewerFailed(created.run!.bossRunId, new Error("temporary launch profile outage"));
     assert.equal(failed.assignments.find((assignment) => assignment.role === "adversary")?.state, "failed");
+    const liveManager = managerWorker(created.run!.bossRunId);
+    await store.synchronizeWorkers([liveManager]);
+    assert.equal((await store.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "manager-session-reviewer-retry")).run?.state, "active", "an unbound reviewer launch failure must remain retryable across heartbeat synchronization");
     const retry = await store.execute(parseBossCommand(`proof ${created.run!.bossRunId}`), "manager-session-reviewer-retry");
     const retriedAssignment = retry.run!.assignments.find((assignment) => assignment.role === "adversary")!;
     assert.equal(retriedAssignment.state, "requested");
