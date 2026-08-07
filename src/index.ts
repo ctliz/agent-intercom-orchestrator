@@ -407,6 +407,7 @@ export function renewObservedWorkerLeases(
   managerId: string,
   config: OrchestratorConfig,
   now = Date.now(),
+  pauseProtectedWorkerKeys: ReadonlySet<string> = new Set(),
 ): LeaseHeartbeatResult {
   const observedLiveRuns = new Set(observedWorkers
     .filter((worker) => worker.managerSessionId === managerId && worker.owned && isLiveState(worker.state) && worker.stateReason !== "stop_in_progress")
@@ -417,6 +418,7 @@ export function renewObservedWorkerLeases(
   for (const worker of state.workers) {
     if (!observedLiveRuns.has(`${worker.id}\u0000${worker.runId}`)) continue;
     if (worker.managerSessionId !== managerId || !worker.owned || !isLiveState(worker.state) || worker.stateReason === "stop_in_progress") continue;
+    if (pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) continue;
     changed = initializeWorkerLifecycle(worker, config, now) || changed;
     const lastActivity = worker.lastWorkerActivityAt!;
     const idleDeadline = worker.idleDeadlineAt!;
@@ -944,14 +946,19 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   const cleanupExpired = async (execute: boolean, now = Date.now()): Promise<CleanupExecution> => {
     await recoverCleanupClaims();
     await reconcile();
+    const pauseProtectedWorkerKeys = new Set(await trustedLocalBossStore.pauseProtectedWorkerKeys());
     await store.mutateConditionally((state) => {
       let changed = false;
-      for (const worker of state.workers) changed = initializeWorkerLifecycle(worker, config, now) || changed;
+      for (const worker of state.workers) {
+        if (pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) continue;
+        changed = initializeWorkerLifecycle(worker, config, now) || changed;
+      }
       return { value: undefined, changed };
     });
     const migrated = await store.read();
     const claimedIds = new Set((migrated.runtimeCleanupClaims ?? []).map((claim) => claim.workerId));
     const liveCandidates = migrated.workers.flatMap((worker) => {
+      if (pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) return [];
       const reason = cleanupReason(worker, now);
       return reason ? [{ worker, reason, kind: "stop" as const }] : [];
     });
@@ -1079,9 +1086,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       return { renewed: [], checkpointRequested: [], changed: false, checkpointRequests: [] };
     }
     const observedWorkers = await reconcile(sessionId, false);
+    const pauseProtectedWorkerKeys = new Set(await trustedLocalBossStore.pauseProtectedWorkerKeys());
     const now = Date.now();
     const result = await store.mutateConditionally((state) => {
-      const value = renewObservedWorkerLeases(state, observedWorkers, sessionId, config, now);
+      const value = renewObservedWorkerLeases(state, observedWorkers, sessionId, config, now, pauseProtectedWorkerKeys);
       return { value, changed: value.changed };
     });
     publishStatus(ctx, observedWorkers);

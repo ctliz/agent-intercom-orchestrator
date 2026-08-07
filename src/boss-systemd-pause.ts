@@ -242,11 +242,21 @@ export async function suspendBossWorkerTimers(store: WorkerStore, timers: readon
   });
 }
 
-/** Restore each lifecycle deadline relative to the verified thaw completion time. */
+/** Restore each lifecycle deadline relative to the first verified thaw completion time. */
 export async function restoreBossWorkerTimers(store: WorkerStore, timers: readonly TrustedLocalBossPausedTimer[], now: number): Promise<void> {
   await store.mutate((state) => {
     for (const timer of timers) {
       const worker = exactTimerWorker(state, timer);
+      const controlledDeadlines = [
+        worker.leaseExpiresAt,
+        ...(timer.idleRemainingMs === null ? [] : [worker.idleDeadlineAt]),
+        ...(timer.checkpointRemainingMs === null ? [] : [worker.checkpointDeadlineAt]),
+        ...(timer.checkpointRetryRemainingMs === null ? [] : [worker.checkpointLastAttemptAt]),
+      ];
+      const suspended = controlledDeadlines.every((value) => value === SUSPENDED_DEADLINE);
+      const restored = controlledDeadlines.every((value) => value !== undefined && value !== SUSPENDED_DEADLINE);
+      if (restored) continue;
+      if (!suspended) throw new Error(`Boss worker ${timer.workerId} has mixed suspended timer state`);
       worker.leaseExpiresAt = now + timer.leaseRemainingMs;
       if (timer.idleRemainingMs !== null) worker.idleDeadlineAt = now + timer.idleRemainingMs;
       if (timer.checkpointRemainingMs !== null) worker.checkpointDeadlineAt = now + timer.checkpointRemainingMs;

@@ -287,6 +287,17 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     assert.deepEqual([...frozenUnits].sort(), paused.details.run.currentPause.targets.map((target: any) => target.unit).sort());
     assert.equal([...frozenUnits].some((unit) => unit.includes(`boss-manager-${suffix}`)), false);
     assert.match(paused.content[0].text, /RuntimeMaxSec continues to elapse/);
+    const statePath = join(orchestratorDir, "workers.json");
+    const pausedKeys = new Set(paused.details.run.currentPause.targets.map((target: any) => `${target.workerId}\0${target.workerIncarnationId}`));
+    const fencedBefore = JSON.parse(await readFile(statePath, "utf8")).workers
+      .filter((worker: any) => pausedKeys.has(`${worker.id}\0${worker.workerIncarnationId ?? worker.runId}`))
+      .map((worker: any) => [worker.id, worker.leaseExpiresAt, worker.idleDeadlineAt, worker.checkpointDeadlineAt, worker.checkpointLastAttemptAt]);
+    await tools.get("agent_fleet").execute("boss-paused-heartbeat-test", { action: "_heartbeat" }, new AbortController().signal, () => {}, ctx);
+    await tools.get("agent_fleet").execute("boss-paused-cleanup-test", { action: "cleanup", execute: false }, new AbortController().signal, () => {}, ctx);
+    const fencedAfter = JSON.parse(await readFile(statePath, "utf8")).workers
+      .filter((worker: any) => pausedKeys.has(`${worker.id}\0${worker.workerIncarnationId ?? worker.runId}`))
+      .map((worker: any) => [worker.id, worker.leaseExpiresAt, worker.idleDeadlineAt, worker.checkpointDeadlineAt, worker.checkpointLastAttemptAt]);
+    assert.deepEqual(fencedAfter, fencedBefore, "heartbeat and cleanup must not normalize exact pause-fenced lifecycle budgets");
     const resumed = await tools.get("boss").execute(
       "boss-systemd-resume-test",
       { action: "resume", bossRunId },

@@ -289,6 +289,34 @@ test("heartbeat renewal is activity-gated, capped at the idle deadline, and requ
   assert.deepEqual(expired.renewed, []);
 });
 
+test("heartbeat leaves exact Boss pause-fenced lifecycle budgets untouched", () => {
+  const worker = createSystemdRecord({
+    id: "paused-worker", runId: "paused-run", harness: "codex", role: "builder", task: "test", cwd: "/tmp",
+    profile: "codex-safe", unit: "paused.service", managerSessionId: "session-a", config: DEFAULT_CONFIG, now: 1_000,
+  });
+  worker.state = "running";
+  const suspended = 8_640_000_000_000_000 - 1;
+  worker.leaseExpiresAt = suspended;
+  worker.idleDeadlineAt = suspended;
+  worker.checkpointDeadlineAt = suspended;
+  worker.checkpointLastAttemptAt = suspended;
+  const state = { version: 1 as const, workers: [worker] };
+  const result = renewObservedWorkerLeases(
+    state,
+    [structuredClone(worker)],
+    "session-a",
+    DEFAULT_CONFIG,
+    9_000_000,
+    new Set([`${worker.id}\0${worker.workerIncarnationId ?? worker.runId}`]),
+  );
+  assert.equal(result.changed, false);
+  assert.deepEqual(result.checkpointRequested, []);
+  assert.equal(worker.leaseExpiresAt, suspended);
+  assert.equal(worker.idleDeadlineAt, suspended);
+  assert.equal(worker.checkpointDeadlineAt, suspended);
+  assert.equal(worker.checkpointLastAttemptAt, suspended);
+});
+
 test("manager ownership rebind changes exact context and advances the binding epoch", () => {
   const worker = createSystemdRecord({
     id: "owner-worker", runId: "owner-run", harness: "codex", role: "builder", task: "test", cwd: "/tmp",

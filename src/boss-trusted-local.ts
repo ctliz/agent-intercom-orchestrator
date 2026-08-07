@@ -651,7 +651,13 @@ function parseRun(value: unknown, handlePrefix: string): TrustedLocalBossRun {
   const parsedDeliveries = deliveries.map(parseDelivery);
   const parsedResults = assignmentResults.map(parseAssignmentResult);
   const parsedLifecycle = lifecycle.map(parseLifecycleObservation);
-  const parsedProofs = proofPackets.map((packet) => parseProofPacket(packet, value.version !== TRUSTED_LOCAL_BOSS_RUN_VERSION));
+  // Bound proof packets shipped with run v5. Only v1-v4 use the legacy
+  // unbound shape; later run-schema additions must not reinterpret v5 proofs.
+  const legacyProof = value.version === "orc.boss-trusted-local.v1"
+    || value.version === "orc.boss-trusted-local.v2"
+    || value.version === "orc.boss-trusted-local.v3"
+    || value.version === "orc.boss-trusted-local.v4";
+  const parsedProofs = proofPackets.map((packet) => parseProofPacket(packet, legacyProof));
   const parsedDecisions = decisions.map(parseDecision);
   const assignmentIds = new Set(parsedAssignments.map((assignment) => assignment.assignmentId));
   if (assignmentIds.size !== parsedAssignments.length || parsedLifecycle.some((entry) => !assignmentIds.has(entry.assignmentId))) throw new Error("Trusted-local Boss state contains invalid assignment correlation");
@@ -1043,6 +1049,20 @@ export class TrustedLocalBossStore {
   async acceptedPauseControls(): Promise<TrustedLocalBossRun[]> {
     const state = await this.readState();
     return state.runs.filter((run) => run.currentPause && !run.currentPauseDegradation).map((run) => structuredClone(run));
+  }
+
+  /** Exact WorkerStore incarnations whose lifecycle budgets are fenced by a durable pause intent. */
+  async pauseProtectedWorkerKeys(): Promise<string[]> {
+    const state = await this.readState();
+    const keys = new Set<string>();
+    for (const run of state.runs) {
+      for (const target of run.currentPause?.targets ?? []) keys.add(`${target.workerId}\0${target.workerIncarnationId}`);
+      const applying = run.pauseTransitions.at(-1);
+      if (applying?.phase === "applying") {
+        for (const target of applying.targets) keys.add(`${target.workerId}\0${target.workerIncarnationId}`);
+      }
+    }
+    return [...keys];
   }
 
   async recordPauseDegradation(bossRunId: string, pauseRevision: number, transitionRevision: number, detail: string): Promise<TrustedLocalBossRun> {

@@ -210,6 +210,11 @@ test("WorkerStore lifecycle timers are fenced during pause and restored from exa
   assert.equal(participant.idleDeadlineAt, 121_000);
   assert.equal(participant.checkpointDeadlineAt, 131_000);
   assert.equal(participant.checkpointLastAttemptAt, 100_500);
+  await restoreBossWorkerTimers(fakeStore, timers, 201_000);
+  assert.equal(participant.leaseExpiresAt, 111_000, "restart retry after timer restoration must not extend the lease budget");
+  assert.equal(participant.idleDeadlineAt, 121_000);
+  assert.equal(participant.checkpointDeadlineAt, 131_000);
+  assert.equal(participant.checkpointLastAttemptAt, 100_500);
 });
 
 test("systemd pause control rejects PID movement, queued units, unsupported state, command timeout, and ambiguous verification", async () => {
