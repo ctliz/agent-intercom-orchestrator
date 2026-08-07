@@ -292,12 +292,15 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     const fencedBefore = JSON.parse(await readFile(statePath, "utf8")).workers
       .filter((worker: any) => pausedKeys.has(`${worker.id}\0${worker.workerIncarnationId ?? worker.runId}`))
       .map((worker: any) => [worker.id, worker.leaseExpiresAt, worker.idleDeadlineAt, worker.checkpointDeadlineAt, worker.checkpointLastAttemptAt]);
+    const pausedRenewTarget = paused.details.run.currentPause.targets[0].workerId as string;
+    const pausedRenew = await tools.get("agent_fleet").execute("boss-paused-renew-test", { action: "renew", id: pausedRenewTarget }, new AbortController().signal, () => {}, ctx);
+    assert.equal(pausedRenew.details.workers.length, 0, "explicit renew must not cross an exact Boss pause fence");
     await tools.get("agent_fleet").execute("boss-paused-heartbeat-test", { action: "_heartbeat" }, new AbortController().signal, () => {}, ctx);
     await tools.get("agent_fleet").execute("boss-paused-cleanup-test", { action: "cleanup", execute: false }, new AbortController().signal, () => {}, ctx);
     const fencedAfter = JSON.parse(await readFile(statePath, "utf8")).workers
       .filter((worker: any) => pausedKeys.has(`${worker.id}\0${worker.workerIncarnationId ?? worker.runId}`))
       .map((worker: any) => [worker.id, worker.leaseExpiresAt, worker.idleDeadlineAt, worker.checkpointDeadlineAt, worker.checkpointLastAttemptAt]);
-    assert.deepEqual(fencedAfter, fencedBefore, "heartbeat and cleanup must not normalize exact pause-fenced lifecycle budgets");
+    assert.deepEqual(fencedAfter, fencedBefore, "renew, heartbeat, and cleanup must not normalize exact pause-fenced lifecycle budgets");
     const mixedTimerState = JSON.parse(await readFile(statePath, "utf8"));
     const mixedTimerWorker = mixedTimerState.workers.find((worker: any) => pausedKeys.has(`${worker.id}\0${worker.workerIncarnationId ?? worker.runId}`));
     const suspendedLeaseDeadline = mixedTimerWorker.leaseExpiresAt;

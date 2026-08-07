@@ -1297,9 +1297,18 @@ export class TrustedLocalBossStore {
             assignment.state = "failed";
             assignment.lastError = (detail ?? `${assignment.role} worker entered ${workerState}`).slice(0, 4_096);
             assignment.updatedAt = timestamp;
-            run.state = "failed";
+            // A Controller-authorized pause must remain resumable even when the
+            // intentionally-unfrozen Manager or an already-terminal non-target
+            // dies. Record the exact assignment failure now, then project the
+            // run failure only after the pause transition has cleared.
+            if (!run.currentPause && !applyingPause) run.state = "failed";
             changed = true;
           }
+        }
+        if (!run.currentPause && !applyingPause && !TERMINAL_RUN_STATES.has(run.state) && run.assignments.some((assignment) => assignment.state === "failed")) {
+          run.state = "failed";
+          run.updatedAt = timestamp;
+          changed = true;
         }
         if (run.state === "cancelled" && run.cancellation?.state === "pending") {
           const bound = run.assignments.filter((assignment) => assignment.state === "assigned" && assignment.workerId && assignment.workerIncarnationId);

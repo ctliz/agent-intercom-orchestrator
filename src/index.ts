@@ -452,6 +452,7 @@ export function recordIntercomWorkerActivity(
   sender: { id?: string; name?: string },
   config: OrchestratorConfig,
   now = Date.now(),
+  pauseProtectedWorkerKeys: ReadonlySet<string> = new Set(),
 ): WorkerRecordV3 | undefined {
   const worker = state.workers.find((candidate) => {
     if (candidate.managerSessionId !== managerId || !candidate.owned || !isLiveState(candidate.state) || candidate.stateReason === "stop_in_progress") return false;
@@ -461,8 +462,10 @@ export function recordIntercomWorkerActivity(
     return sender.id === expectedSenderId || (!sender.id && sender.name === expectedSenderId);
   });
   if (!worker) return undefined;
-  recordWorkerActivity(worker, config, now);
+  const pauseProtected = pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`);
+  if (!bossWorkerTimersSuspended(worker) && !pauseProtected) recordWorkerActivity(worker, config, now);
   worker.lastAuthenticatedIntercomActivityAt = now;
+  worker.updatedAt = now;
   return structuredClone(worker);
 }
 
@@ -596,7 +599,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     const sender = parseInboundActivitySender(payload);
     if (!ctx || !config || !sender) return;
     const now = Date.now();
-    void store.mutate((state) => recordIntercomWorkerActivity(state as WorkerStateFileV3, managerSessionId(ctx), sender, config, now))
+    void trustedLocalBossStore.pauseProtectedWorkerKeys()
+      .then((keys) => store.mutate((state) => recordIntercomWorkerActivity(state as WorkerStateFileV3, managerSessionId(ctx), sender, config, now, new Set(keys))))
       .then((worker) => { if (worker) return updateStatus(ctx); })
       .catch(() => undefined);
   });
@@ -1802,12 +1806,14 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       if (params.action === "renew") {
         const owner = managerSessionId(ctx);
         const now = Date.now();
+        const pauseProtectedWorkerKeys = new Set(await trustedLocalBossStore.pauseProtectedWorkerKeys());
         const workers = await store.mutate((state) => {
           const selected = extractWorkers(state, params.id);
           const renewed: WorkerRecord[] = [];
           for (const worker of selected) {
             if (!worker.owned || !isLiveState(worker.state) || worker.stateReason === "stop_in_progress") continue;
             if (worker.managerSessionId !== owner) throw new Error(`Worker ${worker.id} belongs to another manager session; adopt it before renewing`);
+            if (bossWorkerTimersSuspended(worker) || pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) continue;
             recordWorkerActivity(worker, config, now);
             renewed.push(structuredClone(worker));
           }

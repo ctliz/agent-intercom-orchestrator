@@ -350,6 +350,46 @@ test("manager-received worker Intercom activity resets the idle budget but manag
   assert.equal(updated?.checkpointRequestedAt, undefined);
 });
 
+test("pause-protected inbound Intercom activity records communication without clobbering lifecycle fences", () => {
+  const worker = createSystemdRecord({
+    id: "paused-worker", runId: "paused-run", harness: "pi", role: "worker", task: "test", cwd: "/tmp", profile: "pi-peer",
+    unit: "paused-worker.service", managerSessionId: "manager-a", config: DEFAULT_CONFIG, now: 1_000,
+  }) as WorkerRecordV3;
+  worker.state = "ready";
+  worker.workerIncarnationId = "paused-incarnation";
+  worker.checkpointRequestedAt = 1_500;
+  worker.checkpointLastAttemptAt = 1_750;
+  worker.checkpointAttemptCount = 2;
+  const lifecycleBefore = {
+    lastWorkerActivityAt: worker.lastWorkerActivityAt,
+    idleDeadlineAt: worker.idleDeadlineAt,
+    checkpointDeadlineAt: worker.checkpointDeadlineAt,
+    leaseExpiresAt: worker.leaseExpiresAt,
+    checkpointRequestedAt: worker.checkpointRequestedAt,
+    checkpointLastAttemptAt: worker.checkpointLastAttemptAt,
+    checkpointAttemptCount: worker.checkpointAttemptCount,
+  };
+  const state = { version: 3 as const, generation: 0, workers: [worker], workerGenerations: [{ workerId: worker.id, generation: worker.workerGeneration! }] };
+  const updated = recordIntercomWorkerActivity(
+    state,
+    "manager-a",
+    { id: worker.id },
+    DEFAULT_CONFIG,
+    4_000,
+    new Set([`${worker.id}\0${worker.workerIncarnationId}`]),
+  );
+  assert.equal(updated?.lastAuthenticatedIntercomActivityAt, 4_000);
+  assert.deepEqual({
+    lastWorkerActivityAt: worker.lastWorkerActivityAt,
+    idleDeadlineAt: worker.idleDeadlineAt,
+    checkpointDeadlineAt: worker.checkpointDeadlineAt,
+    leaseExpiresAt: worker.leaseExpiresAt,
+    checkpointRequestedAt: worker.checkpointRequestedAt,
+    checkpointLastAttemptAt: worker.checkpointLastAttemptAt,
+    checkpointAttemptCount: worker.checkpointAttemptCount,
+  }, lifecycleBefore);
+});
+
 test("legacy live records receive a complete idle window during lifecycle migration", () => {
   const worker = createSystemdRecord({
     id: "legacy-worker", runId: "legacy-run", harness: "pi", role: "advisor", task: "test", cwd: "/tmp",

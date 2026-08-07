@@ -827,6 +827,47 @@ test("trusted-local Boss fails the run when Manager launch or lifecycle fails", 
   }
 });
 
+test("trusted-local Boss keeps an accepted pause resumable when the intentionally-unfrozen Manager dies", async () => {
+  const { dir, store } = await fixture();
+  try {
+    const controller = "controller-paused-manager-failure";
+    const created = await store.execute(parseBossCommand("create keep paused recovery available"), controller);
+    const bossRunId = created.run!.bossRunId;
+    const manager = { ...managerWorker(bossRunId), managerSessionId: controller, unit: "boss-manager.service" };
+    const worker = {
+      ...managerWorker(bossRunId),
+      id: `boss-worker-${bossRunId.slice(-12)}`,
+      runId: "paused-worker-incarnation",
+      workerIncarnationId: "paused-worker-incarnation",
+      role: "worker",
+      managerSessionId: controller,
+      unit: "boss-worker.service",
+    };
+    await store.recordManagerStarted(bossRunId, manager);
+    await store.recordAssignmentStartedForRole(bossRunId, "worker", worker);
+    const targets = [{ role: "worker" as const, workerId: worker.id, workerIncarnationId: worker.workerIncarnationId!, unit: worker.unit!, mainPid: 123 }];
+    const timers = [{ workerId: worker.id, workerIncarnationId: worker.workerIncarnationId!, leaseRemainingMs: 60_000, idleRemainingMs: 50_000, checkpointRemainingMs: 70_000, checkpointRetryRemainingMs: 5_000, checkpointRetryIntervalMs: 10_000 }];
+    const pause = await store.beginPauseControl({ bossRunId, managerSessionId: controller, action: "pause", targets, intentionallyUnfrozenManagerWorkerId: manager.id, timers });
+    await store.finishPauseControl(bossRunId, pause.actionId);
+
+    const deadManager = { ...manager, state: "failed" as const, lastError: "Manager exited while participants were frozen" };
+    assert.equal(await store.synchronizeWorkers([deadManager, worker]), true);
+    const paused = await store.execute(parseBossCommand(`status ${bossRunId}`), controller);
+    assert.equal(paused.run?.state, "paused");
+    assert.equal(paused.run?.currentPause?.targets[0].workerId, worker.id);
+    assert.equal(paused.run?.assignments.find((assignment) => assignment.role === "manager")?.state, "failed");
+
+    const resume = await store.beginPauseControl({ bossRunId, managerSessionId: controller, action: "resume", targets, intentionallyUnfrozenManagerWorkerId: manager.id, timers });
+    await store.finishPauseControl(bossRunId, resume.actionId);
+    assert.equal(await store.synchronizeWorkers([deadManager, worker]), true);
+    const failed = await store.execute(parseBossCommand(`status ${bossRunId}`), controller);
+    assert.equal(failed.run?.state, "failed", "the deferred participant failure projects only after the pause clears");
+    assert.equal(failed.run?.currentPause, null);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("trusted-local Boss stales proof creation, delivery, and decision when the frozen candidate moves", async () => {
   const { dir, store } = await fixture();
   try {
