@@ -115,6 +115,8 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     const tools = new Map<string, any>();
     const launches: string[][] = [];
     const stoppedUnits = new Set<string>();
+    const frozenUnits = new Set<string>();
+    const freezerActions: string[] = [];
     const intercomDeliveries: Array<{ to: string; message: string }> = [];
     let contextStale = false;
     let failNextBossLaunch = false;
@@ -146,11 +148,19 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
           stoppedUnits.add(args.at(-1)!);
           return commandResult();
         }
+        if (command === "systemctl" && (args.includes("freeze") || args.includes("thaw"))) {
+          const action = args.includes("freeze") ? "freeze" : "thaw";
+          const unit = args.at(-1)!;
+          freezerActions.push(`${action}:${unit}`);
+          if (action === "freeze") frozenUnits.add(unit); else frozenUnits.delete(unit);
+          return commandResult();
+        }
         if (command === "systemctl" && args.includes("show")) {
-          const stopped = stoppedUnits.has(args[args.indexOf("show") + 1]);
+          const unit = args[args.indexOf("show") + 1];
+          const stopped = stoppedUnits.has(unit);
           return { ...commandResult(), stdout: stopped
-            ? "LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nResult=success\nExecMainStatus=0\nJob=\nInactiveEnterTimestampMonotonic=20\n"
-            : "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nResult=success\nExecMainStatus=0\nJob=\nExecMainStartTimestampMonotonic=10\n" };
+            ? "LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nResult=success\nExecMainStatus=0\nJob=\nFreezerState=running\nInactiveEnterTimestampMonotonic=20\n"
+            : `LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=123\nResult=success\nExecMainStatus=0\nJob=\nFreezerState=${frozenUnits.has(unit) ? "frozen" : "running"}\nExecMainStartTimestampMonotonic=10\n` };
         }
         return commandResult();
       },
@@ -265,6 +275,37 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       assert.match(delivery.message, /Begin now using the isolated Ralph protocol/);
     }
 
+    const paused = await tools.get("boss").execute(
+      "boss-systemd-pause-test",
+      { action: "pause", bossRunId, note: "hold exact managed units" },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(paused.details.run.state, "paused");
+    assert.deepEqual(paused.details.run.currentPause.targets.map((target: any) => target.role).sort(), ["scout", "worker"]);
+    assert.deepEqual([...frozenUnits].sort(), paused.details.run.currentPause.targets.map((target: any) => target.unit).sort());
+    assert.equal([...frozenUnits].some((unit) => unit.includes(`boss-manager-${suffix}`)), false);
+    assert.match(paused.content[0].text, /RuntimeMaxSec continues to elapse/);
+    const resumed = await tools.get("boss").execute(
+      "boss-systemd-resume-test",
+      { action: "resume", bossRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(resumed.details.run.state, "active");
+    assert.equal(resumed.details.run.currentPause, null);
+    assert.equal(frozenUnits.size, 0);
+    const pausedForCancel = await tools.get("boss").execute(
+      "boss-systemd-terminal-thaw-test",
+      { action: "pause", bossRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(pausedForCancel.details.run.state, "paused");
+    const freezerActionsBeforeCancel = freezerActions.length;
     const cancelled = await tools.get("boss").execute(
       "boss-clean-resource-test",
       { action: "cancel", bossRunId },
@@ -273,6 +314,9 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       ctx,
     );
     assert.equal(cancelled.details.run.cancellation.state, "succeeded");
+    assert.equal(cancelled.details.run.currentPause, null);
+    assert.equal(frozenUnits.size, 0, "terminal cancellation thaws every exact managed unit before stop");
+    assert.deepEqual(freezerActions.slice(freezerActionsBeforeCancel).map((entry) => entry.split(":")[0]), ["thaw", "thaw"]);
     assert.equal(cancelled.details.run.resource.revision, 2);
     assert.equal(cancelled.details.run.resource.leaseState, "released");
     assert.equal(cancelled.details.run.resource.existence, "missing");
