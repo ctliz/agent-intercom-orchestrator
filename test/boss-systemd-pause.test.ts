@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyBossSystemdPausePlan, captureBossPausedTimers, recoverBossSystemdPauseTargets, resolveBossSystemdPausePlan, restoreBossWorkerTimers, setBossUnitFreezerState, suspendBossWorkerTimers, validatePersistedBossSystemdPauseTargets, waitForUnitFreezerState } from "../src/boss-systemd-pause.ts";
+import { applyBossSystemdPausePlan, captureBossPausedTimers, recoverBossSystemdPauseTargets, resolveBossSystemdPausePlan, restoreBossWorkerTimers, setBossUnitFreezerState, suspendBossWorkerTimers, validatePersistedBossSystemdPauseTargets, verifyAcceptedBossSystemdPause, waitForUnitFreezerState } from "../src/boss-systemd-pause.ts";
 import type { WorkerStore } from "../src/store.ts";
 import type { TrustedLocalBossRun } from "../src/boss-trusted-local.ts";
 import type { WorkerRecord } from "../src/types.ts";
@@ -21,7 +21,7 @@ function run(): TrustedLocalBossRun {
     updatedAt: "2026-01-01T00:00:00.000Z",
   });
   return {
-    version: "orc.boss-trusted-local.v6",
+    version: "orc.boss-trusted-local.v7",
     bossRunId: "boss-00000000-0000-4000-8000-000000000001",
     handle: "boss-aaaaaaaaaa",
     goal: "pause exactly",
@@ -34,6 +34,8 @@ function run(): TrustedLocalBossRun {
     currentFreeze: null,
     pauseTransitions: [],
     currentPause: null,
+    pauseReconciliations: [],
+    currentPauseDegradation: null,
     assignments: [assignment("manager"), assignment("worker"), assignment("scout"), assignment("adversary", "requested")],
     deliveries: [], assignmentResults: [], lifecycle: [], proofPackets: [], decisions: [], cancellation: null,
     createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
@@ -101,6 +103,26 @@ test("restart reconciliation rejects changed WorkerStore incarnation, ownership,
   assert.throws(() => validatePersistedBossSystemdPauseTargets(bossRun, [{ ...participant, state: "stopped" }], [target]), /owned live systemd identity changed/);
   assert.throws(() => validatePersistedBossSystemdPauseTargets(bossRun, [{ ...participant, unit: "replacement.service" }], [target]), /owned live systemd identity changed/);
   assert.throws(() => validatePersistedBossSystemdPauseTargets(bossRun, [{ ...participant, mainPid: 201 }], [target]), /main PID changed/);
+});
+
+test("accepted pause verification requires every exact live target to remain frozen", async () => {
+  const bossRun = run();
+  const participant = worker("worker");
+  bossRun.state = "paused";
+  bossRun.currentPause = {
+    version: "orc.boss-pause.v1",
+    pauseRevision: 1,
+    transitionRevision: 1,
+    targets: [{ role: "worker", workerId: participant.id, workerIncarnationId: participant.workerIncarnationId!, unit: participant.unit!, mainPid: participant.mainPid! }],
+    intentionallyUnfrozenManagerWorkerId: "boss-manager",
+    timers: [],
+    authorizedBySessionId: "controller-session",
+    pausedAt: "2026-01-01T00:00:00.000Z",
+  };
+  await assert.doesNotReject(verifyAcceptedBossSystemdPause({ async exec() { return ok(status("frozen")); } }, bossRun, [participant]));
+  await assert.rejects(verifyAcceptedBossSystemdPause({ async exec() { return ok(status("running")); } }, bossRun, [participant]), /accepted pause drifted.*running/);
+  await assert.rejects(verifyAcceptedBossSystemdPause({ async exec() { return ok(status("frozen", 201)); } }, bossRun, [participant]), /main PID changed/);
+  await assert.rejects(verifyAcceptedBossSystemdPause({ async exec() { return ok(status("frozen")); } }, bossRun, [{ ...participant, state: "stopped" }]), /owned live systemd identity changed/);
 });
 
 test("restart recovery thaws every surviving exact target without reversing prior recovery", async () => {

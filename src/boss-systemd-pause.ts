@@ -61,6 +61,21 @@ export function validatePersistedBossSystemdPauseTargets(run: TrustedLocalBossRu
   }
 }
 
+export async function verifyAcceptedBossSystemdPause(
+  runner: CommandRunner,
+  run: TrustedLocalBossRun,
+  workers: readonly WorkerRecord[],
+): Promise<void> {
+  if (!run.currentPause) throw new Error("Boss accepted pause projection is unavailable");
+  const targets: BossSystemdPauseTarget[] = run.currentPause.targets.map((target) => ({ ...target, expectedMainPid: target.mainPid }));
+  validatePersistedBossSystemdPauseTargets(run, workers, targets);
+  for (const target of targets) {
+    const status = await getUnitStatus(runner, target.unit);
+    assertExactLiveUnit(status, target.unit, target.expectedMainPid);
+    if (status.freezerState !== "frozen") throw new Error(`Boss unit ${target.unit} accepted pause drifted to FreezerState=${status.freezerState ?? "unknown"}`);
+  }
+}
+
 export function resolveBossSystemdPausePlan(run: TrustedLocalBossRun, workers: readonly WorkerRecord[]): BossSystemdPausePlan {
   if (run.state !== "active" && run.state !== "paused") throw new Error(`Boss run ${run.bossRunId} is not controllable from ${run.state}`);
   const manager = exactAssignedWorker(run, "manager", workers);

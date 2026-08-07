@@ -336,6 +336,29 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     assert.doesNotMatch(defaultCreated.content[0].text, /Boss create capability report/);
     assert.equal(launches.length, 6, "omitting requirements preserves ordinary three-role staffing");
 
+    const degradedRunId = defaultCreated.details.run.bossRunId as string;
+    const driftPaused = await tools.get("boss").execute(
+      "boss-accepted-pause-drift-pause",
+      { action: "pause", bossRunId: degradedRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    const driftedUnit = driftPaused.details.run.currentPause.targets[0].unit as string;
+    frozenUnits.delete(driftedUnit);
+    const degradedStatus = await tools.get("boss").execute(
+      "boss-accepted-pause-drift-status",
+      { action: "status", bossRunId: degradedRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(degradedStatus.details.run.state, "paused");
+    assert.equal(degradedStatus.details.run.currentPauseDegradation.outcome, "degraded");
+    assert.match(degradedStatus.content[0].text, /accepted pause drifted to FreezerState=running/);
+    assert.match(degradedStatus.content[0].text, /No new Controller authorization is implied/);
+    assert.equal(frozenUnits.size, 0, "accepted-pause degradation moves every surviving unit toward thaw");
+
     const reviewable = await tools.get("boss").execute(
       "boss-review-cleanup-retry-create",
       { action: "create", goal: "retry terminal cleanup after transient stop failure", requirements: { worktree: "write" } },
