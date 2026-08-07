@@ -204,6 +204,31 @@ test("trusted-local Boss supports pause, resume, proof snapshot, and cancel", as
   }
 });
 
+test("trusted-local Boss exposes only exact durable applying pause controls for restart reconciliation", async () => {
+  const { dir, store } = await fixture();
+  try {
+    const created = await store.execute(parseBossCommand("create recover interrupted pause"), "controller-restart");
+    const transition = await store.beginPauseControl({
+      bossRunId: created.run!.bossRunId,
+      managerSessionId: "controller-restart",
+      action: "pause",
+      targets: [],
+      intentionallyUnfrozenManagerWorkerId: null,
+      timers: [],
+    });
+    const pending = await store.applyingPauseControls();
+    assert.equal(pending.length, 1);
+    assert.equal(pending[0].run.bossRunId, created.run!.bossRunId);
+    assert.deepEqual(pending[0].transition, transition);
+    pending[0].transition.phase = "failed";
+    assert.equal((await store.applyingPauseControls())[0].transition.phase, "applying", "reconciliation snapshots are detached");
+    await store.finishPauseControl(created.run!.bossRunId, transition.actionId);
+    assert.deepEqual(await store.applyingPauseControls(), []);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("trusted-local Boss permits concurrent open runs and rejects premature approvals", async () => {
   const { dir, store } = await fixture();
   try {

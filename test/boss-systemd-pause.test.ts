@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyBossSystemdPausePlan, captureBossPausedTimers, resolveBossSystemdPausePlan, restoreBossWorkerTimers, setBossUnitFreezerState, suspendBossWorkerTimers, waitForUnitFreezerState } from "../src/boss-systemd-pause.ts";
+import { applyBossSystemdPausePlan, captureBossPausedTimers, recoverBossSystemdPauseTargets, resolveBossSystemdPausePlan, restoreBossWorkerTimers, setBossUnitFreezerState, suspendBossWorkerTimers, validatePersistedBossSystemdPauseTargets, waitForUnitFreezerState } from "../src/boss-systemd-pause.ts";
 import type { WorkerStore } from "../src/store.ts";
 import type { TrustedLocalBossRun } from "../src/boss-trusted-local.ts";
 import type { WorkerRecord } from "../src/types.ts";
@@ -89,6 +89,38 @@ test("pause planning fails closed for missing, conflicting, unowned, or non-syst
   assert.throws(() => resolveBossSystemdPausePlan(run(), base.map((entry) => entry.role === "worker" ? { ...entry, bossRunId: "boss-other" } : entry)), /not the exact owned run participant/);
   assert.throws(() => resolveBossSystemdPausePlan(run(), base.map((entry) => entry.role === "worker" ? { ...entry, owned: false } : entry)), /not the exact owned run participant/);
   assert.throws(() => resolveBossSystemdPausePlan(run(), base.map((entry) => entry.role === "worker" ? { ...entry, unit: undefined } : entry)), /not attached to a controllable systemd unit/);
+});
+
+test("restart reconciliation rejects changed WorkerStore incarnation, ownership, liveness, unit, and PID", () => {
+  const bossRun = run();
+  const participant = worker("worker");
+  const target = { role: "worker" as const, workerId: participant.id, workerIncarnationId: participant.workerIncarnationId!, unit: participant.unit!, expectedMainPid: participant.mainPid };
+  assert.doesNotThrow(() => validatePersistedBossSystemdPauseTargets(bossRun, [participant], [target]));
+  assert.throws(() => validatePersistedBossSystemdPauseTargets(bossRun, [{ ...participant, workerIncarnationId: "replacement", runId: "replacement" }], [target]), /incarnation changed/);
+  assert.throws(() => validatePersistedBossSystemdPauseTargets(bossRun, [{ ...participant, owned: false }], [target]), /owned live systemd identity changed/);
+  assert.throws(() => validatePersistedBossSystemdPauseTargets(bossRun, [{ ...participant, state: "stopped" }], [target]), /owned live systemd identity changed/);
+  assert.throws(() => validatePersistedBossSystemdPauseTargets(bossRun, [{ ...participant, unit: "replacement.service" }], [target]), /owned live systemd identity changed/);
+  assert.throws(() => validatePersistedBossSystemdPauseTargets(bossRun, [{ ...participant, mainPid: 201 }], [target]), /main PID changed/);
+});
+
+test("restart recovery thaws every surviving exact target without reversing prior recovery", async () => {
+  const states = new Map([["worker.service", "frozen"], ["scout.service", "frozen"]]);
+  const actions: string[] = [];
+  const failures = await recoverBossSystemdPauseTargets({ async exec(command, args) {
+    const unit = args.includes("show") ? args[2] : args.at(-1)!;
+    if (args.includes("show")) return ok(status(states.get(unit)!, unit === "worker.service" ? 200 : 300));
+    actions.push(`${args[1]}:${unit}`);
+    if (unit === "worker.service") return { stdout: "", stderr: "gone", code: 1 };
+    states.set(unit, "running");
+    return ok();
+  } }, [
+    { role: "worker", workerId: "boss-worker", workerIncarnationId: "incarnation-worker", unit: "worker.service", expectedMainPid: 200 },
+    { role: "scout", workerId: "boss-scout", workerIncarnationId: "incarnation-scout", unit: "scout.service", expectedMainPid: 300 },
+  ], "running", { timeoutMs: 50, intervalMs: 1 });
+  assert.equal(failures.length, 1);
+  assert.match(failures[0], /worker\.service.*gone/);
+  assert.deepEqual(actions, ["thaw:worker.service", "thaw:scout.service"]);
+  assert.equal(states.get("scout.service"), "running");
 });
 
 test("systemd freeze and thaw require exact settled live identity and verify FreezerState", async () => {

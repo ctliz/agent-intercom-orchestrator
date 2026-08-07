@@ -1002,6 +1002,14 @@ export class TrustedLocalBossStore {
     });
   }
 
+  async applyingPauseControls(): Promise<Array<{ run: TrustedLocalBossRun; transition: TrustedLocalBossPauseTransition }>> {
+    const state = await this.readState();
+    return state.runs.flatMap((run) => {
+      const transition = run.pauseTransitions.at(-1);
+      return transition?.phase === "applying" ? [{ run: structuredClone(run), transition: structuredClone(transition) }] : [];
+    });
+  }
+
   async finishPauseControl(bossRunId: string, actionId: string, error?: unknown): Promise<TrustedLocalBossResult> {
     return this.mutate((state, timestamp) => {
       const run = state.runs.find((candidate) => candidate.bossRunId === bossRunId);

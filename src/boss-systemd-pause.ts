@@ -47,6 +47,20 @@ function exactAssignedWorker(run: TrustedLocalBossRun, role: TrustedLocalBossAss
  * deliberately validated and returned separately, but can never become a
  * freeze target: it must remain runnable while the Controller awaits it.
  */
+export function validatePersistedBossSystemdPauseTargets(run: TrustedLocalBossRun, workers: readonly WorkerRecord[], targets: readonly BossSystemdPauseTarget[]): void {
+  for (const target of targets) {
+    const worker = workers.find((candidate) => candidate.id === target.workerId && workerIncarnation(candidate) === target.workerIncarnationId);
+    if (!worker) throw new Error(`Boss ${target.role} exact WorkerStore incarnation changed during pause reconciliation`);
+    if (!worker.owned || worker.bossRunId !== run.bossRunId || worker.managerSessionId !== run.managerSessionId
+      || worker.backend !== "systemd" || worker.unit !== target.unit || !isLiveState(worker.state)) {
+      throw new Error(`Boss ${target.role} exact owned live systemd identity changed during pause reconciliation`);
+    }
+    if (!target.expectedMainPid || worker.mainPid !== target.expectedMainPid) {
+      throw new Error(`Boss ${target.role} main PID changed during pause reconciliation`);
+    }
+  }
+}
+
 export function resolveBossSystemdPausePlan(run: TrustedLocalBossRun, workers: readonly WorkerRecord[]): BossSystemdPausePlan {
   if (run.state !== "active" && run.state !== "paused") throw new Error(`Boss run ${run.bossRunId} is not controllable from ${run.state}`);
   const manager = exactAssignedWorker(run, "manager", workers);
@@ -122,6 +136,21 @@ export async function setBossUnitFreezerState(
   if (result.killed) throw new Error(`Could not determine whether Boss unit ${target.unit} was ${action}d: systemctl timed out`);
   if (result.code !== 0) throw new Error(`Could not ${action} Boss unit ${target.unit}: ${result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`}`);
   return waitForUnitFreezerState(runner, target.unit, expected, { ...options, expectedMainPid: target.expectedMainPid });
+}
+
+/** Best-effort recovery control used after an interrupted transaction. It never reverses successful recovery work. */
+export async function recoverBossSystemdPauseTargets(
+  runner: CommandRunner,
+  targets: readonly BossSystemdPauseTarget[],
+  expected: BossUnitFreezerState,
+  options: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<string[]> {
+  const failures: string[] = [];
+  for (const target of targets) {
+    try { await setBossUnitFreezerState(runner, target, expected, options); }
+    catch (error) { failures.push(`${target.unit}: ${error instanceof Error ? error.message : String(error)}`); }
+  }
+  return failures;
 }
 
 /** Apply every target in order and compensate already-changed units in reverse on failure. */

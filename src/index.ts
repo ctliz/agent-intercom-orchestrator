@@ -13,7 +13,7 @@ import { BOSS_CREATE_ACCESS_LEVELS, assertDirectInteractiveBossCommand, bossCrea
 import { formatBossCreateCapabilityReport, inspectBossCreateCapabilities, type BossCreateCapabilityReport } from "./boss-create-capabilities.ts";
 import { cleanupProvisionedBossResource, observeProvisionedBossResource, preserveProvisionedBossResource, provisionBossLinkedWorktree, rollbackProvisionedBossWorktree, type ProvisionedBossWorktree } from "./boss-resource.ts";
 import { formatBossReadinessReport, formatBossSetupReport, inspectBossSetup, inspectTrustedLocalBossReadiness } from "./boss-setup.ts";
-import { applyBossSystemdPausePlan, captureBossPausedTimers, resolveBossSystemdPausePlan, restoreBossWorkerTimers, suspendBossWorkerTimers, type BossSystemdPauseTarget } from "./boss-systemd-pause.ts";
+import { applyBossSystemdPausePlan, captureBossPausedTimers, recoverBossSystemdPauseTargets, resolveBossSystemdPausePlan, restoreBossWorkerTimers, suspendBossWorkerTimers, validatePersistedBossSystemdPauseTargets, type BossSystemdPauseTarget } from "./boss-systemd-pause.ts";
 import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossSupervisionEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
 import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, type TrustedLocalBossResult, type TrustedLocalBossRun } from "./boss-trusted-local.ts";
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
@@ -1958,6 +1958,44 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     });
   }
 
+  let bossPauseReconciliation: Promise<void> | undefined;
+  async function reconcileApplyingBossPauseControls(): Promise<void> {
+    if (bossPauseReconciliation) return bossPauseReconciliation;
+    const operation = (async () => {
+      const pending = await trustedLocalBossStore.applyingPauseControls();
+      for (const { run, transition } of pending) {
+        const targets: BossSystemdPauseTarget[] = transition.targets.map((target) => ({
+          role: target.role,
+          workerId: target.workerId,
+          workerIncarnationId: target.workerIncarnationId,
+          unit: target.unit,
+          expectedMainPid: target.mainPid,
+        }));
+        let operationError: unknown;
+        try {
+          const snapshot = await store.read();
+          validatePersistedBossSystemdPauseTargets(run, snapshot.workers, targets);
+          if (transition.action === "pause") {
+            await suspendBossWorkerTimers(store, transition.timers, Date.now());
+            await applyBossSystemdPausePlan(runner, targets, "frozen");
+          } else {
+            await applyBossSystemdPausePlan(runner, targets, "running");
+            await restoreBossWorkerTimers(store, transition.timers, Date.now());
+          }
+        } catch (error) {
+          const recoveryFailures = await recoverBossSystemdPauseTargets(runner, targets, "running");
+          try { await restoreBossWorkerTimers(store, transition.timers, Date.now()); }
+          catch (restoreError) { recoveryFailures.push(`timers: ${restoreError instanceof Error ? restoreError.message : String(restoreError)}`); }
+          operationError = new Error(`Boss restart reconciliation could not complete ${transition.action}: ${error instanceof Error ? error.message : String(error)}${recoveryFailures.length ? `; recovery incomplete: ${recoveryFailures.join("; ")}` : "; affected units were thawed and timers restored"}`);
+        }
+        await trustedLocalBossStore.finishPauseControl(run.bossRunId, transition.actionId, operationError);
+      }
+    })();
+    bossPauseReconciliation = operation;
+    try { await operation; }
+    finally { if (bossPauseReconciliation === operation) bossPauseReconciliation = undefined; }
+  }
+
   async function executeBossSystemdPauseControl(run: TrustedLocalBossRun, action: "pause" | "resume", ownerSessionId: string): Promise<TrustedLocalBossResult> {
     const snapshot = await store.read();
     const plan = resolveBossSystemdPausePlan(run, snapshot.workers);
@@ -2065,6 +2103,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       const report = await trustedLocalBossReadiness(ctx);
       return { title: "Orc Boss readiness", message: formatBossReadinessReport(report) };
     }
+    await reconcileApplyingBossPauseControls();
     await synchronizeTrustedLocalBossWorkers();
     let capabilityReport: BossCreateCapabilityReport | undefined;
     let provisionedWorktree: ProvisionedBossWorktree | undefined;
@@ -2658,6 +2697,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       });
     }
     await reconcile();
+    await reconcileApplyingBossPauseControls();
     await synchronizeTrustedLocalBossWorkers();
     if (config.cleanupExpiredOnStart && process.env.AGENT_INTERCOM_SKIP_STARTUP_CLEANUP !== "1") await cleanupExpired(true);
     clearInterval(heartbeat);
@@ -2667,6 +2707,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       heartbeatRunning = true;
       void runLifecycleHeartbeat(ctx).then(async (result) => {
         if (currentCtx !== ctx) return;
+        await reconcileApplyingBossPauseControls();
         await synchronizeTrustedLocalBossWorkers();
         for (const request of result.checkpointRequests) {
           pi.events.emit(INTERCOM_LIFECYCLE_SEND_EVENT, {
