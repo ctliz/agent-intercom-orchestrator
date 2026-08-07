@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { applyBossSystemdPausePlan, captureBossPausedTimers, recoverBossSystemdPauseTargets, resolveBossSystemdPausePlan, restoreBossWorkerTimers, setBossUnitFreezerState, suspendBossWorkerTimers, validatePersistedBossSystemdPauseTargets, verifyAcceptedBossSystemdPause, waitForUnitFreezerState } from "../src/boss-systemd-pause.ts";
 import type { WorkerStore } from "../src/store.ts";
-import type { TrustedLocalBossRun } from "../src/boss-trusted-local.ts";
+import { TRUSTED_LOCAL_BOSS_RUN_VERSION, type TrustedLocalBossRun } from "../src/boss-trusted-local.ts";
 import type { WorkerRecord } from "../src/types.ts";
 
 const ok = (stdout = "") => ({ stdout, stderr: "", code: 0 });
@@ -21,7 +21,7 @@ function run(): TrustedLocalBossRun {
     updatedAt: "2026-01-01T00:00:00.000Z",
   });
   return {
-    version: "orc.boss-trusted-local.v7",
+    version: TRUSTED_LOCAL_BOSS_RUN_VERSION,
     bossRunId: "boss-00000000-0000-4000-8000-000000000001",
     handle: "boss-aaaaaaaaaa",
     goal: "pause exactly",

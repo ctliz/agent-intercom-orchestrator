@@ -439,6 +439,56 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     );
     assert.equal(degradedCancelled.details.run.cancellation.state, "succeeded", "an accepted degraded resume durably settles an exact missing target for terminal shutdown");
 
+    const liveRecovered = await restartedTools.get("boss").execute(
+      "boss-degraded-live-recovery-create",
+      { action: "create", goal: "Do not mask failures after a live degraded resume" },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    const liveRecoveredRunId = liveRecovered.details.run.bossRunId as string;
+    const liveRecoveredPaused = await restartedTools.get("boss").execute(
+      "boss-degraded-live-recovery-pause",
+      { action: "pause", bossRunId: liveRecoveredRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    frozenUnits.delete(liveRecoveredPaused.details.run.currentPause.targets[0].unit);
+    await restartedTools.get("boss").execute(
+      "boss-degraded-live-recovery-status",
+      { action: "status", bossRunId: liveRecoveredRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    const liveRecoveredResumed = await restartedTools.get("boss").execute(
+      "boss-degraded-live-recovery-resume",
+      { action: "resume", bossRunId: liveRecoveredRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.deepEqual(liveRecoveredResumed.details.run.pauseTransitions.at(-1).settledTargets, [], "live thawed targets are not durably classified as terminal settlements");
+    const laterFailedTarget = liveRecoveredResumed.details.run.pauseTransitions.at(-1).targets[0];
+    const laterFailedState = JSON.parse(await readFile(statePath, "utf8"));
+    const laterFailedWorker = laterFailedState.workers.find((worker: any) => worker.id === laterFailedTarget.workerId && (worker.workerIncarnationId ?? worker.runId) === laterFailedTarget.workerIncarnationId);
+    laterFailedWorker.state = "stopped";
+    laterFailedWorker.stoppedAt = Date.now();
+    laterFailedWorker.stopReason = "failed after the degraded resume completed";
+    laterFailedWorker.updatedAt = laterFailedWorker.stoppedAt;
+    await writeFile(statePath, `${JSON.stringify(laterFailedState, null, 2)}\n`, "utf8");
+    stoppedUnits.add(laterFailedTarget.unit);
+    const liveRecoveredFailed = await restartedTools.get("boss").execute(
+      "boss-degraded-live-recovery-later-failure",
+      { action: "status", bossRunId: liveRecoveredRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(liveRecoveredFailed.details.run.state, "failed", "a historical degraded resume must not suppress a later failure of a target that was live during recovery");
+    assert.equal(liveRecoveredFailed.details.run.assignments.find((assignment: any) => assignment.workerId === laterFailedTarget.workerId).state, "failed");
+
     const decideDegradedMissingTarget = async (outcome: "approve" | "reject") => {
       const created = await restartedTools.get("boss").execute(
         `boss-degraded-${outcome}-create`,

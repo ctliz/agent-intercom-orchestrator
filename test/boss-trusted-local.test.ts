@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import test from "node:test";
 import { parseBossCommand, type BossCommandRequest } from "../src/boss-command.ts";
 import { preserveProvisionedBossResource } from "../src/boss-resource.ts";
-import { TRUSTED_LOCAL_BOSS_AUTHENTICATED_COMMUNICATION_DEADLINE_MS, TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, deterministicBossRunHandle, type TrustedLocalBossResource, type TrustedLocalBossResult } from "../src/boss-trusted-local.ts";
+import { TRUSTED_LOCAL_BOSS_AUTHENTICATED_COMMUNICATION_DEADLINE_MS, TRUSTED_LOCAL_BOSS_RUN_VERSION, TRUSTED_LOCAL_BOSS_STORE_VERSION, TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, deterministicBossRunHandle, type TrustedLocalBossResource, type TrustedLocalBossResult } from "../src/boss-trusted-local.ts";
 import type { BossCandidateFingerprint } from "../src/boss-candidate-fingerprint.ts";
 import type { WorkerRecord } from "../src/types.ts";
 
@@ -120,8 +120,8 @@ test("trusted-local Boss creates and reports an explicitly advisory run", async 
 
     const disk = JSON.parse(await readFile(join(dir, "runs.json"), "utf8"));
     assert.equal(disk.revision, 1);
-    assert.equal(disk.version, "orc.boss-trusted-local.v9");
-    assert.equal(disk.runs[0].version, "orc.boss-trusted-local.v7");
+    assert.equal(disk.version, TRUSTED_LOCAL_BOSS_STORE_VERSION);
+    assert.equal(disk.runs[0].version, TRUSTED_LOCAL_BOSS_RUN_VERSION);
     assert.equal(disk.runs[0].resource, null);
     assert.equal(disk.currentRunId, undefined);
     assert.equal(disk.runs[0].assignments[0].role, "manager");
@@ -238,6 +238,10 @@ test("trusted-local Boss migrates v8/v6 accepted pauses without inventing degrad
     const legacy = JSON.parse(await readFile(path, "utf8"));
     legacy.version = "orc.boss-trusted-local.v8";
     legacy.runs[0].version = "orc.boss-trusted-local.v6";
+    for (const transition of legacy.runs[0].pauseTransitions) {
+      transition.version = "orc.boss-pause-transition.v1";
+      delete transition.settledTargets;
+    }
     delete legacy.runs[0].pauseReconciliations;
     delete legacy.runs[0].currentPauseDegradation;
     await writeFile(path, JSON.stringify(legacy));
@@ -251,9 +255,38 @@ test("trusted-local Boss migrates v8/v6 accepted pauses without inventing degrad
     assert.equal(JSON.parse(await readFile(path, "utf8")).version, "orc.boss-trusted-local.v8", "read-only migration preserves the compatible source schema");
     await reopened.recordPauseDegradation(created.run!.bossRunId, 1, 1, "post-migration observed drift");
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.version, "orc.boss-trusted-local.v9");
-    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v7");
+    assert.equal(migrated.version, TRUSTED_LOCAL_BOSS_STORE_VERSION);
+    assert.equal(migrated.runs[0].version, TRUSTED_LOCAL_BOSS_RUN_VERSION);
     assert.equal(migrated.runs[0].pauseReconciliations.length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("trusted-local Boss migrates v9/v7 pause transitions without inventing per-target settlement", async () => {
+  const { dir, store } = await fixture();
+  const path = join(dir, "runs.json");
+  try {
+    const created = await store.execute(parseBossCommand("create migrate pre-settlement pause"), "controller-v9-pause");
+    await applyPersistedPause(store, created.run!.bossRunId, "controller-v9-pause", "pause");
+    const legacy = JSON.parse(await readFile(path, "utf8"));
+    legacy.version = "orc.boss-trusted-local.v9";
+    legacy.runs[0].version = "orc.boss-trusted-local.v7";
+    for (const transition of legacy.runs[0].pauseTransitions) {
+      transition.version = "orc.boss-pause-transition.v1";
+      delete transition.settledTargets;
+    }
+    await writeFile(path, JSON.stringify(legacy));
+
+    const reopened = new TrustedLocalBossStore(path);
+    const status = await reopened.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "controller-v9-pause");
+    assert.deepEqual(status.run?.pauseTransitions[0].settledTargets, [], "legacy accepted pauses do not invent terminal target outcomes");
+    await applyPersistedPause(reopened, created.run!.bossRunId, "controller-v9-pause", "resume");
+    const migrated = JSON.parse(await readFile(path, "utf8"));
+    assert.equal(migrated.version, TRUSTED_LOCAL_BOSS_STORE_VERSION);
+    assert.equal(migrated.runs[0].version, TRUSTED_LOCAL_BOSS_RUN_VERSION);
+    assert.equal(migrated.runs[0].pauseTransitions[0].version, "orc.boss-pause-transition.v2");
+    assert.deepEqual(migrated.runs[0].pauseTransitions[0].settledTargets, []);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -403,9 +436,9 @@ test("trusted-local Boss reads v1 state and migrates it on the next write", asyn
     assert.equal(JSON.parse(await readFile(path, "utf8")).version, "orc.boss-trusted-local.v1", "read-only status keeps the compatible v1 file intact");
     await reopened.execute(parseBossCommand("create migrated sibling run"), "controller-legacy");
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.version, "orc.boss-trusted-local.v9");
+    assert.equal(migrated.version, TRUSTED_LOCAL_BOSS_STORE_VERSION);
     assert.equal(migrated.currentRunId, undefined);
-    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v7");
+    assert.equal(migrated.runs[0].version, TRUSTED_LOCAL_BOSS_RUN_VERSION);
     assert.equal(migrated.runs[0].resource, null);
     assert.equal(migrated.runs.length, 2);
     assert.deepEqual((await readdir(dir)).filter((entry) => entry.includes(".tmp-")), [], "atomic rename leaves no partial migration file");
@@ -435,8 +468,8 @@ test("trusted-local Boss reads v3 activity state and upgrades it without inventi
     const afterControl = await reopened.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "controller-v3-migration");
     assert.equal(afterControl.communication?.find((entry) => entry.role === "manager")?.communicationStatus, "deadline_unavailable", "Controller controls cannot mint or reset a legacy deadline");
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.version, "orc.boss-trusted-local.v9");
-    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v7");
+    assert.equal(migrated.version, TRUSTED_LOCAL_BOSS_STORE_VERSION);
+    assert.equal(migrated.runs[0].version, TRUSTED_LOCAL_BOSS_RUN_VERSION);
     assert.equal(migrated.runs[0].resource, null, "migration does not invent a canonical resource");
     assert.equal(migrated.runs[0].acceptanceRevision, null, "migration does not invent an acceptance revision");
     assert.equal(migrated.runs[0].currentFreeze, null, "migration does not invent a freeze");
@@ -475,8 +508,8 @@ test("trusted-local Boss migrates v6/v4 proof packets with explicit unavailable 
     await assert.rejects(reopened.recordProofDelivery(bossRunId, status.run!.proofPackets[0].proofPacketId, fingerprint), /exact current freeze and fingerprint revisions/);
     await applyPersistedPause(reopened, bossRunId, "controller-v4-proof-migration", "pause");
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.version, "orc.boss-trusted-local.v9");
-    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v7");
+    assert.equal(migrated.version, TRUSTED_LOCAL_BOSS_STORE_VERSION);
+    assert.equal(migrated.runs[0].version, TRUSTED_LOCAL_BOSS_RUN_VERSION);
     assert.equal(migrated.runs[0].proofPackets[0].fingerprintSha256, null);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -515,7 +548,7 @@ test("trusted-local Boss migrates deployed v7/v5 bound proof, delivery, and deci
     assert.equal(status.run?.decisions[0].outcome, "approved");
     await reopened.execute(parseBossCommand("create force v5 migration write"), controller);
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v7");
+    assert.equal(migrated.runs[0].version, TRUSTED_LOCAL_BOSS_RUN_VERSION);
     assert.equal(migrated.runs[0].proofPackets[0].fingerprintSha256, fingerprint.aggregateSha256);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -555,7 +588,7 @@ test("trusted-local Boss migrates v3 canonical proof, delivery, and decision his
     assert.equal(status.run?.decisions[0].outcome, "approved");
     await reopened.execute(parseBossCommand("create force v3 migration write"), controller);
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v7");
+    assert.equal(migrated.runs[0].version, TRUSTED_LOCAL_BOSS_RUN_VERSION);
     assert.equal(migrated.runs[0].proofPackets[0].fingerprintSha256, null);
     assert.equal(migrated.runs[0].decisions[0].outcome, "approved");
   } finally {
@@ -584,7 +617,7 @@ test("trusted-local Boss upgrades active v3 canonical resources to initial Contr
     const frozen = await reopened.authorizeFreeze({ bossRunId, managerSessionId: controller, expectedAcceptanceRevision: 1, expectedDesignRevision: 1, fingerprint: candidateFingerprint(resource) });
     assert.equal(frozen.freezeTransition?.outcome, "accepted");
     assert.equal(frozen.run?.currentFreeze?.freezeRevision, 1);
-    assert.equal(JSON.parse(await readFile(path, "utf8")).runs[0].version, "orc.boss-trusted-local.v7");
+    assert.equal(JSON.parse(await readFile(path, "utf8")).runs[0].version, TRUSTED_LOCAL_BOSS_RUN_VERSION);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -642,8 +675,8 @@ test("trusted-local Boss assigns deterministic handles while migrating v2 run re
     assert.equal((await reopened.execute(parseBossCommand(`status ${migratedHandle}`), "controller-handle-migration")).run?.handle, migratedHandle);
     await reopened.execute(parseBossCommand("create migration writer"), "controller-handle-migration");
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.version, "orc.boss-trusted-local.v9");
-    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v7");
+    assert.equal(migrated.version, TRUSTED_LOCAL_BOSS_STORE_VERSION);
+    assert.equal(migrated.runs[0].version, TRUSTED_LOCAL_BOSS_RUN_VERSION);
     assert.equal(migrated.runs[0].resource, null);
     assert.equal(migrated.runs[0].assignments[0].resourceRevision, null);
     assert.equal(migrated.runs[0].handle, migratedHandle);
