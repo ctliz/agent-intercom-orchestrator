@@ -13,7 +13,7 @@ import { BOSS_CREATE_ACCESS_LEVELS, assertDirectInteractiveBossCommand, bossCrea
 import { formatBossCreateCapabilityReport, inspectBossCreateCapabilities, type BossCreateCapabilityReport } from "./boss-create-capabilities.ts";
 import { cleanupProvisionedBossResource, observeProvisionedBossResource, preserveProvisionedBossResource, provisionBossLinkedWorktree, rollbackProvisionedBossWorktree, type ProvisionedBossWorktree } from "./boss-resource.ts";
 import { formatBossReadinessReport, formatBossSetupReport, inspectBossSetup, inspectTrustedLocalBossReadiness } from "./boss-setup.ts";
-import { applyBossSystemdPausePlan, captureBossPausedTimers, recoverBossSystemdPauseTargets, resolveBossSystemdPausePlan, restoreBossWorkerTimers, suspendBossWorkerTimers, validatePersistedBossSystemdPauseTargets, verifyAcceptedBossSystemdPause, type BossSystemdPauseTarget } from "./boss-systemd-pause.ts";
+import { applyBossSystemdPausePlan, bossWorkerTimersSuspended, captureBossPausedTimers, recoverBossSystemdPauseTargets, resolveBossSystemdPausePlan, restoreBossWorkerTimers, suspendBossWorkerTimers, validatePersistedBossSystemdPauseTargets, verifyAcceptedBossSystemdPause, type BossSystemdPauseTarget } from "./boss-systemd-pause.ts";
 import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossSupervisionEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
 import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, type TrustedLocalBossAssignment, type TrustedLocalBossPausedTimer, type TrustedLocalBossResult, type TrustedLocalBossRun } from "./boss-trusted-local.ts";
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
@@ -418,7 +418,7 @@ export function renewObservedWorkerLeases(
   for (const worker of state.workers) {
     if (!observedLiveRuns.has(`${worker.id}\u0000${worker.runId}`)) continue;
     if (worker.managerSessionId !== managerId || !worker.owned || !isLiveState(worker.state) || worker.stateReason === "stop_in_progress") continue;
-    if (pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) continue;
+    if (bossWorkerTimersSuspended(worker) || pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) continue;
     changed = initializeWorkerLifecycle(worker, config, now) || changed;
     const lastActivity = worker.lastWorkerActivityAt!;
     const idleDeadline = worker.idleDeadlineAt!;
@@ -950,7 +950,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     await store.mutateConditionally((state) => {
       let changed = false;
       for (const worker of state.workers) {
-        if (pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) continue;
+        if (bossWorkerTimersSuspended(worker) || pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) continue;
         changed = initializeWorkerLifecycle(worker, config, now) || changed;
       }
       return { value: undefined, changed };
@@ -958,7 +958,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     const migrated = await store.read();
     const claimedIds = new Set((migrated.runtimeCleanupClaims ?? []).map((claim) => claim.workerId));
     const liveCandidates = migrated.workers.flatMap((worker) => {
-      if (pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) return [];
+      if (bossWorkerTimersSuspended(worker) || pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) return [];
       const reason = cleanupReason(worker, now);
       return reason ? [{ worker, reason, kind: "stop" as const }] : [];
     });
@@ -2058,8 +2058,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         return target;
       });
     const persistedTargets = targets.map((target) => ({ role: target.role, workerId: target.workerId, workerIncarnationId: target.workerIncarnationId, unit: target.unit, mainPid: target.expectedMainPid! }));
+    const timerCaptureAt = Date.now();
     const timers = action === "pause"
-      ? captureBossPausedTimers(snapshot, targets, Date.now(), config.checkpointRetryMinutes * 60_000)
+      ? captureBossPausedTimers(snapshot, targets, timerCaptureAt, config.checkpointRetryMinutes * 60_000)
       : run.currentPause?.timers;
     if (!timers) throw new Error("Trusted-local Boss resume requires exact suspended timer budgets");
     if (action === "resume" && JSON.stringify(persistedTargets) !== JSON.stringify(run.currentPause?.targets)) {
@@ -2077,7 +2078,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     if (action === "pause") {
       let timersSuspended = false;
       try {
-        await suspendBossWorkerTimers(store, timers, Date.now());
+        await suspendBossWorkerTimers(store, timers, Date.now(), { expectedCurrentAt: timerCaptureAt });
         timersSuspended = true;
         await applyBossSystemdPausePlan(runner, targets, "frozen");
       } catch (error) {

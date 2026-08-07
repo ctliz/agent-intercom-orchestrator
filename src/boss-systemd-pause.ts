@@ -200,6 +200,11 @@ export async function applyBossSystemdPausePlan(
 
 const SUSPENDED_DEADLINE = 8_640_000_000_000_000 - 1;
 
+/** WorkerStore-resident lifecycle fence observed atomically by heartbeat and cleanup mutations. */
+export function bossWorkerTimersSuspended(worker: WorkerRecord): boolean {
+  return worker.leaseExpiresAt === SUSPENDED_DEADLINE;
+}
+
 export function captureBossPausedTimers(
   state: WorkerStateFile,
   targets: readonly BossSystemdPauseTarget[],
@@ -229,10 +234,32 @@ function exactTimerWorker(state: WorkerStateFile, timer: TrustedLocalBossPausedT
 }
 
 /** Fence WorkerStore lifecycle timers while systemd units are frozen. */
-export async function suspendBossWorkerTimers(store: WorkerStore, timers: readonly TrustedLocalBossPausedTimer[], now: number): Promise<void> {
+export async function suspendBossWorkerTimers(
+  store: WorkerStore,
+  timers: readonly TrustedLocalBossPausedTimer[],
+  now: number,
+  options: { expectedCurrentAt?: number } = {},
+): Promise<void> {
   await store.mutate((state) => {
     for (const timer of timers) {
       const worker = exactTimerWorker(state, timer);
+      if (bossWorkerTimersSuspended(worker)) continue;
+      if (!isLiveState(worker.state) || worker.stateReason === "stop_in_progress") {
+        throw new Error(`Boss worker ${timer.workerId} lifecycle changed before timer fencing`);
+      }
+      if (options.expectedCurrentAt !== undefined) {
+        const capturedAt = options.expectedCurrentAt;
+        const expected = [
+          ["lease", worker.leaseExpiresAt, capturedAt + timer.leaseRemainingMs],
+          ...(timer.idleRemainingMs === null ? [] : [["idle", worker.idleDeadlineAt, capturedAt + timer.idleRemainingMs] as const]),
+          ...(timer.checkpointRemainingMs === null ? [] : [["checkpoint", worker.checkpointDeadlineAt, capturedAt + timer.checkpointRemainingMs] as const]),
+          ...(timer.checkpointRetryRemainingMs === null || timer.checkpointRetryIntervalMs === null
+            ? []
+            : [["checkpoint retry", worker.checkpointLastAttemptAt, capturedAt + timer.checkpointRetryRemainingMs - timer.checkpointRetryIntervalMs] as const]),
+        ] as const;
+        const changed = expected.find(([, actual, captured]) => actual !== captured);
+        if (changed) throw new Error(`Boss worker ${timer.workerId} ${changed[0]} lifecycle changed before timer fencing`);
+      }
       worker.leaseExpiresAt = SUSPENDED_DEADLINE;
       if (timer.idleRemainingMs !== null) worker.idleDeadlineAt = SUSPENDED_DEADLINE;
       if (timer.checkpointRemainingMs !== null) worker.checkpointDeadlineAt = SUSPENDED_DEADLINE;

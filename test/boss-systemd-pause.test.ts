@@ -200,7 +200,7 @@ test("WorkerStore lifecycle timers are fenced during pause and restored from exa
   const state = { version: 3 as const, activeFeatures: ["authenticated-intercom-activity-v1"], generation: 1, workers: [participant], workerGenerations: [], runtimeCleanupClaims: [] };
   const fakeStore = { async mutate(fn: (value: typeof state) => unknown) { return fn(state); } } as unknown as WorkerStore;
   const timers = captureBossPausedTimers(state, [{ role: "worker", workerId: participant.id, workerIncarnationId: participant.workerIncarnationId!, unit: participant.unit!, expectedMainPid: participant.mainPid }], 1_000, 5_000);
-  await suspendBossWorkerTimers(fakeStore, timers, 1_000);
+  await suspendBossWorkerTimers(fakeStore, timers, 1_000, { expectedCurrentAt: 1_000 });
   assert.ok(participant.leaseExpiresAt > 8_000_000_000_000_000);
   assert.equal(participant.idleDeadlineAt, participant.leaseExpiresAt);
   assert.equal(participant.checkpointDeadlineAt, participant.leaseExpiresAt);
@@ -215,6 +215,20 @@ test("WorkerStore lifecycle timers are fenced during pause and restored from exa
   assert.equal(participant.idleDeadlineAt, 121_000);
   assert.equal(participant.checkpointDeadlineAt, 131_000);
   assert.equal(participant.checkpointLastAttemptAt, 100_500);
+});
+
+test("initial timer fencing rejects heartbeat or cleanup lifecycle movement after capture", async () => {
+  const participant = { ...worker("worker"), leaseExpiresAt: 11_000, idleDeadlineAt: 21_000, checkpointDeadlineAt: 31_000, checkpointLastAttemptAt: 500 };
+  const state = { version: 3 as const, activeFeatures: ["authenticated-intercom-activity-v1"], generation: 1, workers: [participant], workerGenerations: [], runtimeCleanupClaims: [] };
+  const fakeStore = { async mutate(fn: (value: typeof state) => unknown) { return fn(state); } } as unknown as WorkerStore;
+  const timers = captureBossPausedTimers(state, [{ role: "worker", workerId: participant.id, workerIncarnationId: participant.workerIncarnationId!, unit: participant.unit!, expectedMainPid: participant.mainPid }], 1_000, 5_000);
+
+  participant.leaseExpiresAt += 1;
+  await assert.rejects(suspendBossWorkerTimers(fakeStore, timers, 1_001, { expectedCurrentAt: 1_000 }), /lease lifecycle changed before timer fencing/);
+  participant.leaseExpiresAt = 11_000;
+  participant.state = "blocked";
+  participant.stateReason = "stop_in_progress";
+  await assert.rejects(suspendBossWorkerTimers(fakeStore, timers, 1_001, { expectedCurrentAt: 1_000 }), /lifecycle changed before timer fencing/);
 });
 
 test("systemd pause control rejects PID movement, queued units, unsupported state, command timeout, and ambiguous verification", async () => {

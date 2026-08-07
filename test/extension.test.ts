@@ -439,6 +439,85 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     );
     assert.equal(degradedCancelled.details.run.cancellation.state, "succeeded", "an accepted degraded resume durably settles an exact missing target for terminal shutdown");
 
+    const decideDegradedMissingTarget = async (outcome: "approve" | "reject") => {
+      const created = await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-create`,
+        { action: "create", goal: `${outcome} after degraded missing target`, requirements: { worktree: "write" } },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      const runId = created.details.run.bossRunId as string;
+      const paused = await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-pause`,
+        { action: "pause", bossRunId: runId },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      frozenUnits.delete(paused.details.run.currentPause.targets[0].unit);
+      const degraded = await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-status`,
+        { action: "status", bossRunId: runId },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      const [dead, missing] = degraded.details.run.currentPause.targets;
+      const workerState = JSON.parse(await readFile(statePath, "utf8"));
+      const deadRecord = workerState.workers.find((worker: any) => worker.id === dead.workerId && (worker.workerIncarnationId ?? worker.runId) === dead.workerIncarnationId);
+      deadRecord.state = "stopped";
+      deadRecord.stoppedAt = Date.now();
+      deadRecord.stopReason = "RuntimeMaxSec elapsed while cgroup-frozen";
+      deadRecord.updatedAt = deadRecord.stoppedAt;
+      workerState.workers = workerState.workers.filter((worker: any) => worker.id !== missing.workerId || (worker.workerIncarnationId ?? worker.runId) !== missing.workerIncarnationId);
+      await writeFile(statePath, `${JSON.stringify(workerState, null, 2)}\n`, "utf8");
+      stoppedUnits.add(dead.unit);
+      stoppedUnits.add(missing.unit);
+      const resumed = await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-resume`,
+        { action: "resume", bossRunId: runId },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      assert.equal(resumed.details.run.currentPause, null);
+      const frozen = await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-freeze`,
+        { action: "freeze", bossRunId: runId, expectedAcceptanceRevision: 1, expectedDesignRevision: 1 },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      assert.equal(frozen.details.run.currentFreeze.freezeRevision, 1);
+      await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-proof`,
+        { action: "proof", bossRunId: runId },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-fresh-proof`,
+        { action: "proof", bossRunId: runId },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      const decided = await restartedTools.get("boss").execute(
+        `boss-degraded-${outcome}-decision`,
+        { action: outcome, bossRunId: runId, note: `${outcome} exact frozen proof` },
+        new AbortController().signal,
+        () => {},
+        ctx,
+      );
+      assert.equal(decided.details.run.state, outcome === "approve" ? "approved" : "rejected");
+      assert.equal(decided.details.run.resource.leaseState, "released", `${outcome} must complete terminal resource cleanup after an accepted degraded resume settles the missing target`);
+      assert.equal(decided.details.run.resource.existence, "verified", "the Controller-frozen candidate is preserved rather than ambiguously deleted");
+    };
+    await decideDegradedMissingTarget("approve");
+    await decideDegradedMissingTarget("reject");
+
     const reviewable = await tools.get("boss").execute(
       "boss-review-cleanup-retry-create",
       { action: "create", goal: "retry terminal cleanup after transient stop failure", requirements: { worktree: "write" } },

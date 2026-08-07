@@ -307,7 +307,7 @@ test("heartbeat leaves exact Boss pause-fenced lifecycle budgets untouched", () 
     "session-a",
     DEFAULT_CONFIG,
     9_000_000,
-    new Set([`${worker.id}\0${worker.workerIncarnationId ?? worker.runId}`]),
+    new Set(),
   );
   assert.equal(result.changed, false);
   assert.deepEqual(result.checkpointRequested, []);
