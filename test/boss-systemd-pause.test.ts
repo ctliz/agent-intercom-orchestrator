@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { resolveBossSystemdPausePlan, setBossUnitFreezerState, waitForUnitFreezerState } from "../src/boss-systemd-pause.ts";
+import { applyBossSystemdPausePlan, captureBossPausedTimers, resolveBossSystemdPausePlan, restoreBossWorkerTimers, setBossUnitFreezerState, suspendBossWorkerTimers, waitForUnitFreezerState } from "../src/boss-systemd-pause.ts";
+import type { WorkerStore } from "../src/store.ts";
 import type { TrustedLocalBossRun } from "../src/boss-trusted-local.ts";
 import type { WorkerRecord } from "../src/types.ts";
 
@@ -20,7 +21,7 @@ function run(): TrustedLocalBossRun {
     updatedAt: "2026-01-01T00:00:00.000Z",
   });
   return {
-    version: "orc.boss-trusted-local.v5",
+    version: "orc.boss-trusted-local.v6",
     bossRunId: "boss-00000000-0000-4000-8000-000000000001",
     handle: "boss-aaaaaaaaaa",
     goal: "pause exactly",
@@ -31,6 +32,8 @@ function run(): TrustedLocalBossRun {
     designRevision: null,
     freezeTransitions: [],
     currentFreeze: null,
+    pauseTransitions: [],
+    currentPause: null,
     assignments: [assignment("manager"), assignment("worker"), assignment("scout"), assignment("adversary", "requested")],
     deliveries: [], assignmentResults: [], lifecycle: [], proofPackets: [], decisions: [], cancellation: null,
     createdAt: "2026-01-01T00:00:00.000Z", updatedAt: "2026-01-01T00:00:00.000Z",
@@ -111,6 +114,48 @@ test("systemd freeze and thaw require exact settled live identity and verify Fre
     return ok();
   } }, { unit: "worker.service", expectedMainPid: 200 }, "running", { timeoutMs: 50, intervalMs: 1 });
   assert.equal(thawed.freezerState, "running");
+});
+
+test("multi-unit pause compensates already frozen units in reverse when a later target fails", async () => {
+  const states = new Map([["worker.service", "running"], ["scout.service", "running"]]);
+  const actions: string[] = [];
+  await assert.rejects(applyBossSystemdPausePlan({ async exec(command, args) {
+    const unit = args.includes("show") ? args[2] : args.at(-1)!;
+    if (args.includes("show")) return ok(status(states.get(unit)!, unit === "worker.service" ? 200 : 300));
+    const action = args[1]; actions.push(`${action}:${unit}`);
+    if (action === "freeze" && unit === "scout.service") return { stdout: "", stderr: "denied", code: 1 };
+    states.set(unit, action === "freeze" ? "frozen" : "running");
+    return ok();
+  } }, [
+    { role: "worker", workerId: "boss-worker", workerIncarnationId: "incarnation-worker", unit: "worker.service", expectedMainPid: 200 },
+    { role: "scout", workerId: "boss-scout", workerIncarnationId: "incarnation-scout", unit: "scout.service", expectedMainPid: 300 },
+  ], "frozen", { timeoutMs: 50, intervalMs: 1 }), /prior unit changes were compensated/);
+  assert.deepEqual(actions, ["freeze:worker.service", "freeze:scout.service", "thaw:worker.service"]);
+  assert.equal(states.get("worker.service"), "running");
+});
+
+test("pause timer capture preserves exact remaining lifecycle budgets", () => {
+  const now = 1_000;
+  const participant = { ...worker("worker"), leaseExpiresAt: 11_000, idleDeadlineAt: 21_000, checkpointDeadlineAt: 31_000, checkpointLastAttemptAt: 500 };
+  const timers = captureBossPausedTimers({ version: 3, activeFeatures: ["authenticated-intercom-activity-v1"], generation: 1, workers: [participant], workerGenerations: [], runtimeCleanupClaims: [] }, [{ role: "worker", workerId: participant.id, workerIncarnationId: participant.workerIncarnationId!, unit: participant.unit!, expectedMainPid: participant.mainPid }], now, 5_000);
+  assert.deepEqual(timers, [{ workerId: participant.id, workerIncarnationId: participant.workerIncarnationId, leaseRemainingMs: 10_000, idleRemainingMs: 20_000, checkpointRemainingMs: 30_000, checkpointRetryRemainingMs: 4_500, checkpointRetryIntervalMs: 5_000 }]);
+});
+
+test("WorkerStore lifecycle timers are fenced during pause and restored from exact remaining budgets", async () => {
+  const participant = { ...worker("worker"), leaseExpiresAt: 11_000, idleDeadlineAt: 21_000, checkpointDeadlineAt: 31_000, checkpointLastAttemptAt: 500 };
+  const state = { version: 3 as const, activeFeatures: ["authenticated-intercom-activity-v1"], generation: 1, workers: [participant], workerGenerations: [], runtimeCleanupClaims: [] };
+  const fakeStore = { async mutate(fn: (value: typeof state) => unknown) { return fn(state); } } as unknown as WorkerStore;
+  const timers = captureBossPausedTimers(state, [{ role: "worker", workerId: participant.id, workerIncarnationId: participant.workerIncarnationId!, unit: participant.unit!, expectedMainPid: participant.mainPid }], 1_000, 5_000);
+  await suspendBossWorkerTimers(fakeStore, timers, 1_000);
+  assert.ok(participant.leaseExpiresAt > 8_000_000_000_000_000);
+  assert.equal(participant.idleDeadlineAt, participant.leaseExpiresAt);
+  assert.equal(participant.checkpointDeadlineAt, participant.leaseExpiresAt);
+  assert.equal(participant.checkpointLastAttemptAt, participant.leaseExpiresAt);
+  await restoreBossWorkerTimers(fakeStore, timers, 101_000);
+  assert.equal(participant.leaseExpiresAt, 111_000);
+  assert.equal(participant.idleDeadlineAt, 121_000);
+  assert.equal(participant.checkpointDeadlineAt, 131_000);
+  assert.equal(participant.checkpointLastAttemptAt, 100_500);
 });
 
 test("systemd pause control rejects PID movement, queued units, unsupported state, command timeout, and ambiguous verification", async () => {

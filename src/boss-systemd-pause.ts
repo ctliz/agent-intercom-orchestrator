@@ -1,7 +1,8 @@
 import { setTimeout as delay } from "node:timers/promises";
-import type { TrustedLocalBossAssignmentRole, TrustedLocalBossRun } from "./boss-trusted-local.ts";
+import type { TrustedLocalBossAssignmentRole, TrustedLocalBossPausedTimer, TrustedLocalBossRun } from "./boss-trusted-local.ts";
+import type { WorkerStore } from "./store.ts";
 import { getUnitStatus } from "./systemd.ts";
-import type { CommandRunner, UnitStatus, WorkerRecord } from "./types.ts";
+import type { CommandRunner, UnitStatus, WorkerRecord, WorkerStateFile } from "./types.ts";
 import { isLiveState } from "./workers.ts";
 
 export type BossFreezableRole = Exclude<TrustedLocalBossAssignmentRole, "manager">;
@@ -121,4 +122,92 @@ export async function setBossUnitFreezerState(
   if (result.killed) throw new Error(`Could not determine whether Boss unit ${target.unit} was ${action}d: systemctl timed out`);
   if (result.code !== 0) throw new Error(`Could not ${action} Boss unit ${target.unit}: ${result.stderr.trim() || result.stdout.trim() || `exit ${result.code}`}`);
   return waitForUnitFreezerState(runner, target.unit, expected, { ...options, expectedMainPid: target.expectedMainPid });
+}
+
+/** Apply every target in order and compensate already-changed units in reverse on failure. */
+export async function applyBossSystemdPausePlan(
+  runner: CommandRunner,
+  targets: readonly BossSystemdPauseTarget[],
+  expected: BossUnitFreezerState,
+  options: { timeoutMs?: number; intervalMs?: number } = {},
+): Promise<UnitStatus[]> {
+  const changed: BossSystemdPauseTarget[] = [];
+  const statuses: UnitStatus[] = [];
+  try {
+    for (const target of targets) {
+      const before = await getUnitStatus(runner, target.unit);
+      const alreadyExpected = before.freezerState === expected;
+      statuses.push(await setBossUnitFreezerState(runner, target, expected, options));
+      if (!alreadyExpected) changed.push(target);
+    }
+    return statuses;
+  } catch (error) {
+    const compensationErrors: string[] = [];
+    const compensationState: BossUnitFreezerState = expected === "frozen" ? "running" : "frozen";
+    for (const target of changed.reverse()) {
+      try { await setBossUnitFreezerState(runner, target, compensationState, options); }
+      catch (compensationError) { compensationErrors.push(`${target.unit}: ${compensationError instanceof Error ? compensationError.message : String(compensationError)}`); }
+    }
+    const original = error instanceof Error ? error.message : String(error);
+    if (compensationErrors.length) throw new Error(`Boss cgroup ${expected} failed: ${original}; compensation incomplete: ${compensationErrors.join("; ")}`);
+    throw new Error(`Boss cgroup ${expected} failed and prior unit changes were compensated: ${original}`);
+  }
+}
+
+const SUSPENDED_DEADLINE = 8_640_000_000_000_000 - 1;
+
+export function captureBossPausedTimers(
+  state: WorkerStateFile,
+  targets: readonly BossSystemdPauseTarget[],
+  now: number,
+  checkpointRetryIntervalMs: number,
+): TrustedLocalBossPausedTimer[] {
+  return targets.map((target) => {
+    const worker = state.workers.find((candidate) => candidate.id === target.workerId && workerIncarnation(candidate) === target.workerIncarnationId);
+    if (!worker || !worker.owned || worker.unit !== target.unit || worker.bossRunId === undefined) throw new Error(`Boss worker ${target.workerId} exact timer identity is unavailable`);
+    const remaining = (value: number | undefined): number | null => value === undefined ? null : Math.max(0, value - now);
+    return {
+      workerId: worker.id,
+      workerIncarnationId: workerIncarnation(worker),
+      leaseRemainingMs: Math.max(0, worker.leaseExpiresAt - now),
+      idleRemainingMs: remaining(worker.idleDeadlineAt),
+      checkpointRemainingMs: remaining(worker.checkpointDeadlineAt),
+      checkpointRetryRemainingMs: worker.checkpointLastAttemptAt === undefined ? null : Math.max(0, worker.checkpointLastAttemptAt + checkpointRetryIntervalMs - now),
+      checkpointRetryIntervalMs: worker.checkpointLastAttemptAt === undefined ? null : checkpointRetryIntervalMs,
+    };
+  });
+}
+
+function exactTimerWorker(state: WorkerStateFile, timer: TrustedLocalBossPausedTimer): WorkerRecord {
+  const worker = state.workers.find((candidate) => candidate.id === timer.workerId && workerIncarnation(candidate) === timer.workerIncarnationId);
+  if (!worker || !worker.owned) throw new Error(`Boss worker ${timer.workerId} exact timer identity changed`);
+  return worker;
+}
+
+/** Fence WorkerStore lifecycle timers while systemd units are frozen. */
+export async function suspendBossWorkerTimers(store: WorkerStore, timers: readonly TrustedLocalBossPausedTimer[], now: number): Promise<void> {
+  await store.mutate((state) => {
+    for (const timer of timers) {
+      const worker = exactTimerWorker(state, timer);
+      worker.leaseExpiresAt = SUSPENDED_DEADLINE;
+      if (timer.idleRemainingMs !== null) worker.idleDeadlineAt = SUSPENDED_DEADLINE;
+      if (timer.checkpointRemainingMs !== null) worker.checkpointDeadlineAt = SUSPENDED_DEADLINE;
+      if (timer.checkpointRetryRemainingMs !== null) worker.checkpointLastAttemptAt = SUSPENDED_DEADLINE;
+      worker.updatedAt = Math.max(worker.updatedAt, now);
+    }
+  });
+}
+
+/** Restore each lifecycle deadline relative to the verified thaw completion time. */
+export async function restoreBossWorkerTimers(store: WorkerStore, timers: readonly TrustedLocalBossPausedTimer[], now: number): Promise<void> {
+  await store.mutate((state) => {
+    for (const timer of timers) {
+      const worker = exactTimerWorker(state, timer);
+      worker.leaseExpiresAt = now + timer.leaseRemainingMs;
+      if (timer.idleRemainingMs !== null) worker.idleDeadlineAt = now + timer.idleRemainingMs;
+      if (timer.checkpointRemainingMs !== null) worker.checkpointDeadlineAt = now + timer.checkpointRemainingMs;
+      if (timer.checkpointRetryRemainingMs !== null && timer.checkpointRetryIntervalMs !== null) worker.checkpointLastAttemptAt = now + timer.checkpointRetryRemainingMs - timer.checkpointRetryIntervalMs;
+      worker.updatedAt = Math.max(worker.updatedAt, now);
+    }
+  });
 }

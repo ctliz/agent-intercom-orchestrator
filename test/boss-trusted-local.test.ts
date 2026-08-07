@@ -97,6 +97,13 @@ function managerWorker(bossRunId: string, state: WorkerRecord["state"] = "ready"
   };
 }
 
+async function applyPersistedPause(store: TrustedLocalBossStore, bossRunId: string, controller: string, action: "pause" | "resume") {
+  const status = await store.execute(parseBossCommand(`status ${bossRunId}`), controller);
+  const current = status.run!.currentPause;
+  const transition = await store.beginPauseControl({ bossRunId, managerSessionId: controller, action, targets: current?.targets ?? [], intentionallyUnfrozenManagerWorkerId: current?.intentionallyUnfrozenManagerWorkerId ?? null, timers: current?.timers ?? [] });
+  return store.finishPauseControl(status.run!.bossRunId, transition.actionId);
+}
+
 test("trusted-local Boss creates and reports an explicitly advisory run", async () => {
   const { dir, store } = await fixture();
   try {
@@ -113,8 +120,8 @@ test("trusted-local Boss creates and reports an explicitly advisory run", async 
 
     const disk = JSON.parse(await readFile(join(dir, "runs.json"), "utf8"));
     assert.equal(disk.revision, 1);
-    assert.equal(disk.version, "orc.boss-trusted-local.v7");
-    assert.equal(disk.runs[0].version, "orc.boss-trusted-local.v5");
+    assert.equal(disk.version, "orc.boss-trusted-local.v8");
+    assert.equal(disk.runs[0].version, "orc.boss-trusted-local.v6");
     assert.equal(disk.runs[0].resource, null);
     assert.equal(disk.currentRunId, undefined);
     assert.equal(disk.runs[0].assignments[0].role, "manager");
@@ -147,7 +154,7 @@ test("trusted-local Boss authorizes exact Controller freeze and unfreeze transit
     const repeated = await store.authorizeFreeze({ bossRunId, managerSessionId: "controller-freeze", expectedAcceptanceRevision: 1, expectedDesignRevision: 1, fingerprint });
     assert.equal(repeated.run?.freezeTransitions.length, 2, "an identical current freeze is idempotent");
 
-    const paused = await store.execute(parseBossCommand(`pause ${bossRunId}`), "controller-freeze");
+    const paused = await applyPersistedPause(store, bossRunId, "controller-freeze", "pause");
     assert.equal(paused.run?.currentFreeze?.freezeRevision, 1, "pause does not authorize or retire freeze");
     const moved = await store.authorizeUnfreeze({ bossRunId, managerSessionId: "controller-freeze", expectedFreezeRevision: 1, expectedFingerprintSha256: fingerprint.aggregateSha256, fingerprint: candidateFingerprint(resource, "3".repeat(40)) });
     assert.equal(moved.freezeTransition?.outcome, "rejected");
@@ -171,7 +178,7 @@ test("trusted-local Boss accepts stable handles as aliases while retaining exact
     const handle = created.run!.handle;
     assert.match(handle, /^orc-[a-z2-7]{10}$/);
     assert.equal((await store.execute(parseBossCommand(`status ${handle}`), "manager-alias")).run?.bossRunId, created.run!.bossRunId);
-    assert.equal((await store.execute(parseBossCommand(`pause ${handle}`), "manager-alias")).run?.state, "paused");
+    assert.equal((await applyPersistedPause(store, handle, "manager-alias", "pause")).run?.state, "paused");
     store.setHandlePrefix("changed");
     assert.equal((await store.execute(parseBossCommand(`status ${handle}`), "manager-alias")).run?.handle, handle, "stored handles do not change with later configuration");
   } finally {
@@ -184,8 +191,8 @@ test("trusted-local Boss supports pause, resume, proof snapshot, and cancel", as
   try {
     const created = await store.execute(parseBossCommand("create coordinate agents"), "manager-session-2");
     const id = created.run!.bossRunId;
-    assert.equal((await store.execute(parseBossCommand(`pause ${id}`), "manager-session-2")).run?.state, "paused");
-    assert.equal((await store.execute(parseBossCommand(`resume ${id}`), "manager-session-2")).run?.state, "active");
+    assert.equal((await applyPersistedPause(store, id, "manager-session-2", "pause")).run?.state, "paused");
+    assert.equal((await applyPersistedPause(store, id, "manager-session-2", "resume")).run?.state, "active");
     const proof = await store.execute(parseBossCommand(`proof ${id}`), "manager-session-2");
     assert.match(proof.message, /adversary must be assigned/i);
     assert.equal(proof.run?.proofPackets.length, 0);
@@ -314,9 +321,9 @@ test("trusted-local Boss reads v1 state and migrates it on the next write", asyn
     assert.equal(JSON.parse(await readFile(path, "utf8")).version, "orc.boss-trusted-local.v1", "read-only status keeps the compatible v1 file intact");
     await reopened.execute(parseBossCommand("create migrated sibling run"), "controller-legacy");
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.version, "orc.boss-trusted-local.v7");
+    assert.equal(migrated.version, "orc.boss-trusted-local.v8");
     assert.equal(migrated.currentRunId, undefined);
-    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v5");
+    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v6");
     assert.equal(migrated.runs[0].resource, null);
     assert.equal(migrated.runs.length, 2);
     assert.deepEqual((await readdir(dir)).filter((entry) => entry.includes(".tmp-")), [], "atomic rename leaves no partial migration file");
@@ -346,8 +353,8 @@ test("trusted-local Boss reads v3 activity state and upgrades it without inventi
     const afterControl = await reopened.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "controller-v3-migration");
     assert.equal(afterControl.communication?.find((entry) => entry.role === "manager")?.communicationStatus, "deadline_unavailable", "Controller controls cannot mint or reset a legacy deadline");
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.version, "orc.boss-trusted-local.v7");
-    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v5");
+    assert.equal(migrated.version, "orc.boss-trusted-local.v8");
+    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v6");
     assert.equal(migrated.runs[0].resource, null, "migration does not invent a canonical resource");
     assert.equal(migrated.runs[0].acceptanceRevision, null, "migration does not invent an acceptance revision");
     assert.equal(migrated.runs[0].currentFreeze, null, "migration does not invent a freeze");
@@ -372,6 +379,8 @@ test("trusted-local Boss migrates v6/v4 proof packets with explicit unavailable 
     const legacy = JSON.parse(await readFile(path, "utf8"));
     legacy.version = "orc.boss-trusted-local.v6";
     legacy.runs[0].version = "orc.boss-trusted-local.v4";
+    delete legacy.runs[0].pauseTransitions;
+    delete legacy.runs[0].currentPause;
     for (const field of ["freezeRevision", "acceptanceRevision", "designRevision", "resourceRevision", "fingerprintSha256"]) delete legacy.runs[0].proofPackets[0][field];
     await writeFile(path, JSON.stringify(legacy));
 
@@ -383,10 +392,10 @@ test("trusted-local Boss migrates v6/v4 proof packets with explicit unavailable 
       "migration must not invent bindings for pre-binding proof evidence",
     );
     await assert.rejects(reopened.recordProofDelivery(bossRunId, status.run!.proofPackets[0].proofPacketId, fingerprint), /exact current freeze and fingerprint revisions/);
-    await reopened.execute(parseBossCommand(`pause ${bossRunId}`), "controller-v4-proof-migration");
+    await applyPersistedPause(reopened, bossRunId, "controller-v4-proof-migration", "pause");
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.version, "orc.boss-trusted-local.v7");
-    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v5");
+    assert.equal(migrated.version, "orc.boss-trusted-local.v8");
+    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v6");
     assert.equal(migrated.runs[0].proofPackets[0].fingerprintSha256, null);
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -411,7 +420,7 @@ test("trusted-local Boss migrates v3 canonical proof, delivery, and decision his
     const legacy = JSON.parse(await readFile(path, "utf8"));
     legacy.version = "orc.boss-trusted-local.v5";
     legacy.runs[0].version = "orc.boss-trusted-local.v3";
-    for (const field of ["acceptanceRevision", "designRevision", "freezeTransitions", "currentFreeze"]) delete legacy.runs[0][field];
+    for (const field of ["acceptanceRevision", "designRevision", "freezeTransitions", "currentFreeze", "pauseTransitions", "currentPause"]) delete legacy.runs[0][field];
     for (const field of ["freezeRevision", "acceptanceRevision", "designRevision", "resourceRevision", "fingerprintSha256"]) delete legacy.runs[0].proofPackets[0][field];
     await writeFile(path, JSON.stringify(legacy));
 
@@ -426,7 +435,7 @@ test("trusted-local Boss migrates v3 canonical proof, delivery, and decision his
     assert.equal(status.run?.decisions[0].outcome, "approved");
     await reopened.execute(parseBossCommand("create force v3 migration write"), controller);
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v5");
+    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v6");
     assert.equal(migrated.runs[0].proofPackets[0].fingerprintSha256, null);
     assert.equal(migrated.runs[0].decisions[0].outcome, "approved");
   } finally {
@@ -445,7 +454,7 @@ test("trusted-local Boss upgrades active v3 canonical resources to initial Contr
     const legacy = JSON.parse(await readFile(path, "utf8"));
     legacy.version = "orc.boss-trusted-local.v5";
     legacy.runs[0].version = "orc.boss-trusted-local.v3";
-    for (const field of ["acceptanceRevision", "designRevision", "freezeTransitions", "currentFreeze"]) delete legacy.runs[0][field];
+    for (const field of ["acceptanceRevision", "designRevision", "freezeTransitions", "currentFreeze", "pauseTransitions", "currentPause"]) delete legacy.runs[0][field];
     await writeFile(path, JSON.stringify(legacy));
 
     const reopened = new TrustedLocalBossStore(path);
@@ -455,7 +464,7 @@ test("trusted-local Boss upgrades active v3 canonical resources to initial Contr
     const frozen = await reopened.authorizeFreeze({ bossRunId, managerSessionId: controller, expectedAcceptanceRevision: 1, expectedDesignRevision: 1, fingerprint: candidateFingerprint(resource) });
     assert.equal(frozen.freezeTransition?.outcome, "accepted");
     assert.equal(frozen.run?.currentFreeze?.freezeRevision, 1);
-    assert.equal(JSON.parse(await readFile(path, "utf8")).runs[0].version, "orc.boss-trusted-local.v5");
+    assert.equal(JSON.parse(await readFile(path, "utf8")).runs[0].version, "orc.boss-trusted-local.v6");
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -501,6 +510,8 @@ test("trusted-local Boss assigns deterministic handles while migrating v2 run re
     delete legacy.runs[0].designRevision;
     delete legacy.runs[0].freezeTransitions;
     delete legacy.runs[0].currentFreeze;
+    delete legacy.runs[0].pauseTransitions;
+    delete legacy.runs[0].currentPause;
     for (const assignment of legacy.runs[0].assignments) delete assignment.resourceRevision;
     await writeFile(path, JSON.stringify(legacy));
 
@@ -509,8 +520,8 @@ test("trusted-local Boss assigns deterministic handles while migrating v2 run re
     assert.equal((await reopened.execute(parseBossCommand(`status ${migratedHandle}`), "controller-handle-migration")).run?.handle, migratedHandle);
     await reopened.execute(parseBossCommand("create migration writer"), "controller-handle-migration");
     const migrated = JSON.parse(await readFile(path, "utf8"));
-    assert.equal(migrated.version, "orc.boss-trusted-local.v7");
-    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v5");
+    assert.equal(migrated.version, "orc.boss-trusted-local.v8");
+    assert.equal(migrated.runs[0].version, "orc.boss-trusted-local.v6");
     assert.equal(migrated.runs[0].resource, null);
     assert.equal(migrated.runs[0].assignments[0].resourceRevision, null);
     assert.equal(migrated.runs[0].handle, migratedHandle);

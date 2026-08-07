@@ -6,13 +6,15 @@ import type { BossCandidateFingerprint } from "./boss-candidate-fingerprint.ts";
 import type { BossCommandRequest } from "./boss-command.ts";
 import type { WorkerRecord, WorkerState } from "./types.ts";
 
-export const TRUSTED_LOCAL_BOSS_RUN_VERSION = "orc.boss-trusted-local.v5" as const;
-const LEGACY_TRUSTED_LOCAL_BOSS_RUN_VERSIONS = new Set(["orc.boss-trusted-local.v1", "orc.boss-trusted-local.v2", "orc.boss-trusted-local.v3", "orc.boss-trusted-local.v4"]);
+export const TRUSTED_LOCAL_BOSS_RUN_VERSION = "orc.boss-trusted-local.v6" as const;
+const LEGACY_TRUSTED_LOCAL_BOSS_RUN_VERSIONS = new Set(["orc.boss-trusted-local.v1", "orc.boss-trusted-local.v2", "orc.boss-trusted-local.v3", "orc.boss-trusted-local.v4", "orc.boss-trusted-local.v5"]);
 export const TRUSTED_LOCAL_BOSS_RESOURCE_VERSION = "orc.boss-resource.v1" as const;
-export const TRUSTED_LOCAL_BOSS_STORE_VERSION = "orc.boss-trusted-local.v7" as const;
-const LEGACY_TRUSTED_LOCAL_BOSS_STORE_VERSIONS = new Set(["orc.boss-trusted-local.v1", "orc.boss-trusted-local.v2", "orc.boss-trusted-local.v3", "orc.boss-trusted-local.v4", "orc.boss-trusted-local.v5", "orc.boss-trusted-local.v6"]);
+export const TRUSTED_LOCAL_BOSS_STORE_VERSION = "orc.boss-trusted-local.v8" as const;
+const LEGACY_TRUSTED_LOCAL_BOSS_STORE_VERSIONS = new Set(["orc.boss-trusted-local.v1", "orc.boss-trusted-local.v2", "orc.boss-trusted-local.v3", "orc.boss-trusted-local.v4", "orc.boss-trusted-local.v5", "orc.boss-trusted-local.v6", "orc.boss-trusted-local.v7"]);
 export const TRUSTED_LOCAL_BOSS_FREEZE_TRANSITION_VERSION = "orc.boss-freeze-transition.v1" as const;
 export const TRUSTED_LOCAL_BOSS_FREEZE_VERSION = "orc.boss-freeze.v1" as const;
+export const TRUSTED_LOCAL_BOSS_PAUSE_TRANSITION_VERSION = "orc.boss-pause-transition.v1" as const;
+export const TRUSTED_LOCAL_BOSS_PAUSE_VERSION = "orc.boss-pause.v1" as const;
 export const TRUSTED_LOCAL_BOSS_WARNING = "TRUSTED LOCAL MODE — same-user agents and local files are trusted; evidence is advisory, not tamper-proof.";
 export const TRUSTED_LOCAL_BOSS_AUTHENTICATED_COMMUNICATION_DEADLINE_MS = 10 * 60_000;
 
@@ -179,6 +181,51 @@ export interface TrustedLocalBossFreezeTransition {
   occurredAt: string;
 }
 
+export interface TrustedLocalBossPausedTimer {
+  workerId: string;
+  workerIncarnationId: string;
+  leaseRemainingMs: number;
+  idleRemainingMs: number | null;
+  checkpointRemainingMs: number | null;
+  checkpointRetryRemainingMs: number | null;
+  checkpointRetryIntervalMs: number | null;
+}
+
+export interface TrustedLocalBossPauseTarget {
+  role: Exclude<TrustedLocalBossAssignmentRole, "manager">;
+  workerId: string;
+  workerIncarnationId: string;
+  unit: string;
+  mainPid: number;
+}
+
+export interface TrustedLocalBossPauseTransition {
+  version: typeof TRUSTED_LOCAL_BOSS_PAUSE_TRANSITION_VERSION;
+  actionId: string;
+  revision: number;
+  action: "pause" | "resume";
+  phase: "applying" | "accepted" | "failed";
+  authorizedBySessionId: string;
+  pauseRevision: number;
+  targets: TrustedLocalBossPauseTarget[];
+  intentionallyUnfrozenManagerWorkerId: string | null;
+  timers: TrustedLocalBossPausedTimer[];
+  reason: string | null;
+  occurredAt: string;
+  completedAt: string | null;
+}
+
+export interface TrustedLocalBossPause {
+  version: typeof TRUSTED_LOCAL_BOSS_PAUSE_VERSION;
+  pauseRevision: number;
+  transitionRevision: number;
+  targets: TrustedLocalBossPauseTarget[];
+  intentionallyUnfrozenManagerWorkerId: string | null;
+  timers: TrustedLocalBossPausedTimer[];
+  authorizedBySessionId: string;
+  pausedAt: string;
+}
+
 export interface TrustedLocalBossFreeze {
   version: typeof TRUSTED_LOCAL_BOSS_FREEZE_VERSION;
   freezeRevision: number;
@@ -203,6 +250,8 @@ export interface TrustedLocalBossRun {
   designRevision: number | null;
   freezeTransitions: TrustedLocalBossFreezeTransition[];
   currentFreeze: TrustedLocalBossFreeze | null;
+  pauseTransitions: TrustedLocalBossPauseTransition[];
+  currentPause: TrustedLocalBossPause | null;
   assignments: TrustedLocalBossAssignment[];
   deliveries: TrustedLocalBossDelivery[];
   assignmentResults: TrustedLocalBossAssignmentResult[];
@@ -227,6 +276,7 @@ export interface TrustedLocalBossResult {
   runs?: TrustedLocalBossRun[];
   communication?: TrustedLocalBossAssignmentCommunication[];
   freezeTransition?: TrustedLocalBossFreezeTransition;
+  pauseTransition?: TrustedLocalBossPauseTransition;
 }
 
 export interface TrustedLocalBossOrphanedWorker {
@@ -473,6 +523,54 @@ function parseCurrentFreeze(value: unknown): TrustedLocalBossFreeze | null {
   return { ...freeze, freezeRevision: positiveRevision(freeze.freezeRevision, "freeze revision"), transitionRevision: positiveRevision(freeze.transitionRevision, "freeze transition revision"), acceptanceRevision: positiveRevision(freeze.acceptanceRevision, "freeze acceptance revision"), designRevision: positiveRevision(freeze.designRevision, "freeze design revision"), resourceRevision: positiveRevision(freeze.resourceRevision, "freeze resource revision"), fingerprint: parseCandidateFingerprint(freeze.fingerprint), authorizedAt: parseTimestamp(freeze.authorizedAt, "freeze authorizedAt") };
 }
 
+function parsePauseTarget(value: unknown): TrustedLocalBossPauseTarget {
+  if (!isPlainRecord(value) || !exactKeys(value, ["mainPid", "role", "unit", "workerId", "workerIncarnationId"])) throw new Error("Trusted-local Boss state contains an invalid pause target");
+  const target = value as unknown as TrustedLocalBossPauseTarget;
+  if ((target.role !== "worker" && target.role !== "scout" && target.role !== "adversary")
+    || typeof target.workerId !== "string" || target.workerId.length < 1 || target.workerId.length > 128
+    || typeof target.workerIncarnationId !== "string" || target.workerIncarnationId.length < 1 || target.workerIncarnationId.length > 128
+    || typeof target.unit !== "string" || target.unit.length < 9 || target.unit.length > 256 || !target.unit.endsWith(".service") || /[\u0000-\u001f\u007f/]/.test(target.unit)
+    || !Number.isSafeInteger(target.mainPid) || target.mainPid < 1) throw new Error("Trusted-local Boss state contains invalid pause target fields");
+  return { ...target };
+}
+
+function parsePausedTimer(value: unknown): TrustedLocalBossPausedTimer {
+  if (!isPlainRecord(value) || !exactKeys(value, ["checkpointRemainingMs", "checkpointRetryIntervalMs", "checkpointRetryRemainingMs", "idleRemainingMs", "leaseRemainingMs", "workerId", "workerIncarnationId"])) throw new Error("Trusted-local Boss state contains an invalid paused timer");
+  const timer = value as unknown as TrustedLocalBossPausedTimer;
+  const optionalDuration = (duration: unknown): boolean => duration === null || (Number.isSafeInteger(duration) && (duration as number) >= 0);
+  if (typeof timer.workerId !== "string" || timer.workerId.length < 1 || timer.workerId.length > 128
+    || typeof timer.workerIncarnationId !== "string" || timer.workerIncarnationId.length < 1 || timer.workerIncarnationId.length > 128
+    || !Number.isSafeInteger(timer.leaseRemainingMs) || timer.leaseRemainingMs < 0
+    || !optionalDuration(timer.idleRemainingMs) || !optionalDuration(timer.checkpointRemainingMs) || !optionalDuration(timer.checkpointRetryRemainingMs) || !optionalDuration(timer.checkpointRetryIntervalMs)
+    || ((timer.checkpointRetryRemainingMs === null) !== (timer.checkpointRetryIntervalMs === null))) throw new Error("Trusted-local Boss state contains invalid paused timer fields");
+  return { ...timer };
+}
+
+function parsePauseTransition(value: unknown): TrustedLocalBossPauseTransition {
+  if (!isPlainRecord(value) || !exactKeys(value, ["action", "actionId", "authorizedBySessionId", "completedAt", "intentionallyUnfrozenManagerWorkerId", "occurredAt", "pauseRevision", "phase", "reason", "revision", "targets", "timers", "version"])) throw new Error("Trusted-local Boss state contains an invalid pause transition");
+  const transition = value as unknown as TrustedLocalBossPauseTransition;
+  if (transition.version !== TRUSTED_LOCAL_BOSS_PAUSE_TRANSITION_VERSION || !/^pause-action-[0-9a-f-]{36}$/.test(transition.actionId)
+    || (transition.action !== "pause" && transition.action !== "resume") || (transition.phase !== "applying" && transition.phase !== "accepted" && transition.phase !== "failed")
+    || typeof transition.authorizedBySessionId !== "string" || transition.authorizedBySessionId.length < 1 || transition.authorizedBySessionId.length > 1_024
+    || !Array.isArray(transition.targets) || transition.targets.length > 3 || !Array.isArray(transition.timers) || transition.timers.length > 3
+    || (transition.intentionallyUnfrozenManagerWorkerId !== null && (typeof transition.intentionallyUnfrozenManagerWorkerId !== "string" || transition.intentionallyUnfrozenManagerWorkerId.length < 1 || transition.intentionallyUnfrozenManagerWorkerId.length > 128))
+    || (transition.phase === "applying" ? transition.completedAt !== null || transition.reason !== null : typeof transition.completedAt !== "string")
+    || (transition.phase === "failed" ? typeof transition.reason !== "string" || transition.reason.length < 1 || transition.reason.length > 4_096 : transition.reason !== null)) throw new Error("Trusted-local Boss state contains invalid pause transition fields");
+  const targets = transition.targets.map(parsePauseTarget);
+  const timers = transition.timers.map(parsePausedTimer);
+  if (new Set(targets.map((target) => target.workerId)).size !== targets.length || new Set(timers.map((timer) => timer.workerId)).size !== timers.length) throw new Error("Trusted-local Boss pause transition contains duplicate identities");
+  return { ...transition, revision: positiveRevision(transition.revision, "pause transition revision"), pauseRevision: positiveRevision(transition.pauseRevision, "pause revision"), targets, timers, occurredAt: parseTimestamp(transition.occurredAt, "pause transition occurredAt"), completedAt: transition.completedAt === null ? null : parseTimestamp(transition.completedAt, "pause transition completedAt") };
+}
+
+function parseCurrentPause(value: unknown): TrustedLocalBossPause | null {
+  if (value === null) return null;
+  if (!isPlainRecord(value) || !exactKeys(value, ["authorizedBySessionId", "intentionallyUnfrozenManagerWorkerId", "pauseRevision", "pausedAt", "targets", "timers", "transitionRevision", "version"])) throw new Error("Trusted-local Boss state contains an invalid current pause");
+  const pause = value as unknown as TrustedLocalBossPause;
+  if (pause.version !== TRUSTED_LOCAL_BOSS_PAUSE_VERSION || typeof pause.authorizedBySessionId !== "string" || !Array.isArray(pause.targets) || !Array.isArray(pause.timers)
+    || (pause.intentionallyUnfrozenManagerWorkerId !== null && typeof pause.intentionallyUnfrozenManagerWorkerId !== "string")) throw new Error("Trusted-local Boss state contains invalid current pause fields");
+  return { ...pause, pauseRevision: positiveRevision(pause.pauseRevision, "pause revision"), transitionRevision: positiveRevision(pause.transitionRevision, "pause transition revision"), targets: pause.targets.map(parsePauseTarget), timers: pause.timers.map(parsePausedTimer), pausedAt: parseTimestamp(pause.pausedAt, "pause pausedAt") };
+}
+
 function parseCancellation(value: unknown): TrustedLocalBossCancellation | null {
   if (value === null) return null;
   if (!isPlainRecord(value)) throw new Error("Trusted-local Boss state contains invalid cancellation action");
@@ -516,7 +614,8 @@ function parseRun(value: unknown, handlePrefix: string): TrustedLocalBossRun {
   const legacyHandle = value.version === "orc.boss-trusted-local.v1";
   const legacyResource = value.version === "orc.boss-trusted-local.v1" || value.version === "orc.boss-trusted-local.v2";
   const legacyFreeze = value.version === "orc.boss-trusted-local.v1" || value.version === "orc.boss-trusted-local.v2" || value.version === "orc.boss-trusted-local.v3";
-  const keys = ["assignmentResults", "assignments", "bossRunId", "cancellation", "createdAt", "decisions", "deliveries", "goal", "lifecycle", "managerSessionId", "proofPackets", "state", "updatedAt", "version", ...(legacyHandle ? [] : ["handle"]), ...(legacyResource ? [] : ["resource"]), ...(legacyFreeze ? [] : ["acceptanceRevision", "currentFreeze", "designRevision", "freezeTransitions"])];
+  const legacyPause = legacyVersion;
+  const keys = ["assignmentResults", "assignments", "bossRunId", "cancellation", "createdAt", "decisions", "deliveries", "goal", "lifecycle", "managerSessionId", "proofPackets", "state", "updatedAt", "version", ...(legacyHandle ? [] : ["handle"]), ...(legacyResource ? [] : ["resource"]), ...(legacyFreeze ? [] : ["acceptanceRevision", "currentFreeze", "designRevision", "freezeTransitions"]), ...(legacyPause ? [] : ["currentPause", "pauseTransitions"])];
   if (!exactKeys(value, keys)) throw new Error("Trusted-local Boss state contains an invalid run record");
   const { assignmentResults, assignments, bossRunId, cancellation, createdAt, decisions, deliveries, goal, lifecycle, managerSessionId, proofPackets, state, updatedAt } = value;
   if ((!legacyVersion && value.version !== TRUSTED_LOCAL_BOSS_RUN_VERSION) || typeof bossRunId !== "string" || !/^boss-[0-9a-f-]{36}$/.test(bossRunId)
@@ -570,7 +669,25 @@ function parseRun(value: unknown, handlePrefix: string): TrustedLocalBossRun {
     }
   }
   if (JSON.stringify(currentFreeze) !== JSON.stringify(derivedFreeze)) throw new Error("Trusted-local Boss current freeze is not derived from accepted Controller transitions");
-  return { version: TRUSTED_LOCAL_BOSS_RUN_VERSION, bossRunId, handle, goal, state: state as TrustedLocalBossRunState, managerSessionId, resource, acceptanceRevision, designRevision, freezeTransitions, currentFreeze, assignments: parsedAssignments, deliveries: parsedDeliveries, assignmentResults: parsedResults, lifecycle: parsedLifecycle, proofPackets: parsedProofs, decisions: parsedDecisions, cancellation: parseCancellation(cancellation), createdAt: parseTimestamp(createdAt, "run createdAt"), updatedAt: parseTimestamp(updatedAt, "run updatedAt") };
+  const pauseTransitions = legacyPause ? [] : Array.isArray(value.pauseTransitions) ? value.pauseTransitions.map(parsePauseTransition) : (() => { throw new Error("Trusted-local Boss state contains invalid pause transitions"); })();
+  if (pauseTransitions.some((transition, index) => transition.revision !== index + 1) || pauseTransitions.filter((transition) => transition.phase === "applying").length > 1 || pauseTransitions.some((transition, index) => transition.phase === "applying" && index !== pauseTransitions.length - 1)) throw new Error("Trusted-local Boss pause transition revisions or pending state are invalid");
+  let derivedPause: TrustedLocalBossPause | null = null;
+  let nextPauseRevision = 1;
+  for (const transition of pauseTransitions) {
+    if (transition.phase !== "accepted") continue;
+    if (transition.action === "pause") {
+      if (derivedPause || transition.pauseRevision !== nextPauseRevision) throw new Error("Trusted-local Boss accepted pause transition is not a valid monotonic projection");
+      derivedPause = { version: TRUSTED_LOCAL_BOSS_PAUSE_VERSION, pauseRevision: transition.pauseRevision, transitionRevision: transition.revision, targets: transition.targets, intentionallyUnfrozenManagerWorkerId: transition.intentionallyUnfrozenManagerWorkerId, timers: transition.timers, authorizedBySessionId: transition.authorizedBySessionId, pausedAt: transition.completedAt! };
+      nextPauseRevision += 1;
+    } else {
+      if (!derivedPause || transition.pauseRevision !== derivedPause.pauseRevision) throw new Error("Trusted-local Boss accepted resume transition does not match the current pause");
+      derivedPause = null;
+    }
+  }
+  const currentPause = legacyPause ? null : parseCurrentPause(value.currentPause);
+  const migratedState = legacyPause && state === "paused" ? "active" : state as TrustedLocalBossRunState;
+  if (JSON.stringify(currentPause) !== JSON.stringify(derivedPause) || (migratedState === "paused") !== Boolean(currentPause)) throw new Error("Trusted-local Boss current pause is not derived from accepted cgroup transitions");
+  return { version: TRUSTED_LOCAL_BOSS_RUN_VERSION, bossRunId, handle, goal, state: migratedState, managerSessionId, resource, acceptanceRevision, designRevision, freezeTransitions, currentFreeze, pauseTransitions, currentPause, assignments: parsedAssignments, deliveries: parsedDeliveries, assignmentResults: parsedResults, lifecycle: parsedLifecycle, proofPackets: parsedProofs, decisions: parsedDecisions, cancellation: parseCancellation(cancellation), createdAt: parseTimestamp(createdAt, "run createdAt"), updatedAt: parseTimestamp(updatedAt, "run updatedAt") };
 }
 
 function parseState(value: unknown, handlePrefix: string): TrustedLocalBossState {
@@ -674,7 +791,12 @@ function formatRun(run: TrustedLocalBossRun, now: string): string {
   const freeze = run.currentFreeze
     ? `freeze: Controller-authorized advisory revision ${run.currentFreeze.freezeRevision}; fingerprint=${run.currentFreeze.fingerprint.aggregateSha256}; HEAD=${run.currentFreeze.fingerprint.headSha}; tracked-bytes=${run.currentFreeze.fingerprint.trackedDirtyBytes}; untracked-files=${run.currentFreeze.fingerprint.untrackedManifest.length}; acceptance/design/resource=${run.currentFreeze.acceptanceRevision}/${run.currentFreeze.designRevision}/${run.currentFreeze.resourceRevision}; authorized=${run.currentFreeze.authorizedBySessionId} at ${run.currentFreeze.authorizedAt}. This is not process suspension; trusted same-UID processes may still move files.`
     : `freeze: none; acceptance/design revisions=${run.acceptanceRevision ?? "unavailable"}/${run.designRevision ?? "unavailable"}`;
-  return [TRUSTED_LOCAL_BOSS_WARNING, `handle: ${run.handle}`, `run: ${run.bossRunId}`, `state: ${run.state}`, `goal: ${run.goal}`, `manager session: ${run.managerSessionId}`, resource, freeze, "readiness: WorkerStore lifecycle reports process/transport state only; it does not prove productive task activity.", "communication evidence: authenticated worker Intercom traffic proves communication only; assignment acknowledgement and substantive typed checkpoint telemetry are unavailable unless explicitly reported as separate fields.", "staffing:", staffing, "communication:", communication, `adversary assignment: ${reviewer ? `${reviewer.assignmentId} (${reviewer.state})` : "not requested"}`, `assignment delivery: ${latestDelivery ? `${latestDelivery.kind} ${latestDelivery.state} to ${latestDelivery.targetWorkerId} at revision ${latestDelivery.assignmentRevision}` : "none"}`, `assignment results: ${run.assignmentResults.length}`, `latest proof: ${latestProof ? `${latestProof.proofPacketId} revision ${latestProof.revision} sha256:${latestProof.snapshotSha256}` : "none"}`, `latest decision: ${latestDecision ? `${latestDecision.outcome} on proof revision ${latestDecision.proofRevision} — ${latestDecision.note}` : "none"}`, `cancellation: ${run.cancellation ? `${run.cancellation.state}${run.cancellation.error ? ` — ${run.cancellation.error}` : ""}` : "not requested"}`, `created: ${run.createdAt}`, `updated: ${run.updatedAt}`, "lifecycle:", lifecycle].join("\n");
+  const pause = run.currentPause
+    ? `pause-control: enforced revision ${run.currentPause.pauseRevision}; frozen-units=${run.currentPause.targets.map((target) => target.unit).join(",") || "none"}; Manager=${run.currentPause.intentionallyUnfrozenManagerWorkerId ?? "unavailable"} intentionally unfrozen; WorkerStore timers suspended=${run.currentPause.timers.length}. Trusted same-UID processes outside these exact units remain unattached.`
+    : run.pauseTransitions.at(-1)?.phase === "applying"
+      ? `pause-control: reconciliation required for ${run.pauseTransitions.at(-1)!.action} transition ${run.pauseTransitions.at(-1)!.actionId}`
+      : "pause-control: not enforced";
+  return [TRUSTED_LOCAL_BOSS_WARNING, `handle: ${run.handle}`, `run: ${run.bossRunId}`, `state: ${run.state}`, pause, `goal: ${run.goal}`, `manager session: ${run.managerSessionId}`, resource, freeze, "readiness: WorkerStore lifecycle reports process/transport state only; it does not prove productive task activity.", "communication evidence: authenticated worker Intercom traffic proves communication only; assignment acknowledgement and substantive typed checkpoint telemetry are unavailable unless explicitly reported as separate fields.", "staffing:", staffing, "communication:", communication, `adversary assignment: ${reviewer ? `${reviewer.assignmentId} (${reviewer.state})` : "not requested"}`, `assignment delivery: ${latestDelivery ? `${latestDelivery.kind} ${latestDelivery.state} to ${latestDelivery.targetWorkerId} at revision ${latestDelivery.assignmentRevision}` : "none"}`, `assignment results: ${run.assignmentResults.length}`, `latest proof: ${latestProof ? `${latestProof.proofPacketId} revision ${latestProof.revision} sha256:${latestProof.snapshotSha256}` : "none"}`, `latest decision: ${latestDecision ? `${latestDecision.outcome} on proof revision ${latestDecision.proofRevision} — ${latestDecision.note}` : "none"}`, `cancellation: ${run.cancellation ? `${run.cancellation.state}${run.cancellation.error ? ` — ${run.cancellation.error}` : ""}` : "not requested"}`, `created: ${run.createdAt}`, `updated: ${run.updatedAt}`, "lifecycle:", lifecycle].join("\n");
 }
 
 function workerIncarnation(worker: WorkerRecord): string { return worker.workerIncarnationId ?? worker.runId; }
@@ -734,7 +856,7 @@ export class TrustedLocalBossStore {
       const assignments = [assignment("manager", `Manage the trusted-local Boss goal: ${input.goal}`), assignment("worker", `Implement the highest-priority bounded work for: ${input.goal}`), assignment("scout", `Scout risks, dependencies, and verification gaps for: ${input.goal}`)];
       const handle = deterministicBossRunHandle(input.bossRunId, this.handlePrefix);
       if (state.runs.some((candidate) => candidate.handle === handle)) throw new Error("Trusted-local Boss deterministic handle collision; no run was created");
-      const run: TrustedLocalBossRun = { version: TRUSTED_LOCAL_BOSS_RUN_VERSION, bossRunId: input.bossRunId, handle, goal: input.goal, state: "active", managerSessionId: input.managerSessionId, resource, acceptanceRevision: 1, designRevision: 1, freezeTransitions: [], currentFreeze: null, assignments, deliveries: [], assignmentResults: [], lifecycle: [], proofPackets: [], decisions: [], cancellation: null, createdAt: timestamp, updatedAt: timestamp };
+      const run: TrustedLocalBossRun = { version: TRUSTED_LOCAL_BOSS_RUN_VERSION, bossRunId: input.bossRunId, handle, goal: input.goal, state: "active", managerSessionId: input.managerSessionId, resource, acceptanceRevision: 1, designRevision: 1, freezeTransitions: [], currentFreeze: null, pauseTransitions: [], currentPause: null, assignments, deliveries: [], assignmentResults: [], lifecycle: [], proofPackets: [], decisions: [], cancellation: null, createdAt: timestamp, updatedAt: timestamp };
       state.runs.push(run);
       state.revision += 1;
       return { title: "Boss trusted-local run created", message: formatRun(run, timestamp), run: structuredClone(run) };
@@ -852,6 +974,56 @@ export class TrustedLocalBossStore {
       const transition: TrustedLocalBossFreezeTransition = { version: TRUSTED_LOCAL_BOSS_FREEZE_TRANSITION_VERSION, actionId: `freeze-action-${randomUUID()}`, revision: transitionRevision, action: "unfreeze", outcome: "accepted", authorizedBySessionId: input.managerSessionId, acceptanceRevision: current.acceptanceRevision, designRevision: current.designRevision, resourceRevision: current.resourceRevision, freezeRevision: current.freezeRevision, fingerprint, reason: null, occurredAt: timestamp };
       run.freezeTransitions.push(transition); run.currentFreeze = null; run.updatedAt = timestamp; state.revision += 1;
       return { title: "Boss candidate unfrozen", message: formatRun(run, timestamp), run: structuredClone(run), freezeTransition: structuredClone(transition) };
+    });
+  }
+
+  async beginPauseControl(input: {
+    bossRunId: string;
+    managerSessionId: string;
+    action: "pause" | "resume";
+    targets: TrustedLocalBossPauseTarget[];
+    intentionallyUnfrozenManagerWorkerId: string | null;
+    timers: TrustedLocalBossPausedTimer[];
+  }): Promise<TrustedLocalBossPauseTransition> {
+    return this.mutate((state, timestamp) => {
+      const run = state.runs.find((candidate) => candidate.bossRunId === input.bossRunId || candidate.handle === input.bossRunId);
+      if (!run) throw new Error("No matching trusted-local Boss run exists.");
+      assertOwningSession(run, input.managerSessionId);
+      if (run.pauseTransitions.at(-1)?.phase === "applying") throw new Error("Trusted-local Boss pause control already has an unreconciled applying transition");
+      if (input.action === "pause" && (run.state !== "active" || run.currentPause)) throw new Error(`Cannot pause Boss run from ${run.state}.`);
+      if (input.action === "resume" && (run.state !== "paused" || !run.currentPause)) throw new Error(`Cannot resume Boss run from ${run.state}.`);
+      const targets = input.targets.map(parsePauseTarget);
+      const timers = input.timers.map(parsePausedTimer);
+      if (input.action === "resume" && (JSON.stringify(targets) !== JSON.stringify(run.currentPause!.targets) || JSON.stringify(timers) !== JSON.stringify(run.currentPause!.timers))) throw new Error("Trusted-local Boss resume must use the exact current pause identities and suspended timers");
+      const pauseRevision = input.action === "pause" ? run.pauseTransitions.filter((transition) => transition.action === "pause" && transition.phase === "accepted").length + 1 : run.currentPause!.pauseRevision;
+      const transition: TrustedLocalBossPauseTransition = { version: TRUSTED_LOCAL_BOSS_PAUSE_TRANSITION_VERSION, actionId: `pause-action-${randomUUID()}`, revision: run.pauseTransitions.length + 1, action: input.action, phase: "applying", authorizedBySessionId: input.managerSessionId, pauseRevision, targets, intentionallyUnfrozenManagerWorkerId: input.intentionallyUnfrozenManagerWorkerId, timers, reason: null, occurredAt: timestamp, completedAt: null };
+      run.pauseTransitions.push(transition); run.updatedAt = timestamp; state.revision += 1;
+      return structuredClone(transition);
+    });
+  }
+
+  async finishPauseControl(bossRunId: string, actionId: string, error?: unknown): Promise<TrustedLocalBossResult> {
+    return this.mutate((state, timestamp) => {
+      const run = state.runs.find((candidate) => candidate.bossRunId === bossRunId);
+      if (!run) throw new Error(`Trusted-local Boss run not found: ${bossRunId}`);
+      const transition = run.pauseTransitions.at(-1);
+      if (!transition || transition.actionId !== actionId || transition.phase !== "applying") throw new Error("Trusted-local Boss pause control completion does not match the exact applying transition");
+      transition.completedAt = timestamp;
+      if (error !== undefined) {
+        transition.phase = "failed";
+        transition.reason = (error instanceof Error ? error.message : String(error)).slice(0, 4_096) || "Boss cgroup pause control failed";
+      } else {
+        transition.phase = "accepted";
+        if (transition.action === "pause") {
+          run.currentPause = { version: TRUSTED_LOCAL_BOSS_PAUSE_VERSION, pauseRevision: transition.pauseRevision, transitionRevision: transition.revision, targets: transition.targets, intentionallyUnfrozenManagerWorkerId: transition.intentionallyUnfrozenManagerWorkerId, timers: transition.timers, authorizedBySessionId: transition.authorizedBySessionId, pausedAt: timestamp };
+          run.state = "paused";
+        } else {
+          run.currentPause = null;
+          run.state = "active";
+        }
+      }
+      run.updatedAt = timestamp; state.revision += 1;
+      return { title: `Boss trusted-local run ${transition.phase === "accepted" ? transition.action === "pause" ? "paused" : "resumed" : `${transition.action} failed`}`, message: formatRun(run, timestamp), run: structuredClone(run), pauseTransition: structuredClone(transition) };
     });
   }
 
@@ -1057,7 +1229,7 @@ export class TrustedLocalBossStore {
         const bossRunId = `boss-${randomUUID()}`;
         const handle = deterministicBossRunHandle(bossRunId, this.handlePrefix);
         if (state.runs.some((candidate) => candidate.handle === handle)) throw new Error("Trusted-local Boss deterministic handle collision; no run was created");
-        const run: TrustedLocalBossRun = { version: TRUSTED_LOCAL_BOSS_RUN_VERSION, bossRunId, handle, goal: request.goal, state: "active", managerSessionId, resource: null, acceptanceRevision: null, designRevision: null, freezeTransitions: [], currentFreeze: null, assignments, deliveries: [], assignmentResults: [], lifecycle: [], proofPackets: [], decisions: [], cancellation: null, createdAt: timestamp, updatedAt: timestamp };
+        const run: TrustedLocalBossRun = { version: TRUSTED_LOCAL_BOSS_RUN_VERSION, bossRunId, handle, goal: request.goal, state: "active", managerSessionId, resource: null, acceptanceRevision: null, designRevision: null, freezeTransitions: [], currentFreeze: null, pauseTransitions: [], currentPause: null, assignments, deliveries: [], assignmentResults: [], lifecycle: [], proofPackets: [], decisions: [], cancellation: null, createdAt: timestamp, updatedAt: timestamp };
         state.runs.push(run); state.revision += 1; return { title: "Boss trusted-local run created", message: formatRun(run, timestamp), run: structuredClone(run) };
       }
       if (!selected) throw new Error("No matching trusted-local Boss run exists.");
@@ -1113,9 +1285,8 @@ export class TrustedLocalBossStore {
         selected.state = outcome; selected.updatedAt = timestamp; state.revision += 1;
         return { title: `Boss trusted-local run ${outcome}`, message: formatRun(selected, timestamp), run: structuredClone(selected) };
       }
-      const nextState = request.action === "pause" ? "paused" : request.action === "resume" ? "active" : "cancelled";
-      if (request.action === "pause" && selected.state !== "active") throw new Error(`Cannot pause Boss run from ${selected.state}.`);
-      if (request.action === "resume" && selected.state !== "paused") throw new Error(`Cannot resume Boss run from ${selected.state}.`);
+      if (request.action === "pause" || request.action === "resume") throw new Error(`Trusted-local Boss ${request.action} requires externally verified systemd cgroup control.`);
+      const nextState = "cancelled" as const;
       if (request.action === "cancel" && selected.state === "cancelled" && selected.cancellation?.state === "pending") return { title: "Boss trusted-local cancellation pending", message: formatRun(selected, timestamp), run: structuredClone(selected) };
       if (request.action === "cancel" && selected.state === "cancelled" && selected.cancellation?.state === "failed") {
         selected.cancellation = { actionId: `cancel-${randomUUID()}`, state: "pending", requestedAt: timestamp };
@@ -1126,8 +1297,8 @@ export class TrustedLocalBossStore {
       if (request.action === "cancel" && TERMINAL_RUN_STATES.has(selected.state)) throw new Error(`Boss run is already ${selected.state}.`);
       selected.state = nextState; selected.updatedAt = timestamp;
       if (nextState === "cancelled") { selected.cancellation = { actionId: `cancel-${randomUUID()}`, state: "pending", requestedAt: timestamp }; for (const assignment of selected.assignments) { if (assignment.state === "requested") { assignment.state = "cancelled"; assignment.updatedAt = timestamp; } } }
-      state.revision += 1; const titleAction = request.action === "pause" ? "paused" : request.action === "resume" ? "resumed" : "cancellation requested";
-      return { title: `Boss trusted-local run ${titleAction}`, message: formatRun(selected, timestamp), run: structuredClone(selected) };
+      state.revision += 1;
+      return { title: "Boss trusted-local run cancellation requested", message: formatRun(selected, timestamp), run: structuredClone(selected) };
     });
   }
 }
