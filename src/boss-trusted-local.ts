@@ -1234,6 +1234,12 @@ export class TrustedLocalBossStore {
       let changed = false;
       for (const run of state.runs) {
         const applyingPause = run.pauseTransitions.at(-1)?.phase === "applying" ? run.pauseTransitions.at(-1)! : null;
+        const acceptedResume = !run.currentPause && run.pauseTransitions.at(-1)?.action === "resume" && run.pauseTransitions.at(-1)?.phase === "accepted"
+          ? run.pauseTransitions.at(-1)!
+          : null;
+        const acceptedDegradedResumeTargets = acceptedResume && run.pauseReconciliations.some((entry) => entry.pauseRevision === acceptedResume.pauseRevision)
+          ? new Set(acceptedResume.targets.map((target) => `${target.workerId}\0${target.workerIncarnationId}`))
+          : new Set<string>();
         const pauseProtectedKeys = new Set([...(run.currentPause?.targets ?? []), ...(applyingPause?.targets ?? [])]
           .map((target) => `${target.workerId}\0${target.workerIncarnationId}`));
         for (const assignment of run.assignments.filter((candidate) => candidate.state === "assigned" && candidate.workerId && candidate.workerIncarnationId)) {
@@ -1254,8 +1260,10 @@ export class TrustedLocalBossStore {
             run.updatedAt = timestamp;
             changed = true;
           }
-          const pauseProtected = pauseProtectedKeys.has(`${assignment.workerId}\0${assignment.workerIncarnationId}`);
-          if (!pauseProtected && !TERMINAL_RUN_STATES.has(run.state) && (workerState === "failed" || workerState === "lost" || workerState === "stopped")) {
+          const assignmentKey = `${assignment.workerId}\0${assignment.workerIncarnationId}`;
+          const pauseProtected = pauseProtectedKeys.has(assignmentKey);
+          const settledByAcceptedDegradedResume = acceptedDegradedResumeTargets.has(assignmentKey);
+          if (!pauseProtected && !settledByAcceptedDegradedResume && !TERMINAL_RUN_STATES.has(run.state) && (workerState === "failed" || workerState === "lost" || workerState === "stopped")) {
             assignment.state = "failed";
             assignment.lastError = (detail ?? `${assignment.role} worker entered ${workerState}`).slice(0, 4_096);
             assignment.updatedAt = timestamp;

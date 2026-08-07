@@ -298,6 +298,25 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       .filter((worker: any) => pausedKeys.has(`${worker.id}\0${worker.workerIncarnationId ?? worker.runId}`))
       .map((worker: any) => [worker.id, worker.leaseExpiresAt, worker.idleDeadlineAt, worker.checkpointDeadlineAt, worker.checkpointLastAttemptAt]);
     assert.deepEqual(fencedAfter, fencedBefore, "heartbeat and cleanup must not normalize exact pause-fenced lifecycle budgets");
+    const mixedTimerState = JSON.parse(await readFile(statePath, "utf8"));
+    const mixedTimerWorker = mixedTimerState.workers.find((worker: any) => pausedKeys.has(`${worker.id}\0${worker.workerIncarnationId ?? worker.runId}`));
+    const suspendedLeaseDeadline = mixedTimerWorker.leaseExpiresAt;
+    mixedTimerWorker.leaseExpiresAt = Date.now() + 60_000;
+    await writeFile(statePath, `${JSON.stringify(mixedTimerState, null, 2)}\n`, "utf8");
+    const failedResume = await tools.get("boss").execute(
+      "boss-systemd-resume-restore-failure-test",
+      { action: "resume", bossRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(failedResume.details.run.state, "paused");
+    assert.equal(failedResume.details.run.pauseTransitions.at(-1).phase, "failed");
+    assert.match(failedResume.details.run.pauseTransitions.at(-1).reason, /mixed suspended timer state/);
+    assert.deepEqual([...frozenUnits].sort(), paused.details.run.currentPause.targets.map((target: any) => target.unit).sort(), "timer restoration failure after thaw must re-freeze every exact target before retaining enforced pause");
+    const repairedTimerState = JSON.parse(await readFile(statePath, "utf8"));
+    repairedTimerState.workers.find((worker: any) => worker.id === mixedTimerWorker.id && (worker.workerIncarnationId ?? worker.runId) === (mixedTimerWorker.workerIncarnationId ?? mixedTimerWorker.runId)).leaseExpiresAt = suspendedLeaseDeadline;
+    await writeFile(statePath, `${JSON.stringify(repairedTimerState, null, 2)}\n`, "utf8");
     const resumed = await tools.get("boss").execute(
       "boss-systemd-resume-test",
       { action: "resume", bossRunId },
@@ -380,17 +399,45 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     await writeFile(statePath, `${JSON.stringify(degradedWorkerState, null, 2)}\n`, "utf8");
     stoppedUnits.add(deadTarget.unit);
     stoppedUnits.add(missingTarget.unit);
-    const degradedResumed = await tools.get("boss").execute(
-      "boss-degraded-dead-target-resume",
-      { action: "resume", bossRunId: degradedRunId },
+    const { TrustedLocalBossStore } = await import("../src/boss-trusted-local.ts");
+    const restartStore = new TrustedLocalBossStore(join(orchestratorDir, "boss-trusted-local.json"));
+    await restartStore.beginPauseControl({
+      bossRunId: degradedRunId,
+      managerSessionId: "controller-exact-target",
+      action: "resume",
+      targets: degradedStatus.details.run.currentPause.targets,
+      intentionallyUnfrozenManagerWorkerId: degradedStatus.details.run.currentPause.intentionallyUnfrozenManagerWorkerId,
+      timers: degradedStatus.details.run.currentPause.timers,
+    });
+    const restartedLifecycle = new Map<string, (...args: any[]) => any>();
+    const restartedTools = new Map<string, any>();
+    const restartedPi: any = {
+      ...pi,
+      on(name: string, handler: (...args: any[]) => any) { restartedLifecycle.set(name, handler); },
+      registerTool(tool: any) { restartedTools.set(tool.name, tool); },
+    };
+    const { default: restartedExtension } = await import(new URL(`../src/index.ts?boss-degraded-restart=${Date.now()}`, import.meta.url).href);
+    restartedExtension(restartedPi);
+    await restartedLifecycle.get("session_start")?.({}, ctx);
+    const degradedResumed = await restartedTools.get("boss").execute(
+      "boss-degraded-dead-target-restart-status",
+      { action: "status", bossRunId: degradedRunId },
       new AbortController().signal,
       () => {},
       ctx,
     );
-    assert.equal(degradedResumed.details.run.state, "active");
+    assert.equal(degradedResumed.details.run.state, "active", "accepted degraded-resume evidence keeps conclusively settled targets operable across restart synchronization");
     assert.equal(degradedResumed.details.run.currentPause, null);
     assert.equal(degradedResumed.details.run.pauseTransitions.at(-1).phase, "accepted");
     assert.equal(degradedResumed.details.run.pauseTransitions.at(-1).authorizedBySessionId, "controller-exact-target");
+    const degradedCancelled = await restartedTools.get("boss").execute(
+      "boss-degraded-missing-target-cancel",
+      { action: "cancel", bossRunId: degradedRunId },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+    assert.equal(degradedCancelled.details.run.cancellation.state, "succeeded", "an accepted degraded resume durably settles an exact missing target for terminal shutdown");
 
     const reviewable = await tools.get("boss").execute(
       "boss-review-cleanup-retry-create",
