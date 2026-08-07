@@ -138,6 +138,18 @@ boss({ action: "create", goal: "Inspect this repository, make no edits, and repo
 boss({ action: "status" })
 ```
 
+When the goal has concrete execution needs, declare them on the tool call instead of relying on goal-text inference:
+
+```typescript
+boss({
+  action: "create",
+  goal: "Implement the requested change in the assigned worktree.",
+  requirements: { worktree: "write", edit: true },
+})
+```
+
+The optional fields are `worktree: "read" | "write"`, `edit: boolean`, `tests: boolean`, and `gitTransport: "read" | "write"`. Boss never derives them from goal text. It checks requested requirements before persisting a run and reports `verified`, `configured`, or `gap` evidence. `/usr/bin/git` verifies canonical linked-worktree identity and administrative relationships; read additionally requires R|X on the root, and write requires canonical cwd equality plus R|W|X. Worker read/write/edit remains policy configuration, not an effective-access claim. Read-only profiles block write/edit. Custom filesystem-path or systemd properties that may alter the target fail closed when they cannot be modeled, and a nested cwd does not prove whole-worktree writability. Project-specific tests and remote Git transport stay gaps when no exact probe establishes them; a configured shell or Git read-only inspection policy is not test/transport proof. A normal blocked response containing `BOSS_CAPABILITY_GAP` has `details.created: false`, no run, and machine-readable `capabilityReport.requested`, `capabilityReport.probes`, and `capabilityReport.gaps` evidence. A successful create has `details.created: true`. `/boss create` remains the goal-only interactive shorthand and cannot carry structured requirements.
+
 A run displays both a deterministic `<prefix>-<base32-digest>` handle and its exact `boss-...` run ID. Later commands accept either value; mutation results continue to show the exact ID. Multiple nonterminal trusted-local runs may coexist, but each remains owned by its exact creating Controller session.
 
 Status deliberately separates process/transport lifecycle from communication and substantive work. A participant may be `ready` while no authenticated communication has been observed. Each assigned role shows a ten-minute authenticated-communication deadline and becomes `authenticated-communication-stale` if the exact owned WorkerStore incarnation has produced no later authenticated Intercom traffic. Manual lease renewal and adoption update general lifecycle timing but not this dedicated evidence timestamp. Assignment acknowledgement, authenticated communication, and substantive typed checkpoints are reported separately: the timestamp proves communication only, while acknowledgement and substantive-checkpoint telemetry remain explicitly unavailable.

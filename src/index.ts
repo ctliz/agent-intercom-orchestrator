@@ -8,10 +8,11 @@ import { getAgentDir, type ExtensionAPI, type ExtensionContext } from "@earendil
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DEFAULT_CONFIG, readConfig, resolveProfileCommand, writeConfigDefaults } from "./config.ts";
-import { assertDirectInteractiveBossCommand, parseBossCommand } from "./boss-command.ts";
+import { BOSS_CREATE_ACCESS_LEVELS, assertDirectInteractiveBossCommand, bossCreateRequest, parseBossCommand, type BossCommandRequest } from "./boss-command.ts";
+import { formatBossCreateCapabilityReport, inspectBossCreateCapabilities, type BossCreateCapabilityReport } from "./boss-create-capabilities.ts";
 import { formatBossReadinessReport, formatBossSetupReport, inspectBossSetup, inspectTrustedLocalBossReadiness } from "./boss-setup.ts";
 import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossSupervisionEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
-import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore } from "./boss-trusted-local.ts";
+import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, type TrustedLocalBossResult } from "./boss-trusted-local.ts";
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
 import { addPiTools, buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy, SAFE_PI_BOSS_SUPERVISION_TOOLS } from "./permissions.ts";
 import { resolvePiRuntime } from "./pi-runtime.ts";
@@ -1954,10 +1955,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     });
   }
 
-  async function executeTrustedLocalBoss(args: string, ctx: ExtensionContext) {
+  async function executeTrustedLocalBoss(request: BossCommandRequest, ctx: ExtensionContext): Promise<TrustedLocalBossResult & { capabilityReport?: BossCreateCapabilityReport; created?: boolean }> {
     if (!config) await loadConfig();
     trustedLocalBossStore.setHandlePrefix(config.boss.handlePrefix);
-    const request = parseBossCommand(args);
     if (request.action === "plan") {
       const report = await inspectBossSetup({ agentDir });
       return { title: "Orc Boss setup plan", message: formatBossSetupReport(report, "plan") };
@@ -1967,10 +1967,30 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       return { title: "Orc Boss readiness", message: formatBossReadinessReport(report) };
     }
     await synchronizeTrustedLocalBossWorkers();
+    let capabilityReport: BossCreateCapabilityReport | undefined;
     if (request.action === "create") {
       const readiness = await trustedLocalBossReadiness(ctx);
       if (readiness.status === "blocked") {
         throw new Error(`BOSS_TRUSTED_LOCAL_NOT_READY:\n${formatBossReadinessReport(readiness)}`);
+      }
+      if (request.requirements) {
+        const workerPermissionProfileName = config.roles.worker?.permissionProfile ?? "builder-restricted";
+        const workerPermissionProfile = config.permissionProfiles[workerPermissionProfileName];
+        if (!workerPermissionProfile) throw new Error(`BOSS_CAPABILITY_GAP: unknown Worker permission profile ${workerPermissionProfileName}; no run was created.`);
+        capabilityReport = await inspectBossCreateCapabilities({
+          cwd: ctx.cwd,
+          requirements: request.requirements,
+          workerPermissionProfileName,
+          workerPermissionProfile,
+        });
+        if (capabilityReport.status === "blocked") {
+          return {
+            title: "Boss create capability gap",
+            message: `BOSS_CAPABILITY_GAP:\n${formatBossCreateCapabilityReport(capabilityReport)}`,
+            capabilityReport,
+            created: false,
+          };
+        }
       }
     }
     let result = await trustedLocalBossStore.execute(request, managerSessionId(ctx));
@@ -2164,7 +2184,13 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         });
       }
     }
-    return staffed;
+    if (!capabilityReport) return { ...staffed, created: true };
+    return {
+      ...staffed,
+      message: `${formatBossCreateCapabilityReport(capabilityReport)}\n\n${staffed.message}`,
+      capabilityReport,
+      created: true,
+    };
   }
 
   pi.registerTool({
@@ -2175,22 +2201,38 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use boss when the user asks the top-level Pi Controller to create or manage a Boss run; do not ask the user to type /boss.",
       "Boss runs use trusted-local advisory scoping, not protected or tamper-proof authority.",
+      "Pass structured create requirements only when the user explicitly requested those worktree, edit, test, or Git transport needs; never infer them from goal text.",
       "Use exact bossRunId values returned by boss for status, pause, resume, proof, approval, rejection, and cancellation.",
     ],
     parameters: Type.Object({
       action: StringEnum(["create", "doctor", "plan", "status", "resume", "pause", "cancel", "proof", "approve", "reject"] as const),
       goal: Type.Optional(Type.String({ description: "Explicit goal; required for create." })),
+      requirements: Type.Optional(Type.Object({
+        worktree: Type.Optional(StringEnum(BOSS_CREATE_ACCESS_LEVELS, { description: "Required configured access to a Git-verified exact linked worktree." })),
+        edit: Type.Optional(Type.Boolean({ description: "Require unambiguously configured Worker workspace edit access." })),
+        tests: Type.Optional(Type.Boolean({ description: "Require a concretely probed project test command/toolchain; reports a gap when no exact probe exists." })),
+        gitTransport: Type.Optional(StringEnum(BOSS_CREATE_ACCESS_LEVELS, { description: "Required remote Git transport authority." })),
+      }, { additionalProperties: false, description: "Explicit create-time requirements; identity, configuration, or probe gaps block before run creation." })),
       bossRunId: Type.Optional(Type.String({ description: "Exact Boss run id; required except for create and status-all." })),
       note: Type.Optional(Type.String({ description: "Optional control or decision note." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      const args = params.action === "create"
-        ? `create ${params.goal ?? ""}`
-        : `${params.action}${params.bossRunId ? ` ${params.bossRunId}` : ""}${params.note ? ` ${params.note}` : ""}`;
-      const result = await executeTrustedLocalBoss(args, ctx);
+      if (params.action !== "create" && params.requirements) throw new Error("Boss create requirements are accepted only for action=create.");
+      const request = params.action === "create"
+        ? bossCreateRequest(params.goal, params.requirements)
+        : parseBossCommand(`${params.action}${params.bossRunId ? ` ${params.bossRunId}` : ""}${params.note ? ` ${params.note}` : ""}`);
+      const result = await executeTrustedLocalBoss(request, ctx);
       return {
         content: [{ type: "text", text: result.message }],
-        details: { title: result.title, run: result.run, runs: result.runs, communication: result.communication },
+        details: {
+          title: result.title,
+          created: result.created,
+          run: result.run,
+          runs: result.runs,
+          communication: result.communication,
+          capabilityReport: result.capabilityReport,
+          gaps: result.capabilityReport?.gaps,
+        },
       };
     },
     renderCall(args, theme) {
@@ -2214,7 +2256,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     handler: async (args, ctx) => {
       try {
         assertDirectInteractiveBossCommand(ctx);
-        const result = await executeTrustedLocalBoss(args, ctx);
+        const result = await executeTrustedLocalBoss(parseBossCommand(args), ctx);
         await ctx.ui.editor(result.title, result.message);
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
