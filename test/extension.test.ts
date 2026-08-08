@@ -1668,6 +1668,8 @@ test("extension registers discovery tools and interactive configuration commands
     assert.match(tools.get("agent_fleet").promptGuidelines.join("\n"), /create the feature worktree before spawning/i);
     assert.match(tools.get("agent_fleet").promptGuidelines.join("\n"), /browser automation, screenshot capture, and artifact write access/i);
     assert.match(tools.get("agent_fleet").promptGuidelines.join("\n"), /explicit executablePath/);
+    assert.match(tools.get("agent_fleet").promptGuidelines.join("\n"), /package runners such as `uv run`/);
+    assert.match(tools.get("agent_fleet").promptGuidelines.join("\n"), /\.venv\/bin\/pytest/);
     assert.match(JSON.stringify(tools.get("agent_fleet").parameters), /versions/);
     assert.match(JSON.stringify(tools.get("agent_fleet").parameters), /update/);
     assert.match(JSON.stringify(tools.get("agent_fleet").parameters), /permissionProfile/);
