@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Teach restricted read-only coworkers and managers to bypass cache-writing package runners such as `uv run` only when a trusted pinned environment already exists, using direct `.venv` entry points with explicit disclosure rather than widening permissions or misreporting runner success.
 - Make browser-dependent coworker delegation honest: manager guidance and launch mandates now require separate verification of browser control, executable availability, and artifact write access; capability output discloses that visual capture is currently unmodeled; and docs describe explicit system-Chromium fallback plus manager-side capture when a read-only reviewer cannot produce screenshots.
 - Add an explicit structured Boss create requirements contract for worktree read/write, edit, tests, and Git transport, with real Git-linked-worktree verification, honest verified/configured/gap evidence, fail-closed custom-profile handling, machine-readable gaps, and no inference from goal text.
 - Version WorkerStore persistence as schema v3 before retaining authenticated inbound Intercom activity timestamps. Legacy v1/v2 reads migrate without promoting timestamp-shaped fields to evidence, explicit migration makes v3 durable, and newer schemas remain untouched and unquarantined behind the downgrade gate.

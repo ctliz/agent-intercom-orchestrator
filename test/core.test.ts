@@ -107,6 +107,9 @@ test("harness launch args include identity or the initial task", () => {
   for (const args of [piArgs, codexArgs, claudeArgs, minimalClaudeArgs, trustedClaudeArgs, opencodeArgs]) {
     assert.match(args.join(" "), /verify that this worker actually has a browser or browser tool/);
     assert.match(args.join(" "), /never present code inspection as visual evidence/);
+    assert.match(args.join(" "), /package runners may fail because they try to write caches/);
+    assert.match(args.join(" "), /\.venv\/bin\/pytest/);
+    assert.match(args.join(" "), /never claim it succeeded/);
   }
   assert.equal(buildWorkerEnvironment("pi", "advisor-a", "advisor").AGENT_INTERCOM_ORCHESTRATOR_DISABLED, "1");
   assert.equal(buildWorkerEnvironment("codex", "builder-a", "builder", "gpt-5.6-sol").CODEX_INTERCOM_MODEL, "gpt-5.6-sol");

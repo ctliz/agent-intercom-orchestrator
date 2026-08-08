@@ -122,6 +122,7 @@ export function standingInstructions(
     `Standing assignment: ${task}`,
     communicationInstructions,
     "Before promising browser-based validation, screenshots, or saved artifacts, verify that this worker actually has a browser or browser tool, a usable browser executable, and write access to the intended artifact directory. If any requirement is unavailable, report the exact gap immediately and ask the manager to capture locally or re-route the work; never present code inspection as visual evidence.",
+    "In a read-only workspace, package runners may fail because they try to write caches or environment metadata even when dependencies already exist. If the repository has a trusted pinned environment and the task does not require dependency synchronization, invoke its existing immutable entry points directly (for example `.venv/bin/python` or `.venv/bin/pytest`) instead of widening permissions. Report that `uv run` was bypassed; never claim it succeeded. If the environment is absent, stale, or would need writes, report the verification as blocked.",
     "Keep downstream tools inside this worker process tree. Do not create detached systemd services, background containers, or remote jobs unless the manager explicitly asks; report every external resource ID so the manager can own its cleanup.",
   ].filter(Boolean).join("\n\n");
 }

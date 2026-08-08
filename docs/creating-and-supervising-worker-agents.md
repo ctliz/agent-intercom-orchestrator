@@ -640,6 +640,22 @@ The report should identify:
 - inherited work from another agent
 - whether the worker can proceed without overwriting anything
 
+### Existing environments in read-only workspaces
+
+A package runner can require writes even when the actual interpreter and dependencies are already present. For example, `uv run` may attempt to create its cache or update environment metadata, so a `review-readonly` worker can be denied before tests start.
+
+When the repository contains a trusted pinned `.venv` and the assignment does not require installing or synchronizing dependencies, use the existing immutable entry points directly:
+
+```bash
+.venv/bin/python -m pytest <focused-tests>
+# or
+.venv/bin/pytest <focused-tests>
+```
+
+The worker must state that `uv run` was bypassed because of the read-only boundary and report the exact command that actually ran. It must not report `uv run` as successful. Do not widen permissions, relocate caches into the repository, or create a replacement environment merely to rescue a read-only review. If `.venv` is absent, stale relative to the lockfile, missing required packages, or the test itself requires writes that are unavailable, report verification as blocked and ask the manager to run it in an appropriate writable environment.
+
+This rule applies similarly to other wrappers that bootstrap or cache before invoking an already-installed tool. Prefer the repository's pinned executable only when doing so preserves the intended dependency set and test semantics.
+
 ## Goals, checklists, and built-in subagents
 
 For substantial assignments, require the worker to:
