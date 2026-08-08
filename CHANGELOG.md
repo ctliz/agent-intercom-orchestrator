@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add an additive trusted-local Boss `pendingDecision` status projection with explicit owner, reason, freshness, exact assignment target, and source timestamp for persisted control gates; report ownership as unavailable rather than inferring work or productivity from process/communication evidence.
 - Teach restricted read-only coworkers and managers to bypass cache-writing package runners such as `uv run` only when a trusted pinned environment already exists, using direct `.venv` entry points with explicit disclosure rather than widening permissions or misreporting runner success.
 - Make browser-dependent coworker delegation honest: manager guidance and launch mandates now require separate verification of browser control, executable availability, and artifact write access; capability output discloses that visual capture is currently unmodeled; and docs describe explicit system-Chromium fallback plus manager-side capture when a read-only reviewer cannot produce screenshots.
 - Add an explicit structured Boss create requirements contract for worktree read/write, edit, tests, and Git transport, with real Git-linked-worktree verification, honest verified/configured/gap evidence, fail-closed custom-profile handling, machine-readable gaps, and no inference from goal text.
