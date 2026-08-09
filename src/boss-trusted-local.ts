@@ -130,6 +130,21 @@ export interface TrustedLocalBossAssignmentCommunication {
   communicationStatus: TrustedLocalBossCommunicationStatus;
 }
 
+export type TrustedLocalBossPendingDecisionOwner = "controller" | TrustedLocalBossAssignmentRole | "none" | "unavailable";
+export type TrustedLocalBossPendingDecisionReason = "terminal" | "cancellation_settlement" | "pause_reconciliation" | "pause_disposition" | "participant_staffing" | "authenticated_communication_stale" | "review_decision" | "unavailable";
+
+/** A control-plane next-action projection derived only from persisted state and explicit deadlines. */
+export interface TrustedLocalBossPendingDecision {
+  owner: TrustedLocalBossPendingDecisionOwner;
+  reason: TrustedLocalBossPendingDecisionReason;
+  freshness: "current" | "unavailable";
+  targetRole: TrustedLocalBossAssignmentRole | null;
+  assignmentId: string | null;
+  sourceObservedAt: string | null;
+  derivedAt: string;
+  detail: string;
+}
+
 export interface TrustedLocalBossProofPacket {
   proofPacketId: string;
   revision: number;
@@ -297,6 +312,7 @@ export interface TrustedLocalBossResult {
   run?: TrustedLocalBossRun;
   runs?: TrustedLocalBossRun[];
   communication?: TrustedLocalBossAssignmentCommunication[];
+  pendingDecision?: TrustedLocalBossPendingDecision;
   freezeTransition?: TrustedLocalBossFreezeTransition;
   pauseTransition?: TrustedLocalBossPauseTransition;
 }
@@ -821,11 +837,47 @@ function runCommunication(run: TrustedLocalBossRun, now: string): TrustedLocalBo
   return run.assignments.map((assignment) => assignmentCommunication(run, assignment, now));
 }
 
+function runPendingDecision(run: TrustedLocalBossRun, now: string): TrustedLocalBossPendingDecision {
+  const decision = (owner: TrustedLocalBossPendingDecisionOwner, reason: TrustedLocalBossPendingDecisionReason, detail: string, sourceObservedAt: string | null, target?: TrustedLocalBossAssignment): TrustedLocalBossPendingDecision => ({
+    owner,
+    reason,
+    freshness: owner === "unavailable" ? "unavailable" : "current",
+    targetRole: target?.role ?? null,
+    assignmentId: target?.assignmentId ?? null,
+    sourceObservedAt,
+    derivedAt: now,
+    detail,
+  });
+  if (run.cancellation?.state === "pending" || run.cancellation?.state === "failed") {
+    return decision("controller", "cancellation_settlement", run.cancellation.state === "pending" ? "Controller must verify exact participant shutdown and canonical resource cleanup." : "Controller must explicitly retry or disposition failed participant shutdown and canonical resource cleanup.", run.cancellation.completedAt ?? run.cancellation.requestedAt);
+  }
+  if (run.currentPauseDegradation) return decision("controller", "pause_reconciliation", "Controller must reconcile exact cgroup thaw and WorkerStore timer restoration before terminal control can proceed.", run.currentPauseDegradation.observedAt);
+  const applyingPause = run.pauseTransitions.at(-1);
+  if (applyingPause?.phase === "applying") return decision("controller", "pause_reconciliation", `Controller must reconcile the exact applying ${applyingPause.action} transition before another lifecycle decision.`, applyingPause.occurredAt);
+  if (TERMINAL_RUN_STATES.has(run.state)) return decision("none", "terminal", `Run is ${run.state}; no pending control decision is represented in persisted state.`, run.updatedAt);
+  if (run.state === "paused") return decision("controller", "pause_disposition", "Controller owns the explicit resume, cancellation, or other disposition of this enforced pause.", run.currentPause?.pausedAt ?? run.updatedAt);
+  const staffing = run.assignments.find((assignment) => assignment.state === "requested" || assignment.state === "failed");
+  if (staffing) return decision("controller", "participant_staffing", `Controller must ${staffing.state === "failed" ? "retry or disposition" : "complete"} exact ${staffing.role} staffing revision ${staffing.revision}.`, staffing.updatedAt, staffing);
+  const stale = runCommunication(run, now).find((entry) => entry.communicationStatus === "authenticated_communication_stale");
+  if (stale) {
+    const target = run.assignments.find((assignment) => assignment.assignmentId === stale.assignmentId)!;
+    return decision(stale.role === "manager" ? "controller" : "manager", "authenticated_communication_stale", `${stale.role === "manager" ? "Controller" : "Manager"} must inspect the exact ${stale.role} communication deadline; authenticated traffic is communication evidence only, not proof of productivity.`, stale.authenticatedCommunicationDeadlineAt, target);
+  }
+  const proof = run.proofPackets.at(-1);
+  if (proof && !run.decisions.length) {
+    const delivery = run.deliveries.find((candidate) => candidate.kind === "proof-review" && candidate.proofPacketId === proof.proofPacketId);
+    const result = delivery ? run.assignmentResults.find((candidate) => candidate.deliveryId === delivery.deliveryId) : undefined;
+    if (delivery?.state === "delivered" && result?.outcome === "accepted") return decision("controller", "review_decision", `Controller must approve or reject exact advisory proof revision ${proof.revision}; authenticated delivery is not protected attestation.`, result.observedAt, run.assignments.find((assignment) => assignment.assignmentId === proof.reviewerAssignmentId));
+  }
+  return decision("unavailable", "unavailable", "No typed substantive checkpoint or blocker establishes a current decision owner. Process state and authenticated traffic are not used to infer productivity or next action.", null);
+}
+
 function formatRunList(runs: readonly TrustedLocalBossRun[], now: string): string {
   if (runs.length === 0) return `${TRUSTED_LOCAL_BOSS_WARNING}\n\nNo Boss runs are owned by this Controller.`;
   const entries = runs.map((run) => {
     const communicationStates = [...new Set(runCommunication(run, now).map((entry) => entry.communicationStatus))];
-    return `- ${run.handle} (${run.bossRunId}) [${run.state}; communication=${communicationStates.join(",")}] ${run.goal}`;
+    const pendingDecision = runPendingDecision(run, now);
+    return `- ${run.handle} (${run.bossRunId}) [${run.state}; communication=${communicationStates.join(",")}; pending-decision=${pendingDecision.owner}/${pendingDecision.reason}] ${run.goal}`;
   });
   return `${TRUSTED_LOCAL_BOSS_WARNING}\n\nOwned Boss runs (${runs.length}):\n${entries.join("\n")}\n\nWorker lifecycle is process/transport evidence only. Use /boss status <handle-or-exact-run-id> for details, including separate assignment acknowledgement, authenticated communication, substantive checkpoint, and unavailable telemetry fields; mutation results always include the exact run id.`;
 }
@@ -843,6 +895,7 @@ function formatRun(run: TrustedLocalBossRun, now: string): string {
     return `- ${entry.role}: transport/process=${transport}; assignment-acknowledgement=${entry.assignmentAcknowledgementEvidence}; authenticated-communication=${authenticated}; substantive-checkpoint=${entry.substantiveCheckpointEvidence}; communication-status=${entry.communicationStatus.replaceAll("_", "-")}${entry.authenticatedCommunicationDeadlineAt ? `; communication-deadline=${entry.authenticatedCommunicationDeadlineAt}` : ""}`;
   }).join("\n");
   const latestDelivery = run.deliveries.at(-1);
+  const pendingDecision = runPendingDecision(run, now);
   const resource = run.resource
     ? `resource: ${run.resource.resourceId} revision ${run.resource.revision}; path=${run.resource.path}; branch=${run.resource.branch}; base=${run.resource.baseSha}; HEAD=${run.resource.headSha}; existence=${run.resource.existence}; lease=${run.resource.leaseState} until ${run.resource.leaseExpiresAt}`
     : "resource: unavailable (this run predates or did not request a canonical worktree resource)";
@@ -856,7 +909,7 @@ function formatRun(run: TrustedLocalBossRun, now: string): string {
     : run.pauseTransitions.at(-1)?.phase === "applying"
       ? `pause-control: reconciliation required for ${run.pauseTransitions.at(-1)!.action} transition ${run.pauseTransitions.at(-1)!.actionId}; enforcement is unavailable until exact unit and timer reconciliation completes.`
       : "pause-control: not enforced; unattached same-UID processes are outside Boss control";
-  return [TRUSTED_LOCAL_BOSS_WARNING, `handle: ${run.handle}`, `run: ${run.bossRunId}`, `state: ${run.state}`, pause, `goal: ${run.goal}`, `manager session: ${run.managerSessionId}`, resource, freeze, "readiness: WorkerStore lifecycle reports process/transport state only; it does not prove productive task activity.", "communication evidence: authenticated worker Intercom traffic proves communication only; assignment acknowledgement and substantive typed checkpoint telemetry are unavailable unless explicitly reported as separate fields.", "staffing:", staffing, "communication:", communication, `adversary assignment: ${reviewer ? `${reviewer.assignmentId} (${reviewer.state})` : "not requested"}`, `assignment delivery: ${latestDelivery ? `${latestDelivery.kind} ${latestDelivery.state} to ${latestDelivery.targetWorkerId} at revision ${latestDelivery.assignmentRevision}` : "none"}`, `assignment results: ${run.assignmentResults.length}`, `latest proof: ${latestProof ? `${latestProof.proofPacketId} revision ${latestProof.revision} sha256:${latestProof.snapshotSha256}` : "none"}`, `latest decision: ${latestDecision ? `${latestDecision.outcome} on proof revision ${latestDecision.proofRevision} — ${latestDecision.note}` : "none"}`, `cancellation: ${run.cancellation ? `${run.cancellation.state}${run.cancellation.error ? ` — ${run.cancellation.error}` : ""}` : "not requested"}`, `created: ${run.createdAt}`, `updated: ${run.updatedAt}`, "lifecycle:", lifecycle].join("\n");
+  return [TRUSTED_LOCAL_BOSS_WARNING, `handle: ${run.handle}`, `run: ${run.bossRunId}`, `state: ${run.state}`, `pending decision: owner=${pendingDecision.owner}; reason=${pendingDecision.reason}; freshness=${pendingDecision.freshness}; target-role=${pendingDecision.targetRole ?? "none"}; assignment=${pendingDecision.assignmentId ?? "none"}; source-observed=${pendingDecision.sourceObservedAt ?? "unavailable"}; derived=${pendingDecision.derivedAt}; detail=${pendingDecision.detail}`, pause, `goal: ${run.goal}`, `manager session: ${run.managerSessionId}`, resource, freeze, "readiness: WorkerStore lifecycle reports process/transport state only; it does not prove productive task activity.", "communication evidence: authenticated worker Intercom traffic proves communication only; assignment acknowledgement and substantive typed checkpoint telemetry are unavailable unless explicitly reported as separate fields.", "staffing:", staffing, "communication:", communication, `adversary assignment: ${reviewer ? `${reviewer.assignmentId} (${reviewer.state})` : "not requested"}`, `assignment delivery: ${latestDelivery ? `${latestDelivery.kind} ${latestDelivery.state} to ${latestDelivery.targetWorkerId} at revision ${latestDelivery.assignmentRevision}` : "none"}`, `assignment results: ${run.assignmentResults.length}`, `latest proof: ${latestProof ? `${latestProof.proofPacketId} revision ${latestProof.revision} sha256:${latestProof.snapshotSha256}` : "none"}`, `latest decision: ${latestDecision ? `${latestDecision.outcome} on proof revision ${latestDecision.proofRevision} — ${latestDecision.note}` : "none"}`, `cancellation: ${run.cancellation ? `${run.cancellation.state}${run.cancellation.error ? ` — ${run.cancellation.error}` : ""}` : "not requested"}`, `created: ${run.createdAt}`, `updated: ${run.updatedAt}`, "lifecycle:", lifecycle].join("\n");
 }
 
 function workerIncarnation(worker: WorkerRecord): string { return worker.workerIncarnationId ?? worker.runId; }
@@ -1346,7 +1399,7 @@ export class TrustedLocalBossStore {
         }
         if (!selected) throw new Error("No matching trusted-local Boss run exists.");
         assertOwningSession(selected, managerSessionId);
-        return { title: "Boss trusted-local status", message: formatRun(selected, timestamp), run: structuredClone(selected), communication: runCommunication(selected, timestamp) };
+        return { title: "Boss trusted-local status", message: formatRun(selected, timestamp), run: structuredClone(selected), communication: runCommunication(selected, timestamp), pendingDecision: runPendingDecision(selected, timestamp) };
       }
       if (request.action === "create") {
         if (request.goal.length > MAX_GOAL_LENGTH) throw new Error(`Trusted-local Boss goal exceeds ${MAX_GOAL_LENGTH} characters.`);
