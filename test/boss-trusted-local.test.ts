@@ -707,6 +707,63 @@ test("trusted-local Boss records Manager staffing and lifecycle changes from ord
   }
 });
 
+test("trusted-local Boss status exposes an honest persisted pending-decision owner", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "boss-trusted-local-pending-decision-"));
+  let now = 1_700_000_000_000;
+  const store = new TrustedLocalBossStore(join(dir, "runs.json"), () => new Date(now));
+  try {
+    const created = await store.execute(parseBossCommand("create expose exact next control owner"), "decision-controller");
+    const initial = await store.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "decision-controller");
+    assert.deepEqual(initial.pendingDecision, {
+      owner: "controller",
+      reason: "participant_staffing",
+      freshness: "current",
+      targetRole: "manager",
+      assignmentId: created.run!.assignments[0].assignmentId,
+      sourceObservedAt: created.run!.assignments[0].updatedAt,
+      derivedAt: new Date(now).toISOString(),
+      detail: "Controller must complete exact manager staffing revision 1.",
+    });
+    assert.match(initial.message, /pending decision: owner=controller; reason=participant_staffing; freshness=current; target-role=manager/);
+
+    const manager = { ...managerWorker(created.run!.bossRunId), managerSessionId: "decision-controller" };
+    const worker = { ...managerWorker(created.run!.bossRunId), managerSessionId: "decision-controller", id: `boss-worker-${created.run!.bossRunId.slice(-12)}`, runId: "decision-worker", workerIncarnationId: "decision-worker", role: "worker" };
+    const scout = { ...managerWorker(created.run!.bossRunId), managerSessionId: "decision-controller", id: `boss-scout-${created.run!.bossRunId.slice(-12)}`, runId: "decision-scout", workerIncarnationId: "decision-scout", role: "scout" };
+    await store.recordManagerStarted(created.run!.bossRunId, manager);
+    await store.recordAssignmentStartedForRole(created.run!.bossRunId, "worker", worker);
+    await store.recordAssignmentStartedForRole(created.run!.bossRunId, "scout", scout);
+
+    const untyped = await store.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "decision-controller");
+    assert.equal(untyped.pendingDecision?.owner, "unavailable");
+    assert.equal(untyped.pendingDecision?.reason, "unavailable");
+    assert.equal(untyped.pendingDecision?.freshness, "unavailable");
+    assert.match(untyped.pendingDecision?.detail ?? "", /not used to infer productivity or next action/);
+
+    now += TRUSTED_LOCAL_BOSS_AUTHENTICATED_COMMUNICATION_DEADLINE_MS;
+    const stale = await store.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "decision-controller");
+    assert.equal(stale.pendingDecision?.owner, "controller", "the Controller owns a stale Manager communication deadline");
+    assert.equal(stale.pendingDecision?.reason, "authenticated_communication_stale");
+    assert.equal(stale.pendingDecision?.targetRole, "manager");
+    assert.equal(stale.pendingDecision?.assignmentId, created.run!.assignments[0].assignmentId);
+    assert.match(stale.pendingDecision?.detail ?? "", /communication evidence only, not proof of productivity/);
+
+    const summary = await store.execute(parseBossCommand("status"), "decision-controller");
+    assert.match(summary.message, /pending-decision=controller\/authenticated_communication_stale/);
+
+    const cancellation = await store.execute(parseBossCommand(`cancel ${created.run!.bossRunId}`), "decision-controller");
+    const cancellingStatus = await store.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "decision-controller");
+    assert.equal(cancellingStatus.pendingDecision?.owner, "controller");
+    assert.equal(cancellingStatus.pendingDecision?.reason, "cancellation_settlement");
+    assert.equal(cancellingStatus.pendingDecision?.sourceObservedAt, cancellation.run!.cancellation!.requestedAt);
+    await store.recordCancellationResult(created.run!.bossRunId);
+    const terminal = await store.execute(parseBossCommand(`status ${created.run!.bossRunId}`), "decision-controller");
+    assert.equal(terminal.pendingDecision?.owner, "none");
+    assert.equal(terminal.pendingDecision?.reason, "terminal");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("trusted-local Boss separates transport, acknowledgement, communication, and substantive checkpoints", async () => {
   const dir = await mkdtemp(join(tmpdir(), "boss-trusted-local-communication-"));
   let now = 1_700_000_000_000;

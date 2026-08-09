@@ -71,7 +71,7 @@ agent_fleet({ action: "history" }) // full retained history for this manager
 
 Before the first run, install and onboard the required Intercom Pi, Orchestrator, Ralph, and Return On stack. Preview setup with `agent-intercom-boss-setup --plan`, apply only after reviewing the exact changes, reload Pi, then inspect live readiness with `/boss doctor`. Setup requires explicit Manager, Worker, Scout, and Adversary model/effort choices plus a lowercase handle prefix; it preserves unrelated Pi settings and Orchestrator configuration and refuses dirty, pinned, duplicate, filtered, or identity-mismatched installs. See [Orc Boss installation](docs/boss-installation.md).
 
-A top-level Pi Controller can create and manage concurrent logical Boss teams through the LLM-callable `boss` tool. `doctor` and `plan` are read-only. Every persisted run receives a deterministic handle such as `boss-k3m7...`; commands accept that handle or the exact run ID, while mutation results retain the exact ID.
+A top-level Pi Controller can create and manage concurrent logical Boss teams through the LLM-callable `boss` tool. `doctor` and `plan` are read-only. Every persisted run receives a deterministic handle such as `boss-k3m7...`; commands accept that handle or the exact run ID, while mutation results retain the exact ID. Exact-run status also projects a structured `pendingDecision` from persisted control state and explicit communication deadlines, naming the Controller or participant role that owns the next known control decision. When no typed checkpoint or blocker establishes ownership, it reports `owner: "unavailable"` instead of inferring productivity or next action from process state or authenticated traffic.
 
 ```typescript
 boss({ action: "plan" })
