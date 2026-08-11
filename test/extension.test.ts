@@ -9,6 +9,53 @@ function commandResult() {
   return { stdout: "", stderr: "", code: 0, killed: false };
 }
 
+test("empty RPC bootstrap detection defers only known-empty discovery sessions", async () => {
+  const { isEmptyRpcBootstrapSession } = await import("../src/index.ts");
+  const context = (mode: string, entries?: Array<{ type?: string }>) => ({
+    mode,
+    sessionManager: {
+      getSessionId: () => "test-session",
+      getSessionFile: () => undefined,
+      ...(entries ? { getEntries: () => entries } : {}),
+    },
+  }) as any;
+
+  assert.equal(isEmptyRpcBootstrapSession(context("rpc", [])), true);
+  assert.equal(isEmptyRpcBootstrapSession(context("rpc", [{ type: "model_change" }])), true);
+  assert.equal(isEmptyRpcBootstrapSession(context("rpc", [{ type: "message" }])), false);
+  assert.equal(isEmptyRpcBootstrapSession(context("tui", [])), false);
+  assert.equal(isEmptyRpcBootstrapSession(context("rpc")), false, "partial older hosts must preserve eager initialization");
+});
+
+test("empty RPC provider probes register tools without starting reconciliation", async () => {
+  const lifecycle = new Map<string, (...args: any[]) => any>();
+  let execCalls = 0;
+  const pi: any = {
+    on(name: string, handler: (...args: any[]) => any) { lifecycle.set(name, handler); },
+    events: { on() { return () => {}; }, emit() {} },
+    registerTool() {},
+    registerCommand() {},
+    async exec() { execCalls += 1; return commandResult(); },
+  };
+  const { default: extension } = await import(new URL(`../src/index.ts?rpc-bootstrap=${Date.now()}`, import.meta.url).href);
+  extension(pi);
+  const ctx: any = {
+    cwd: "/tmp",
+    mode: "rpc",
+    hasUI: false,
+    sessionManager: {
+      getSessionId: () => "provider-probe",
+      getSessionFile: () => undefined,
+      getEntries: () => [],
+    },
+    ui: { setStatus() {}, notify() {} },
+  };
+
+  await lifecycle.get("session_start")?.({}, ctx);
+  assert.equal(execCalls, 0, "empty provider probes must not reconcile workers or inspect systemd");
+  assert.equal(typeof lifecycle.get("before_agent_start"), "function", "the first real turn must retain deferred initialization");
+});
+
 test("owned Boss participants cannot register /boss, boss, or agent_fleet when orchestration is disabled", async () => {
   const keys = [
     "AGENT_INTERCOM_ORCHESTRATOR_DISABLED",
