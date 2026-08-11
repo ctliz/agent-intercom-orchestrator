@@ -14,7 +14,7 @@ import { formatBossCreateCapabilityReport, inspectBossCreateCapabilities, type B
 import { cleanupProvisionedBossResource, observeProvisionedBossResource, preserveProvisionedBossResource, provisionBossLinkedWorktree, rollbackProvisionedBossWorktree, type ProvisionedBossWorktree } from "./boss-resource.ts";
 import { formatBossReadinessReport, formatBossSetupReport, inspectBossSetup, inspectTrustedLocalBossReadiness } from "./boss-setup.ts";
 import { applyBossSystemdPausePlan, bossWorkerTimersSuspended, captureBossPausedTimers, recoverBossSystemdPauseTargets, resolveBossSystemdPausePlan, restoreBossWorkerTimers, suspendBossWorkerTimers, validatePersistedBossSystemdPauseTargets, verifyAcceptedBossSystemdPause, type BossSystemdPauseTarget } from "./boss-systemd-pause.ts";
-import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossSupervisionEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
+import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossSupervisionEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
 import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, type TrustedLocalBossAssignment, type TrustedLocalBossPausedTimer, type TrustedLocalBossPauseSettledTarget, type TrustedLocalBossResult, type TrustedLocalBossRun } from "./boss-trusted-local.ts";
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
 import { addPiTools, buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy, SAFE_PI_BOSS_SUPERVISION_TOOLS } from "./permissions.ts";
@@ -1944,8 +1944,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     const available = await systemdAvailable(runner);
     const managerHealth = available ? await getUserManagerHealth(runner) : { responsive: false, error: "systemd user manager unavailable" };
     let availablePiModels: string[] | undefined;
-    const piProfileName = config.defaultProfiles.pi;
-    const piCommand = piProfileName ? resolveProfileCommand(config.profiles[piProfileName]?.command || "") : undefined;
+    const piProfileName = TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE;
+    const piCommand = resolveProfileCommand(config.profiles[piProfileName]?.command || "");
     if (piCommand) {
       const modelResult = await runner.exec(piCommand, ["--list-models"], { timeout: 30_000 }).catch(() => undefined);
       if (modelResult?.code === 0) {
@@ -2327,6 +2327,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           ].join("\n"),
           cwd: result.run.resource?.path ?? ctx.cwd,
           harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
+          profile: TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE,
           model: config.boss.roles.adversary?.model,
           effort: config.boss.roles.adversary?.effort ?? "auto",
           subagents: "auto",
@@ -2442,6 +2443,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         ].join("\n"),
         cwd: result.run.resource?.path ?? ctx.cwd,
         harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
+        profile: TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE,
         model: config.boss.roles[member.role]?.model,
         effort: config.boss.roles[member.role]?.effort ?? "auto",
         subagents: "auto",
@@ -2506,18 +2508,22 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use boss when the user asks the top-level Pi Controller to create or manage a Boss run; do not ask the user to type /boss.",
       "Boss runs use trusted-local advisory scoping, not protected or tamper-proof authority.",
-      "Pass structured create requirements only when the user explicitly requested those worktree, edit, test, or Git transport needs; never infer them from goal text.",
+      "Pass structured create requirements only when the user explicitly requested those worktree, edit, test, or Git transport needs; never infer them from goal text. Strict-schema clients may pass `requirements: null` for non-create actions; null means absent authority and is never a create requirement.",
+      "Boss participants are independent Pi peers using the pre-onboarded Manager, Worker, Scout, and Adversary model/effort choices. Do not describe Boss as a Codex/Claude/OpenCode harness with native subagents, and do not imply per-run model overrides exist.",
       "Use exact bossRunId values returned by boss for status, pause, resume, freeze, unfreeze, proof, approval, rejection, and cancellation.",
     ],
     parameters: Type.Object({
       action: StringEnum(["create", "doctor", "plan", "status", "resume", "pause", "freeze", "unfreeze", "cancel", "proof", "approve", "reject"] as const),
       goal: Type.Optional(Type.String({ description: "Explicit goal; required for create." })),
-      requirements: Type.Optional(Type.Object({
-        worktree: Type.Optional(StringEnum(BOSS_CREATE_ACCESS_LEVELS, { description: "Required configured access to a Git-verified exact linked worktree." })),
-        edit: Type.Optional(Type.Boolean({ description: "Require unambiguously configured Worker workspace edit access." })),
-        tests: Type.Optional(Type.Boolean({ description: "Require a concretely probed project test command/toolchain; reports a gap when no exact probe exists." })),
-        gitTransport: Type.Optional(StringEnum(BOSS_CREATE_ACCESS_LEVELS, { description: "Required remote Git transport authority." })),
-      }, { additionalProperties: false, description: "Explicit create-time requirements; identity, configuration, or probe gaps block before run creation." })),
+      requirements: Type.Optional(Type.Union([
+        Type.Null({ description: "Explicit absence placeholder for strict-schema clients. Required capabilities are never inferred from null." }),
+        Type.Object({
+          worktree: Type.Optional(StringEnum(BOSS_CREATE_ACCESS_LEVELS, { description: "Required configured access to a Git-verified exact linked worktree." })),
+          edit: Type.Optional(Type.Boolean({ description: "Require unambiguously configured Worker workspace edit access." })),
+          tests: Type.Optional(Type.Boolean({ description: "Require a concretely probed project test command/toolchain; reports a gap when no exact probe exists." })),
+          gitTransport: Type.Optional(StringEnum(BOSS_CREATE_ACCESS_LEVELS, { description: "Required remote Git transport authority." })),
+        }, { additionalProperties: false, description: "Explicit create-time requirements; identity, configuration, or probe gaps block before run creation." }),
+      ])),
       bossRunId: Type.Optional(Type.String({ description: "Exact Boss run id; required except for create and status-all." })),
       expectedAcceptanceRevision: Type.Optional(Type.Integer({ minimum: 1, description: "Exact current acceptance revision; required for freeze." })),
       expectedDesignRevision: Type.Optional(Type.Integer({ minimum: 1, description: "Exact current design revision; required for freeze." })),
@@ -2526,9 +2532,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       note: Type.Optional(Type.String({ description: "Optional control or decision note." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      if (params.action !== "create" && params.requirements) throw new Error("Boss create requirements are accepted only for action=create.");
+      if (params.action !== "create" && params.requirements !== undefined && params.requirements !== null) throw new Error("Boss create requirements are accepted only for action=create; use null as the explicit strict-schema absence placeholder.");
       const request = params.action === "create"
-        ? bossCreateRequest(params.goal, params.requirements)
+        ? bossCreateRequest(params.goal, params.requirements ?? undefined)
         : params.action === "freeze"
           ? parseBossCommand(`freeze ${params.bossRunId ?? ""} ${params.expectedAcceptanceRevision ?? ""} ${params.expectedDesignRevision ?? ""}`)
           : params.action === "unfreeze"
@@ -2543,6 +2549,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           run: result.run,
           runs: result.runs,
           communication: result.communication,
+          pendingDecision: result.pendingDecision,
           capabilityReport: result.capabilityReport,
           gaps: result.capabilityReport?.gaps,
           freezeTransition: result.freezeTransition,

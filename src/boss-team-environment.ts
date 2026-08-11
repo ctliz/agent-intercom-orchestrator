@@ -5,6 +5,7 @@ import type { TrustedLocalBossAssignmentRole } from "./boss-trusted-local.ts";
 // Keep every participant on Pi until coordinated non-Pi adapters implement the
 // same exact-ID, role, inbound, and discovery contract.
 export const TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS = "pi" as const;
+export const TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE = "pi-peer" as const;
 
 export interface TrustedLocalBossTeamIdentity {
   bossRunId: string;
