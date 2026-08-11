@@ -3,6 +3,7 @@ import { access, readFile, realpath } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { BOSS_ONBOARDING_VERSION, isBossOnboardingComplete, readConfig, writeConfigDefaults } from "./config.ts";
+import { TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE } from "./boss-team-environment.ts";
 import type { BossBaselineRole, BossRolePreference, Effort, OrchestratorConfig } from "./types.ts";
 
 export const BOSS_SETUP_SCHEMA_VERSION = "orc.boss-setup-report.v1" as const;
@@ -307,12 +308,19 @@ export async function inspectTrustedLocalBossReadiness(options: BossReadinessInp
 
   const roleInput = Object.fromEntries(BOSS_ROLES.map((role) => [role, options.config.boss.roles[role]])) as BossOnboardingInput["roles"];
   const onboardingErrors = validateBossOnboardingInput({ roles: roleInput, handlePrefix: options.config.boss.handlePrefix });
+  const participantProfile = options.config.profiles[TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE];
+  if (!participantProfile) onboardingErrors.push(`Required Boss participant profile '${TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE}' is unavailable.`);
+  else {
+    if (participantProfile.harness !== TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS) onboardingErrors.push(`Boss participant profile '${TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE}' must launch ${TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS}, not ${participantProfile.harness}.`);
+    if ((participantProfile.mode ?? "persistent") !== "persistent") onboardingErrors.push(`Boss participant profile '${TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE}' must use persistent mode.`);
+    if (participantProfile.spawnable === false) onboardingErrors.push(`Boss participant profile '${TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE}' must be spawnable.`);
+  }
   const onboardingReady = isBossOnboardingComplete(options.config) && onboardingErrors.length === 0;
   const configuredTopology = [
-    "topology: Manager, Worker, Scout, and Adversary launch as independent Pi peers; native Codex/Claude/OpenCode subagent topology and per-run model overrides are unavailable",
+    `topology: Manager, Worker, Scout, and Adversary launch as independent Pi peers pinned to profile=${TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE}; native Codex/Claude/OpenCode subagent topology and per-run model overrides are unavailable`,
     ...BOSS_ROLES.map((role) => {
       const preference = options.config.boss.roles[role];
-      return `${role}: harness=pi-peer; model=${preference?.model ?? "unavailable"}; effort=${preference?.effort ?? "unavailable"}`;
+      return `${role}: harness=${TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS}; profile=${TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE}; model=${preference?.model ?? "unavailable"}; effort=${preference?.effort ?? "unavailable"}`;
     }),
   ];
   checks.push({

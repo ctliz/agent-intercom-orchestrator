@@ -14,7 +14,7 @@ import { formatBossCreateCapabilityReport, inspectBossCreateCapabilities, type B
 import { cleanupProvisionedBossResource, observeProvisionedBossResource, preserveProvisionedBossResource, provisionBossLinkedWorktree, rollbackProvisionedBossWorktree, type ProvisionedBossWorktree } from "./boss-resource.ts";
 import { formatBossReadinessReport, formatBossSetupReport, inspectBossSetup, inspectTrustedLocalBossReadiness } from "./boss-setup.ts";
 import { applyBossSystemdPausePlan, bossWorkerTimersSuspended, captureBossPausedTimers, recoverBossSystemdPauseTargets, resolveBossSystemdPausePlan, restoreBossWorkerTimers, suspendBossWorkerTimers, validatePersistedBossSystemdPauseTargets, verifyAcceptedBossSystemdPause, type BossSystemdPauseTarget } from "./boss-systemd-pause.ts";
-import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossSupervisionEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
+import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossSupervisionEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
 import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, type TrustedLocalBossAssignment, type TrustedLocalBossPausedTimer, type TrustedLocalBossPauseSettledTarget, type TrustedLocalBossResult, type TrustedLocalBossRun } from "./boss-trusted-local.ts";
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
 import { addPiTools, buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy, SAFE_PI_BOSS_SUPERVISION_TOOLS } from "./permissions.ts";
@@ -1944,8 +1944,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     const available = await systemdAvailable(runner);
     const managerHealth = available ? await getUserManagerHealth(runner) : { responsive: false, error: "systemd user manager unavailable" };
     let availablePiModels: string[] | undefined;
-    const piProfileName = config.defaultProfiles.pi;
-    const piCommand = piProfileName ? resolveProfileCommand(config.profiles[piProfileName]?.command || "") : undefined;
+    const piProfileName = TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE;
+    const piCommand = resolveProfileCommand(config.profiles[piProfileName]?.command || "");
     if (piCommand) {
       const modelResult = await runner.exec(piCommand, ["--list-models"], { timeout: 30_000 }).catch(() => undefined);
       if (modelResult?.code === 0) {
@@ -2327,6 +2327,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           ].join("\n"),
           cwd: result.run.resource?.path ?? ctx.cwd,
           harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
+          profile: TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE,
           model: config.boss.roles.adversary?.model,
           effort: config.boss.roles.adversary?.effort ?? "auto",
           subagents: "auto",
@@ -2442,6 +2443,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         ].join("\n"),
         cwd: result.run.resource?.path ?? ctx.cwd,
         harness: TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS,
+        profile: TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE,
         model: config.boss.roles[member.role]?.model,
         effort: config.boss.roles[member.role]?.effort ?? "auto",
         subagents: "auto",

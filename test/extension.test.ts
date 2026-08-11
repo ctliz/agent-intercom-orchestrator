@@ -97,8 +97,10 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     ] }));
     await writeFile(join(orchestratorDir, "config.json"), JSON.stringify({
       profiles: {
+        "alternate-pi": { harness: "pi", command: "/bin/true", args: ["--alternate-profile"], mode: "persistent", maxRuntime: "12h" },
         "pi-peer": { harness: "pi", command: "/bin/true", args: ["--mode", "rpc", "--exclude-tools", "agent_fleet"], mode: "persistent", maxRuntime: "12h" },
       },
+      routing: { profilePreferences: { pi: ["alternate-pi", "pi-peer"] } },
       boss: {
         worktreeRoot: join(agentDir, "boss-worktrees"),
         onboarding: { version: "orc.boss-onboarding.v1", completedAt: "2026-03-01T12:34:56.000Z" },
@@ -181,9 +183,9 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     const diagnosed = await tools.get("boss").execute("boss-doctor-test", { action: "doctor", requirements: null }, new AbortController().signal, () => {}, ctx);
     assert.match(diagnosed.content[0].text, /Orc Boss trusted-local readiness: warning/);
     assert.match(diagnosed.content[0].text, /required-stack: ready/);
-    assert.match(diagnosed.content[0].text, /topology: Manager, Worker, Scout, and Adversary launch as independent Pi peers/);
-    assert.match(diagnosed.content[0].text, /manager: harness=pi-peer; model=provider\/manager; effort=high/);
-    assert.match(diagnosed.content[0].text, /worker: harness=pi-peer; model=provider\/worker; effort=medium/);
+    assert.match(diagnosed.content[0].text, /topology: Manager, Worker, Scout, and Adversary launch as independent Pi peers pinned to profile=pi-peer/);
+    assert.match(diagnosed.content[0].text, /manager: harness=pi; profile=pi-peer; model=provider\/manager; effort=high/);
+    assert.match(diagnosed.content[0].text, /worker: harness=pi; profile=pi-peer; model=provider\/worker; effort=medium/);
     assert.match(diagnosed.content[0].text, /models: warning/);
     const blocked = await tools.get("boss").execute(
       "boss-capability-gap-test",
@@ -240,6 +242,9 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       assert.ok(launch.includes(`--setenv=PI_RALPH_STATE_ROOT=${join(runtimeDir, "agent-intercom-worker", "boss-ralph", bossRunId, role)}`));
       assert.ok(launch.includes(`--setenv=PI_RETURN_ON_STATE_DIR=${join(runtimeDir, "agent-intercom-worker", "boss-return-on", bossRunId, role)}`));
       assert.ok(launch.includes("--no-extensions"));
+      assert.equal(launch.includes("--alternate-profile"), false, `${role} followed mutable Pi profile preference instead of the pinned Boss profile`);
+      assert.ok(launch.includes("--mode"));
+      assert.ok(launch.includes("rpc"));
       for (const extensionPath of [intercomExtension, orchestratorExtension, ralphExtension, returnOnExtension]) {
         assert.ok(launch.includes(extensionPath), `${role} missing extension ${extensionPath}`);
       }
