@@ -844,7 +844,7 @@ A fixable code, content, test, route, asset, or visual defect should not be waiv
 For an orchestrator-owned worker, inspect and stop the exact cgroup:
 
 ```typescript
-agent_fleet({ action: "status", id: "opencode-visual-review" }) // includes the live cgroup process tree
+agent_fleet({ action: "status", id: "opencode-visual-review" }) // includes a bounded PID/executable cgroup summary
 agent_fleet({ action: "stop", id: "opencode-visual-review" })
 agent_fleet({ action: "history" })
 agent_fleet({ action: "cleanup", execute: false }) // includes retention-expired terminal records
