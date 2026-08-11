@@ -269,11 +269,42 @@ export async function waitForUnitRunning(
   throw new Error(`Timed out waiting for worker unit ${unit} to run (${formatUnitStatus(last)})`);
 }
 
+const MAX_VISIBLE_CGROUP_PROCESSES = 64;
+const MAX_VISIBLE_EXECUTABLE_LENGTH = 80;
+
+function compactUnitProcessTree(stdout: string): { tree: string; pids: number[] } {
+  const pids: number[] = [];
+  const processes: Array<{ pid: number; executable: string }> = [];
+  for (const match of stdout.matchAll(/[├└]─(\d+)\s+(\S+)/g)) {
+    const pid = Number(match[1]);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    pids.push(pid);
+    const rawExecutable = match[2].replace(/^['"]|['"]$/g, "");
+    const executable = (basename(rawExecutable) || "process").slice(0, MAX_VISIBLE_EXECUTABLE_LENGTH);
+    processes.push({ pid, executable });
+  }
+
+  const uniquePids = [...new Set(pids)];
+  const header = stdout.split("\n", 1)[0]?.trim();
+  const visible = processes.slice(0, MAX_VISIBLE_CGROUP_PROCESSES);
+  const omitted = processes.length - visible.length;
+  const lines = header ? [header] : [];
+  for (const [index, process] of visible.entries()) {
+    const isLast = index === visible.length - 1 && omitted === 0;
+    lines.push(`${isLast ? "└" : "├"}─${process.pid} ${process.executable}`);
+  }
+  if (omitted > 0) lines.push(`└─… ${omitted} more process${omitted === 1 ? "" : "es"} omitted (${processes.length} total)`);
+  return { tree: lines.join("\n"), pids: uniquePids };
+}
+
 export async function readUnitProcessTree(runner: CommandRunner, unit: string): Promise<{ tree: string; pids: number[] }> {
+  // Read the complete cgroup for authoritative PID ownership, but never return
+  // complete argv strings to the manager. Agent launch arguments can contain
+  // prompts, configuration, and multiline shell snapshots that waste context
+  // and may expose sensitive diagnostics.
   const result = await runner.exec("systemd-cgls", ["--user-unit", unit, "--no-pager", "--full"], { timeout: 5000 });
   if (result.code !== 0) return { tree: "", pids: [] };
-  const pids = [...result.stdout.matchAll(/[├└]─(\d+)\s/g)].map((match) => Number(match[1])).filter((pid) => Number.isInteger(pid) && pid > 0);
-  return { tree: result.stdout.trim(), pids: [...new Set(pids)] };
+  return compactUnitProcessTree(result.stdout);
 }
 
 export async function verifyUnitAbsentAndEmpty(

@@ -191,6 +191,48 @@ test("running verification rejects a process that fails before readiness", async
   }, "worker.service", { timeoutMs: 50, intervalMs: 1 }), /failed before readiness/);
 });
 
+test("process-tree status keeps ownership PIDs while omitting argv and multiline shell snapshots", async () => {
+  const result = await readUnitProcessTree({
+    async exec(command, args) {
+      assert.equal(command, "systemd-cgls");
+      assert.ok(args.includes("--full"));
+      return {
+        stdout: [
+          "Control group /user.slice/worker.service:",
+          "├─4242 node /opt/agent/dist/server.mjs --instructions super-secret-task",
+          "├─4243 /usr/bin/python -u -c import sys;exec(secret_payload)",
+          "this continuation contains a shell snapshot and TOKEN=secret",
+          "└─4244 /usr/bin/bash -c echo another-secret",
+        ].join("\n"),
+        stderr: "",
+        code: 0,
+      };
+    },
+  }, "worker.service");
+
+  assert.deepEqual(result.pids, [4242, 4243, 4244]);
+  assert.equal(result.tree, [
+    "Control group /user.slice/worker.service:",
+    "├─4242 node",
+    "├─4243 python",
+    "└─4244 bash",
+  ].join("\n"));
+  assert.doesNotMatch(result.tree, /secret|instructions|snapshot|TOKEN|server\.mjs/);
+});
+
+test("process-tree status bounds large cgroups without losing ownership PIDs", async () => {
+  const processLines = Array.from({ length: 66 }, (_, index) => `${index === 65 ? "└" : "├"}─${5000 + index} /usr/bin/process-${index} --arg value`);
+  const result = await readUnitProcessTree({
+    async exec() {
+      return { stdout: ["Control group /user.slice/large.service:", ...processLines].join("\n"), stderr: "", code: 0 };
+    },
+  }, "large.service");
+
+  assert.equal(result.pids.length, 66);
+  assert.match(result.tree, /└─… 2 more processes omitted \(66 total\)$/);
+  assert.doesNotMatch(result.tree, /--arg/);
+});
+
 test("stop verifies the worker cgroup and escalates remaining descendants", async () => {
   const calls: Array<{ command: string; args: string[] }> = [];
   let cgroupReads = 0;
