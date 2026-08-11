@@ -2807,14 +2807,22 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   });
 
   let initializeSessionPromise: Promise<void> | undefined;
-  let initializeSessionContext: ExtensionContext | undefined;
+  let initializedSessionId: string | undefined;
 
   function initializeSession(ctx: ExtensionContext): Promise<void> {
-    if (initializeSessionContext === ctx && initializeSessionPromise) return initializeSessionPromise;
-    initializeSessionContext = ctx;
-    const promise = (async () => {
+    const sessionId = managerSessionId(ctx);
+    if (initializeSessionPromise) {
+      if (initializedSessionId !== sessionId) throw new Error(`Orchestrator session changed from ${initializedSessionId ?? "unavailable"} to ${sessionId} before shutdown`);
+      // Pi creates a fresh ExtensionContext object for each lifecycle emission.
+      // Refresh context-sensitive UI access without repeating durable startup.
       currentCtx = ctx;
-      currentManagerSessionId = managerSessionId(ctx);
+      currentManagerSessionId = sessionId;
+      return initializeSessionPromise;
+    }
+    initializedSessionId = sessionId;
+    currentCtx = ctx;
+    currentManagerSessionId = sessionId;
+    const promise = (async () => {
       pi.events.emit(INTERCOM_CONTROL_REGISTER_EVENT, { type: WORKER_READINESS_ACK, version: 1 });
       registerOwnedWorkerReadinessProbeType(pi);
       await loadConfig();
@@ -2831,10 +2839,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       clearInterval(heartbeat);
       heartbeatRunning = false;
       heartbeat = setInterval(() => {
-        if (heartbeatRunning) return;
+        if (heartbeatRunning || !currentCtx || initializedSessionId !== sessionId) return;
+        const heartbeatCtx = currentCtx;
         heartbeatRunning = true;
-        void runLifecycleHeartbeat(ctx).then(async (result) => {
-          if (currentCtx !== ctx) return;
+        void runLifecycleHeartbeat(heartbeatCtx).then(async (result) => {
+          if (!currentCtx || initializedSessionId !== sessionId) return;
           await reconcileApplyingBossPauseControls();
           await synchronizeTrustedLocalBossWorkers();
           for (const request of result.checkpointRequests) {
@@ -2855,7 +2864,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     return promise.catch((error) => {
       if (initializeSessionPromise === promise) {
         initializeSessionPromise = undefined;
-        initializeSessionContext = undefined;
+        initializedSessionId = undefined;
+        currentCtx = undefined;
+        currentManagerSessionId = undefined;
       }
       throw error;
     });
@@ -2901,6 +2912,6 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     currentCtx = undefined;
     currentManagerSessionId = undefined;
     initializeSessionPromise = undefined;
-    initializeSessionContext = undefined;
+    initializedSessionId = undefined;
   });
 }

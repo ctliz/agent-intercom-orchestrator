@@ -168,6 +168,7 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     const freezerActions: string[] = [];
     const intercomDeliveries: Array<{ to: string; message: string }> = [];
     let contextStale = false;
+    let execCalls = 0;
     let failNextBossLaunch = false;
     let failNextBossStop = false;
     const pi: any = {
@@ -181,6 +182,7 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       registerTool(tool: any) { tools.set(tool.name, tool); },
       registerCommand() {},
       async exec(command: string, args: string[]) {
+        execCalls += 1;
         if (command === "systemd-run" && args.some((arg) => arg.startsWith("--unit=agent-intercom-worker-boss-"))) {
           if (failNextBossLaunch) {
             failNextBossLaunch = false;
@@ -223,6 +225,11 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     const { default: extension } = await import(extensionUrl.href);
     extension(pi);
     await lifecycle.get("session_start")?.({}, ctx);
+    const initializedExecCalls = execCalls;
+    await lifecycle.get("before_agent_start")?.({}, { ...ctx });
+    await lifecycle.get("before_agent_start")?.({}, { ...ctx, ui: { ...ctx.ui } });
+    assert.equal(execCalls, initializedExecCalls, "fresh per-emission contexts for one session must not repeat orchestration initialization");
+    await assert.rejects(lifecycle.get("before_agent_start")?.({}, { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => "different-controller" } }), /session changed .* before shutdown/);
     assert.match(JSON.stringify(tools.get("boss").parameters.properties.requirements), /\"type\":\"null\"/, "strict-schema callers need an explicit absence placeholder");
     const planned = await tools.get("boss").execute("boss-plan-test", { action: "plan", requirements: null }, new AbortController().signal, () => {}, ctx);
     assert.match(planned.content[0].text, /Orc Boss setup plan: ready/);
