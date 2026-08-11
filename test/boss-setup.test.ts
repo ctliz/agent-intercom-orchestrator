@@ -187,6 +187,25 @@ test("trusted-local readiness composes stack, host, Intercom, onboarding, model,
     assert.equal(ready.version, BOSS_READINESS_SCHEMA_VERSION);
     assert.equal(ready.status, "ready");
     assert.deepEqual(ready.checks.map((check) => check.id), ["required-stack", "host", "intercom", "onboarding", "models", "state"]);
+    const onboardingCheck = ready.checks.find((check) => check.id === "onboarding")!;
+    assert.match(onboardingCheck.diagnostics.join("\n"), /independent Pi peers pinned to profile=pi-peer; native Codex\/Claude\/OpenCode subagent topology and per-run model overrides are unavailable/);
+    for (const [role, preference] of Object.entries(onboarding.roles)) {
+      assert.ok(onboardingCheck.diagnostics.includes(`${role}: harness=pi; profile=pi-peer; model=${preference.model}; effort=${preference.effort}`));
+    }
+
+    const invalidProfileConfig = structuredClone(config);
+    invalidProfileConfig.profiles["pi-peer"].mode = "one-shot";
+    const invalidProfile = await inspectTrustedLocalBossReadiness({
+      agentDir: root,
+      config: invalidProfileConfig,
+      setup,
+      host: { systemdAvailable: true, userManagerResponsive: true },
+      intercom: { controllerRegistered: true },
+      statePaths: [join(root, "state")],
+      availablePiModels: Object.values(onboarding.roles).map((role) => role.model),
+    });
+    assert.equal(invalidProfile.status, "blocked");
+    assert.match(invalidProfile.blockers.join("\n"), /Boss participant profile 'pi-peer' must use persistent mode/);
 
     const readOnlyState = join(root, "read-only-state");
     await writeFile(readOnlyState, "state\n");
