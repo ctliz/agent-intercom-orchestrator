@@ -174,12 +174,16 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     const { default: extension } = await import(extensionUrl.href);
     extension(pi);
     await lifecycle.get("session_start")?.({}, ctx);
-    const planned = await tools.get("boss").execute("boss-plan-test", { action: "plan" }, new AbortController().signal, () => {}, ctx);
+    assert.match(JSON.stringify(tools.get("boss").parameters.properties.requirements), /\"type\":\"null\"/, "strict-schema callers need an explicit absence placeholder");
+    const planned = await tools.get("boss").execute("boss-plan-test", { action: "plan", requirements: null }, new AbortController().signal, () => {}, ctx);
     assert.match(planned.content[0].text, /Orc Boss setup plan: ready/);
     assert.match(planned.content[0].text, /No automatic install changes are proposed/);
-    const diagnosed = await tools.get("boss").execute("boss-doctor-test", { action: "doctor" }, new AbortController().signal, () => {}, ctx);
+    const diagnosed = await tools.get("boss").execute("boss-doctor-test", { action: "doctor", requirements: null }, new AbortController().signal, () => {}, ctx);
     assert.match(diagnosed.content[0].text, /Orc Boss trusted-local readiness: warning/);
     assert.match(diagnosed.content[0].text, /required-stack: ready/);
+    assert.match(diagnosed.content[0].text, /topology: Manager, Worker, Scout, and Adversary launch as independent Pi peers/);
+    assert.match(diagnosed.content[0].text, /manager: harness=pi-peer; model=provider\/manager; effort=high/);
+    assert.match(diagnosed.content[0].text, /worker: harness=pi-peer; model=provider\/worker; effort=medium/);
     assert.match(diagnosed.content[0].text, /models: warning/);
     const blocked = await tools.get("boss").execute(
       "boss-capability-gap-test",
@@ -256,6 +260,11 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       assert.equal(launch[modelIndex + 1], `provider/${role}`);
       assert.equal(launch[thinkingIndex + 1], role === "manager" ? "high" : role === "worker" ? "medium" : "low");
     }
+    const exactStatus = await tools.get("boss").execute("boss-exact-status-details", { action: "status", bossRunId, requirements: null }, new AbortController().signal, () => {}, ctx);
+    assert.equal(exactStatus.details.pendingDecision.owner, "unavailable");
+    assert.equal(exactStatus.details.pendingDecision.reason, "unavailable");
+    assert.match(exactStatus.details.pendingDecision.detail, /not used to infer productivity or next action/);
+
     const managerPrompt = launches.find((args) => args.includes("--setenv=AGENT_INTERCOM_BOSS_ROLE=manager"))!.join("\n");
     assert.match(managerPrompt, /At the start of every Ralph iteration, call intercom_team/);
     assert.match(managerPrompt, /Every iteration, send bounded progress nudges to both Worker and Scout/);

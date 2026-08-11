@@ -187,6 +187,11 @@ test("trusted-local readiness composes stack, host, Intercom, onboarding, model,
     assert.equal(ready.version, BOSS_READINESS_SCHEMA_VERSION);
     assert.equal(ready.status, "ready");
     assert.deepEqual(ready.checks.map((check) => check.id), ["required-stack", "host", "intercom", "onboarding", "models", "state"]);
+    const onboardingCheck = ready.checks.find((check) => check.id === "onboarding")!;
+    assert.match(onboardingCheck.diagnostics.join("\n"), /independent Pi peers; native Codex\/Claude\/OpenCode subagent topology and per-run model overrides are unavailable/);
+    for (const [role, preference] of Object.entries(onboarding.roles)) {
+      assert.ok(onboardingCheck.diagnostics.includes(`${role}: harness=pi-peer; model=${preference.model}; effort=${preference.effort}`));
+    }
 
     const readOnlyState = join(root, "read-only-state");
     await writeFile(readOnlyState, "state\n");

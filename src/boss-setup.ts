@@ -308,11 +308,18 @@ export async function inspectTrustedLocalBossReadiness(options: BossReadinessInp
   const roleInput = Object.fromEntries(BOSS_ROLES.map((role) => [role, options.config.boss.roles[role]])) as BossOnboardingInput["roles"];
   const onboardingErrors = validateBossOnboardingInput({ roles: roleInput, handlePrefix: options.config.boss.handlePrefix });
   const onboardingReady = isBossOnboardingComplete(options.config) && onboardingErrors.length === 0;
+  const configuredTopology = [
+    "topology: Manager, Worker, Scout, and Adversary launch as independent Pi peers; native Codex/Claude/OpenCode subagent topology and per-run model overrides are unavailable",
+    ...BOSS_ROLES.map((role) => {
+      const preference = options.config.boss.roles[role];
+      return `${role}: harness=pi-peer; model=${preference?.model ?? "unavailable"}; effort=${preference?.effort ?? "unavailable"}`;
+    }),
+  ];
   checks.push({
     id: "onboarding",
     status: onboardingReady ? "ready" : "blocked",
     summary: onboardingReady ? "Versioned Boss onboarding and all role preferences are complete." : "Boss onboarding or explicit role preferences are incomplete.",
-    diagnostics: [...(!isBossOnboardingComplete(options.config) ? [`Expected onboarding ${BOSS_ONBOARDING_VERSION}.`] : []), ...onboardingErrors],
+    diagnostics: [...configuredTopology, ...(!isBossOnboardingComplete(options.config) ? [`Expected onboarding ${BOSS_ONBOARDING_VERSION}.`] : []), ...onboardingErrors],
     ...(!onboardingReady ? { remediation: "Run the direct-user Boss setup preview and apply explicit Manager, Worker, Scout, and Adversary model/effort choices." } : {}),
   });
 
