@@ -9,6 +9,53 @@ function commandResult() {
   return { stdout: "", stderr: "", code: 0, killed: false };
 }
 
+test("empty RPC bootstrap detection defers only known-empty discovery sessions", async () => {
+  const { isEmptyRpcBootstrapSession } = await import("../src/index.ts");
+  const context = (mode: string, entries?: Array<{ type?: string }>) => ({
+    mode,
+    sessionManager: {
+      getSessionId: () => "test-session",
+      getSessionFile: () => undefined,
+      ...(entries ? { getEntries: () => entries } : {}),
+    },
+  }) as any;
+
+  assert.equal(isEmptyRpcBootstrapSession(context("rpc", [])), true);
+  assert.equal(isEmptyRpcBootstrapSession(context("rpc", [{ type: "model_change" }])), true);
+  assert.equal(isEmptyRpcBootstrapSession(context("rpc", [{ type: "message" }])), false);
+  assert.equal(isEmptyRpcBootstrapSession(context("tui", [])), false);
+  assert.equal(isEmptyRpcBootstrapSession(context("rpc")), false, "partial older hosts must preserve eager initialization");
+});
+
+test("empty RPC provider probes register tools without starting reconciliation", async () => {
+  const lifecycle = new Map<string, (...args: any[]) => any>();
+  let execCalls = 0;
+  const pi: any = {
+    on(name: string, handler: (...args: any[]) => any) { lifecycle.set(name, handler); },
+    events: { on() { return () => {}; }, emit() {} },
+    registerTool() {},
+    registerCommand() {},
+    async exec() { execCalls += 1; return commandResult(); },
+  };
+  const { default: extension } = await import(new URL(`../src/index.ts?rpc-bootstrap=${Date.now()}`, import.meta.url).href);
+  extension(pi);
+  const ctx: any = {
+    cwd: "/tmp",
+    mode: "rpc",
+    hasUI: false,
+    sessionManager: {
+      getSessionId: () => "provider-probe",
+      getSessionFile: () => undefined,
+      getEntries: () => [],
+    },
+    ui: { setStatus() {}, notify() {} },
+  };
+
+  await lifecycle.get("session_start")?.({}, ctx);
+  assert.equal(execCalls, 0, "empty provider probes must not reconcile workers or inspect systemd");
+  assert.equal(typeof lifecycle.get("before_agent_start"), "function", "the first real turn must retain deferred initialization");
+});
+
 test("owned Boss participants cannot register /boss, boss, or agent_fleet when orchestration is disabled", async () => {
   const keys = [
     "AGENT_INTERCOM_ORCHESTRATOR_DISABLED",
@@ -121,6 +168,7 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     const freezerActions: string[] = [];
     const intercomDeliveries: Array<{ to: string; message: string }> = [];
     let contextStale = false;
+    let execCalls = 0;
     let failNextBossLaunch = false;
     let failNextBossStop = false;
     const pi: any = {
@@ -134,6 +182,7 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       registerTool(tool: any) { tools.set(tool.name, tool); },
       registerCommand() {},
       async exec(command: string, args: string[]) {
+        execCalls += 1;
         if (command === "systemd-run" && args.some((arg) => arg.startsWith("--unit=agent-intercom-worker-boss-"))) {
           if (failNextBossLaunch) {
             failNextBossLaunch = false;
@@ -176,6 +225,11 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     const { default: extension } = await import(extensionUrl.href);
     extension(pi);
     await lifecycle.get("session_start")?.({}, ctx);
+    const initializedExecCalls = execCalls;
+    await lifecycle.get("before_agent_start")?.({}, { ...ctx });
+    await lifecycle.get("before_agent_start")?.({}, { ...ctx, ui: { ...ctx.ui } });
+    assert.equal(execCalls, initializedExecCalls, "fresh per-emission contexts for one session must not repeat orchestration initialization");
+    await assert.rejects(lifecycle.get("before_agent_start")?.({}, { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => "different-controller" } }), /session changed .* before shutdown/);
     assert.match(JSON.stringify(tools.get("boss").parameters.properties.requirements), /\"type\":\"null\"/, "strict-schema callers need an explicit absence placeholder");
     const planned = await tools.get("boss").execute("boss-plan-test", { action: "plan", requirements: null }, new AbortController().signal, () => {}, ctx);
     assert.match(planned.content[0].text, /Orc Boss setup plan: ready/);

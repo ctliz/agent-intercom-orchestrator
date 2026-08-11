@@ -176,6 +176,21 @@ function managerSessionId(ctx: ExtensionContext): string {
   return ctx.sessionManager.getSessionId() || ctx.sessionManager.getSessionFile() || `process-${process.pid}`;
 }
 
+export function isEmptyRpcBootstrapSession(ctx: ExtensionContext): boolean {
+  if (ctx.mode !== "rpc") return false;
+  const sessionManager = ctx.sessionManager as typeof ctx.sessionManager & {
+    getEntries?: () => Array<{ type?: string }>;
+  };
+  if (typeof sessionManager.getEntries !== "function") return false;
+  try {
+    return !sessionManager.getEntries().some((entry) => entry.type === "message");
+  } catch {
+    // Older/custom Pi hosts may expose a partial session manager. Preserve the
+    // historical eager initialization when the bootstrap state is uncertain.
+    return false;
+  }
+}
+
 function parseInboundActivitySender(payload: unknown): { id?: string; name?: string } | undefined {
   if (!payload || typeof payload !== "object") return undefined;
   const from = (payload as { from?: unknown }).from;
@@ -2791,44 +2806,83 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     },
   });
 
-  pi.on("session_start", async (_event, ctx) => {
-    currentCtx = ctx;
-    currentManagerSessionId = managerSessionId(ctx);
-    pi.events.emit(INTERCOM_CONTROL_REGISTER_EVENT, { type: WORKER_READINESS_ACK, version: 1 });
-    registerOwnedWorkerReadinessProbeType(pi);
-    await loadConfig();
-    await recoverCleanupClaims();
-    if (process.env.AGENT_INTERCOM_DISABLE_CLEANUP_TIMER !== "1") {
-      void ensureCleanupTimer({ runner, config, cleanupScriptPath: FLEET_CLEANUP_SCRIPT, agentDir }).catch((error) => {
-        console.error(`[agent-intercom-orchestrator] Could not configure cleanup timer: ${error instanceof Error ? error.message : String(error)}`);
-      });
+  let initializeSessionPromise: Promise<void> | undefined;
+  let initializedSessionId: string | undefined;
+
+  function initializeSession(ctx: ExtensionContext): Promise<void> {
+    const sessionId = managerSessionId(ctx);
+    if (initializeSessionPromise) {
+      if (initializedSessionId !== sessionId) throw new Error(`Orchestrator session changed from ${initializedSessionId ?? "unavailable"} to ${sessionId} before shutdown`);
+      // Pi creates a fresh ExtensionContext object for each lifecycle emission.
+      // Refresh context-sensitive UI access without repeating durable startup.
+      currentCtx = ctx;
+      currentManagerSessionId = sessionId;
+      return initializeSessionPromise;
     }
-    await reconcile();
-    await reconcileApplyingBossPauseControls();
-    await synchronizeTrustedLocalBossWorkers();
-    if (config.cleanupExpiredOnStart && process.env.AGENT_INTERCOM_SKIP_STARTUP_CLEANUP !== "1") await cleanupExpired(true);
-    clearInterval(heartbeat);
-    heartbeatRunning = false;
-    heartbeat = setInterval(() => {
-      if (heartbeatRunning) return;
-      heartbeatRunning = true;
-      void runLifecycleHeartbeat(ctx).then(async (result) => {
-        if (currentCtx !== ctx) return;
-        await reconcileApplyingBossPauseControls();
-        await synchronizeTrustedLocalBossWorkers();
-        for (const request of result.checkpointRequests) {
-          pi.events.emit(INTERCOM_LIFECYCLE_SEND_EVENT, {
-            to: request.target,
-            message: request.message,
-            workerId: request.workerId,
-            runId: request.runId,
-          });
-        }
-      }).catch(() => undefined).finally(() => {
-        heartbeatRunning = false;
-      });
-    }, Math.max(10, config.heartbeatSeconds) * 1000);
-    heartbeat.unref?.();
+    initializedSessionId = sessionId;
+    currentCtx = ctx;
+    currentManagerSessionId = sessionId;
+    const promise = (async () => {
+      pi.events.emit(INTERCOM_CONTROL_REGISTER_EVENT, { type: WORKER_READINESS_ACK, version: 1 });
+      registerOwnedWorkerReadinessProbeType(pi);
+      await loadConfig();
+      await recoverCleanupClaims();
+      if (process.env.AGENT_INTERCOM_DISABLE_CLEANUP_TIMER !== "1") {
+        void ensureCleanupTimer({ runner, config, cleanupScriptPath: FLEET_CLEANUP_SCRIPT, agentDir }).catch((error) => {
+          console.error(`[agent-intercom-orchestrator] Could not configure cleanup timer: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }
+      await reconcile();
+      await reconcileApplyingBossPauseControls();
+      await synchronizeTrustedLocalBossWorkers();
+      if (config.cleanupExpiredOnStart && process.env.AGENT_INTERCOM_SKIP_STARTUP_CLEANUP !== "1") await cleanupExpired(true);
+      clearInterval(heartbeat);
+      heartbeatRunning = false;
+      heartbeat = setInterval(() => {
+        if (heartbeatRunning || !currentCtx || initializedSessionId !== sessionId) return;
+        const heartbeatCtx = currentCtx;
+        heartbeatRunning = true;
+        void runLifecycleHeartbeat(heartbeatCtx).then(async (result) => {
+          if (!currentCtx || initializedSessionId !== sessionId) return;
+          await reconcileApplyingBossPauseControls();
+          await synchronizeTrustedLocalBossWorkers();
+          for (const request of result.checkpointRequests) {
+            pi.events.emit(INTERCOM_LIFECYCLE_SEND_EVENT, {
+              to: request.target,
+              message: request.message,
+              workerId: request.workerId,
+              runId: request.runId,
+            });
+          }
+        }).catch(() => undefined).finally(() => {
+          heartbeatRunning = false;
+        });
+      }, Math.max(10, config.heartbeatSeconds) * 1000);
+      heartbeat.unref?.();
+    })();
+    initializeSessionPromise = promise;
+    return promise.catch((error) => {
+      if (initializeSessionPromise === promise) {
+        initializeSessionPromise = undefined;
+        initializedSessionId = undefined;
+        currentCtx = undefined;
+        currentManagerSessionId = undefined;
+      }
+      throw error;
+    });
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    // Provider/model discovery launches empty RPC sessions only to inspect the
+    // registered surface. Reconciliation can take tens of seconds and is not
+    // needed until a real turn starts. Resumed RPC and all interactive sessions
+    // retain eager initialization.
+    if (isEmptyRpcBootstrapSession(ctx)) return;
+    await initializeSession(ctx);
+  });
+
+  pi.on("before_agent_start", async (_event, ctx) => {
+    await initializeSession(ctx);
   });
 
   pi.on("session_shutdown", async (event, _ctx) => {
@@ -2857,5 +2911,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     }
     currentCtx = undefined;
     currentManagerSessionId = undefined;
+    initializeSessionPromise = undefined;
+    initializedSessionId = undefined;
   });
 }
