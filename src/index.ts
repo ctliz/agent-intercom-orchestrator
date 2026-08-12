@@ -622,8 +622,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     if (!ctx || !config || !sender) return;
     const now = Date.now();
     void trustedLocalBossStore.pauseProtectedWorkerKeys()
-      .then((keys) => store.mutate((state) => recordIntercomWorkerActivity(state as WorkerStateFileV3, managerSessionId(ctx), sender, config, now, new Set(keys))))
-      .then((worker) => { if (worker) return updateStatus(ctx); })
+      .then((keys) => store.mutateConditionallyWithSnapshot((state) => {
+        const worker = recordIntercomWorkerActivity(state, managerSessionId(ctx), sender, config, now, new Set(keys));
+        return { value: worker, changed: worker !== undefined };
+      }))
+      .then((commit) => { if (commit.value) publishStatus(ctx, commit.state.workers); })
       .catch(() => undefined);
   });
   const modelCache = new Map<Harness, { expiresAt: number; models: string[] }>();
@@ -848,12 +851,13 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
 
     const dirty: { dirty?: boolean; status?: string; error?: string } = await inspectWorkerDirtyState(worker)
       .catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
-    await store.mutate((state) => {
+    await store.mutateConditionally((state) => {
       const current = state.workers.find((candidate) => candidate.id === worker.id && workerIncarnation(candidate) === workerIncarnation(worker));
-      if (!current) return;
+      if (!current) return { value: undefined, changed: false };
       if (dirty.dirty !== undefined) current.dirtyAtStop = dirty.dirty;
       if (dirty.status) current.dirtyStatusAtStop = dirty.status;
       if (dirty.error) current.dirtyCheckErrorAtStop = dirty.error;
+      return { value: undefined, changed: dirty.dirty !== undefined || Boolean(dirty.status) || Boolean(dirty.error) };
     });
 
     let stopError: unknown;
@@ -905,13 +909,14 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       else if (!isTerminalState(worker.state) || worker.mainPid !== undefined) throw new Error(`Boss orphan ${worker.id} has no verifiable stopped unit`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      await store.mutate((state) => {
+      await store.mutateConditionally((state) => {
         const current = state.workers.find((candidate) => candidate.id === worker.id && workerIncarnation(candidate) === workerIncarnation(worker));
-        if (!current || current.bossRunId !== worker.bossRunId) return;
+        if (!current || current.bossRunId !== worker.bossRunId) return { value: undefined, changed: false };
         current.lastError = message;
         current.stopReason = "boss-uncorrelated-worker-containment-failed";
         current.stopRequestedAt = Date.now();
         current.updatedAt = current.stopRequestedAt;
+        return { value: undefined, changed: true };
       });
       throw error;
     }
@@ -973,7 +978,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     await recoverCleanupClaims();
     await reconcile();
     const pauseProtectedWorkerKeys = new Set(await trustedLocalBossStore.pauseProtectedWorkerKeys());
-    await store.mutateConditionally((state) => {
+    const lifecycleCommit = await store.mutateConditionallyWithSnapshot((state) => {
       let changed = false;
       for (const worker of state.workers) {
         if (bossWorkerTimersSuspended(worker) || pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) continue;
@@ -981,7 +986,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       }
       return { value: undefined, changed };
     });
-    const migrated = await store.read();
+    const migrated = lifecycleCommit.state;
     const claimedIds = new Set((migrated.runtimeCleanupClaims ?? []).map((claim) => claim.workerId));
     const liveCandidates = migrated.workers.flatMap((worker) => {
       if (bossWorkerTimersSuspended(worker) || pauseProtectedWorkerKeys.has(`${worker.id}\u0000${workerIncarnation(worker)}`)) return [];
@@ -1551,9 +1556,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     } catch (error) {
       const cleanupError = await stopUnit(runner, unit).then(() => undefined).catch((stopError) => stopError);
       if (persistentAdapter && worker.healthPath) await rm(worker.healthPath, { force: true }).catch(() => undefined);
-      await store.mutate((state) => {
+      await store.mutateConditionally((state) => {
         const current = state.workers.find((candidate) => candidate.id === id && candidate.runId === runId);
-        if (!current) return;
+        if (!current) return { value: undefined, changed: false };
         current.state = "failed";
         current.updatedAt = Date.now();
         const primary = error instanceof Error ? error.message : String(error);
@@ -1563,6 +1568,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         current.lastError = cleanupError
           ? `${primary}; cleanup is indeterminate: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`
           : primary;
+        return { value: undefined, changed: true };
       });
       throw error;
     }

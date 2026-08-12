@@ -40,6 +40,7 @@
     "skills/**/*",
     "examples/**/*",
     "docs/**/*",
+    "scripts/benchmark-worker-store.ts",
     "README.md",
     "CHANGELOG.md",
     "LICENSE",
@@ -48,7 +49,8 @@
   ],
   "scripts": {
     "test": "AGENT_INTERCOM_DISABLE_CLEANUP_TIMER=1 node --experimental-strip-types --test --test-concurrency=1 test/*.test.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "benchmark:worker-store": "node --experimental-strip-types scripts/benchmark-worker-store.ts"
   },
   "pi": {
     "extensions": [
