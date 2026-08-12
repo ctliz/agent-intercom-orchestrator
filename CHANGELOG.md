@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Keep high-volume WorkerStore timing telemetry opt-in behind `AGENT_INTERCOM_ORCHESTRATOR_METRICS=1` instead of writing every operation to the interactive Pi terminal by default.
 - Admit worker submission while unrelated systemd user jobs remain queued below the hard 33-job cap, while continuing to fail closed on manager timeouts, command failures, malformed job output, and exact-unit readiness/fencing failures.
 - Make fleet cleanup singular and bounded with a crash-released nonblocking run lock, a foreground `Type=exec` service capped at ten minutes with exact control-group killing, deferred-work reporting, and durable content-free last-run diagnostics in fleet status/doctor output.
 - Reduce WorkerStore lock convoys with live-owner backoff, token-confirmed atomic release tombstones, replacement-safe failed-claim cleanup, and age-gated tombstone collection while preserving the canonical mixed-version lock protocol.
