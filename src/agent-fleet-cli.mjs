@@ -41,7 +41,7 @@ try {
     ? request.managerSessionId.trim()
     : `agent-fleet-cli-${process.pid}`;
   process.env.AGENT_INTERCOM_MANAGER_CONTEXT = process.env.OPENCODE_INTERCOM_FLEET === "1" ? "opencode" : "headless_cli";
-  if (request.params.action === "renew" || request.params.action === "adopt" || request.params.action === "_heartbeat") {
+  if (request.params.action === "renew" || request.params.action === "adopt" || request.params.action === "cleanup" || request.params.action === "_heartbeat") {
     process.env.AGENT_INTERCOM_SKIP_STARTUP_CLEANUP = "1";
   }
   if (request.params.action === "_heartbeat") {

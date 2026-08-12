@@ -1520,6 +1520,8 @@ test("agent_fleet list and unqualified status default to the current manager's w
 
     const ownStatus = await fleet.execute("status-own", { action: "status" }, new AbortController().signal, () => {}, ctx);
     assert.deepEqual(ownStatus.details.workers.map((record: any) => record.id), ["mine", "old-mine"]);
+    assert.ok(["never", "ok"].includes(ownStatus.details.cleanup.state));
+    assert.match(ownStatus.content[0].text, /cleanup run: state=(?:never|ok)/);
     await assert.rejects(
       fleet.execute("status-hidden", { action: "status", id: "theirs" }, new AbortController().signal, () => {}, ctx),
       /Unknown managed worker: theirs/,
@@ -1809,6 +1811,10 @@ test("extension registers discovery tools and interactive configuration commands
       ctx,
     );
     assert.match(doctor.content[0].text, /cleanup timer: enabled=true active=true source-current=false/);
+    assert.match(doctor.content[0].text, /systemd user manager: .*parsed=/);
+    assert.match(doctor.content[0].text, /worker store lock: present=false .*cleanup-claims=0/);
+    assert.match(doctor.content[0].text, /cleanup run: state=(?:never|ok)/);
+    assert.ok(["never", "ok"].includes(doctor.details.cleanup.state));
     assert.match(doctor.content[0].text, /OpenCode Intercom plugin: (?:not detected|could not inspect)/);
 
     await commands.get("agents-config").handler("", ctx);

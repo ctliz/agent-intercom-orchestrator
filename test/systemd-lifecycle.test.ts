@@ -1,11 +1,21 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { getUnitStatus, getUserManagerHealth, getWorkerUnitMutationGeneration, launchUnit, stopUnit, waitForUnitRunning } from "../src/systemd.ts";
+import { getUnitStatus, getUserManagerHealth, getWorkerUnitMutationGeneration, launchUnit, parseSystemctlListJobs, stopUnit, waitForUnitRunning, workerSubmissionRejection } from "../src/systemd.ts";
 import { stateFromUnit, unitRequiresStopFence } from "../src/workers.ts";
 
 const ok = (stdout = "") => ({ stdout, stderr: "", code: 0 });
 
-test("user-manager health distinguishes a draining queue, persistent backlog, and indeterminate timeout", async () => {
+test("list-jobs parsing is strict and preserves structured records", () => {
+  assert.deepEqual(parseSystemctlListJobs("17 worker-a.service start running\n18 worker-b.service stop waiting\n"), [
+    { id: 17, unit: "worker-a.service", type: "start", state: "running", raw: "17 worker-a.service start running" },
+    { id: 18, unit: "worker-b.service", type: "stop", state: "waiting", raw: "18 worker-b.service stop waiting" },
+  ]);
+  assert.throws(() => parseSystemctlListJobs("17 worker-a.service start\n"), /malformed/);
+  assert.throws(() => parseSystemctlListJobs("17 worker-a.service start queued\n"), /malformed/);
+  assert.throws(() => parseSystemctlListJobs("17 worker-a.service start running\n17 worker-b.service stop waiting\n"), /duplicate/);
+});
+
+test("user-manager health distinguishes diagnostics, cap, malformed output, and timeout", async () => {
   let reads = 0;
   const healthy = await getUserManagerHealth({ async exec() {
     reads += 1;
@@ -13,20 +23,54 @@ test("user-manager health distinguishes a draining queue, persistent backlog, an
       ? ok("17 worker-a.service start running\n18 worker-b.service stop waiting\n")
       : ok("");
   } }, { settleMs: 1 });
-  assert.deepEqual(healthy, { responsive: true, settled: true, jobCount: 0, jobs: [] });
+  assert.deepEqual(healthy, { responsive: true, parsed: true, settled: true, jobCount: 0, jobs: [], jobRecords: [], overJobCap: false });
 
   const stuck = await getUserManagerHealth({ async exec() {
     return ok("17 worker-a.service start waiting\n18 worker-b.service stop waiting\n");
   } }, { settleMs: 1 });
   assert.equal(stuck.responsive, true);
+  assert.equal(stuck.parsed, true);
   assert.equal(stuck.settled, false);
+  assert.equal(stuck.overJobCap, false);
   assert.equal(stuck.persistentJobs?.length, 2);
+
+  const capped = await getUserManagerHealth({ async exec() {
+    return ok(Array.from({ length: 33 }, (_, index) => `${index + 1} worker-${index}.service start waiting`).join("\n"));
+  } }, { settleMs: 1 });
+  assert.equal(capped.responsive, true);
+  assert.equal(capped.overJobCap, true);
+  assert.equal(capped.jobCount, 33);
+
+  const malformed = await getUserManagerHealth({ async exec() { return ok("not a valid job row"); } });
+  assert.equal(malformed.responsive, true);
+  assert.equal(malformed.parsed, false);
+  assert.match(malformed.error ?? "", /could not parse/);
+
+  const failed = await getUserManagerHealth({ async exec() {
+    return { stdout: "", stderr: "manager unavailable", code: 1 };
+  } });
+  assert.equal(failed.responsive, false);
+  assert.match(failed.error ?? "", /manager unavailable/);
 
   const stalled = await getUserManagerHealth({ async exec() {
     return { stdout: "", stderr: "", code: 143, killed: true };
   } });
   assert.equal(stalled.responsive, false);
   assert.match(stalled.error ?? "", /timed out/);
+});
+
+test("worker admission allows unrelated persistent jobs below cap and fails closed otherwise", () => {
+  assert.equal(workerSubmissionRejection({
+    responsive: true,
+    parsed: true,
+    settled: false,
+    jobCount: 32,
+    overJobCap: false,
+    persistentJobs: ["17 unrelated.service start running"],
+  }), undefined);
+  assert.match(workerSubmissionRejection({ responsive: true, parsed: true, jobCount: 33, overJobCap: true }) ?? "", /33 queued jobs/);
+  assert.match(workerSubmissionRejection({ responsive: true, parsed: false, error: "malformed" }) ?? "", /ambiguous.*malformed/);
+  assert.match(workerSubmissionRejection({ responsive: false, error: "timed out" }) ?? "", /not responsive.*timed out/);
 });
 
 test("launch is nonblocking and a killed submission is indeterminate", async () => {

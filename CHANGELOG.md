@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Admit worker submission while unrelated systemd user jobs remain queued below the hard 33-job cap, while continuing to fail closed on manager timeouts, command failures, malformed job output, and exact-unit readiness/fencing failures.
+- Make fleet cleanup singular and bounded with a crash-released nonblocking run lock, a foreground `Type=exec` service capped at ten minutes with exact control-group killing, deferred-work reporting, and durable content-free last-run diagnostics in fleet status/doctor output.
+- Reduce WorkerStore lock convoys with live-owner backoff, token-confirmed atomic release tombstones, replacement-safe failed-claim cleanup, and age-gated tombstone collection while preserving the canonical mixed-version lock protocol.
+
 - Reduce global WorkerStore bandwidth with poison-guarded lock-free canonical reads, conditional no-op mutations, commit-linearized snapshots, and cheaper uncontended lock ownership while preserving serialized durable writers and guarded stale-lock recovery.
 - Gate every typed Boss call on exact-session Orchestrator initialization, so deferred/reloaded RPC Controllers establish the Intercom event bridge before `doctor` readiness or create/mutation dispatch instead of falsely reporting the connected Controller as unregistered.
 - Add an explicit absolute Boss create `sourcePath` for worktree-provisioned runs, so a stable umbrella-level Controller can select and Git-verify the intended clean source repository while Boss creates a fresh run-owned canonical worktree and never implicitly attaches the source or another existing worktree.

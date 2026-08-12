@@ -4,7 +4,7 @@ import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { acquireKernelFileLock } from "../src/file-lock.ts";
+import { acquireKernelFileLock, tryAcquireKernelFileLock } from "../src/file-lock.ts";
 
 function waitForLine(stream: NodeJS.ReadableStream, expected: string): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -43,6 +43,21 @@ test("kernel mutation lock can wait without a timeout for correctness-critical r
     const releaseWaiting = await waiting;
     assert.equal(acquired, true);
     await releaseWaiting();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("nonblocking kernel lock skips a concurrent holder and succeeds after release", async () => {
+  const root = await mkdtemp(join(tmpdir(), "kernel-file-lock-nonblocking-"));
+  const path = join(root, "cleanup-run.lock");
+  try {
+    const releaseHolder = await acquireKernelFileLock(path, 1_000);
+    assert.equal(await tryAcquireKernelFileLock(path), undefined);
+    await releaseHolder();
+    const release = await tryAcquireKernelFileLock(path);
+    assert.ok(release);
+    await release();
   } finally {
     await rm(root, { recursive: true, force: true });
   }

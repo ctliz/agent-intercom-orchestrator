@@ -13,7 +13,9 @@ test("cleanup timer units use exact packaged paths and a persistent bounded inte
     intervalMinutes: 15,
     agentDir: "/home/test/.pi/agent",
   });
-  assert.match(units.service, /Type=oneshot/);
+  assert.match(units.service, /Type=exec/);
+  assert.match(units.service, /RuntimeMaxSec=600/);
+  assert.match(units.service, /KillMode=control-group/);
   assert.match(units.service, /ExecStart="\/opt\/node\/bin\/node" "\/opt\/agent intercom\/agent-fleet-cleanup\.mjs"/);
   assert.match(units.service, /Environment="PI_CODING_AGENT_DIR=\/home\/test\/\.pi\/agent"/);
   assert.match(units.timer, /OnUnitActiveSec=15min/);

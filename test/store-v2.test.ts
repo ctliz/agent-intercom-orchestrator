@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
-import { access, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import test from "node:test";
 import {
   WorkerStore,
@@ -427,7 +429,7 @@ test("CAS fences stale writers and a new incarnation advances workerGeneration",
   }
 });
 
-test("uncontended acquisition skips the mutation guard while owned release waits unbounded", async () => {
+test("uncontended acquisition and owned atomic release skip the mutation guard", async () => {
   const root = await mkdtemp(join(tmpdir(), "worker-store-v2-release-guard-"));
   const path = join(root, "workers.json");
   try {
@@ -442,7 +444,7 @@ test("uncontended acquisition skips the mutation guard while owned release waits
       return await original(lockPath, timeoutMs);
     };
     await store.compareAndSwap(0, () => undefined);
-    assert.deepEqual(timeouts, [undefined]);
+    assert.deepEqual(timeouts, []);
     await assert.rejects(access(`${path}.lock`), { code: "ENOENT" });
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -462,7 +464,8 @@ test("owner metadata write failure removes the incomplete uncontended claim", as
       throw new Error("simulated owner metadata failure");
     };
     await assert.rejects(store.compareAndSwap(0, () => undefined), /simulated owner metadata failure/);
-    await assert.rejects(access(`${path}.lock`), { code: "ENOENT" });
+    const leftovers = (await readdir(root)).filter((entry) => entry.startsWith("workers.json.lock.released."));
+    assert.equal(leftovers.length, 0);
 
     instrumented.writeLockOwner = original;
     await store.compareAndSwap(0, () => undefined);
@@ -504,7 +507,7 @@ test("contended acquisition retries mkdir under the guard after an owner release
   const lockPath = `${path}.lock`;
   try {
     await mkdir(lockPath, { mode: 0o700 });
-    await writeFile(`${lockPath}/owner.json`, `${JSON.stringify({ pid: process.pid, token: "releasing-owner", createdAt: Date.now() })}\n`);
+    await writeFile(`${lockPath}/owner.json`, `${JSON.stringify({ pid: 2_147_483_647, token: "releasing-owner", createdAt: Date.now() })}\n`);
     const store = new WorkerStore(path);
     const instrumented = store as unknown as {
       acquireLockMutationGuard(lockPath: string, timeoutMs?: number): Promise<() => Promise<void>>;
@@ -612,13 +615,104 @@ test("malformed fresh owners wait for age while stale guard files recover throug
     }).finally(() => { settled = true; });
     await callbackEntered;
     await new Promise((resolve) => setTimeout(resolve, 60));
-    assert.equal(settled, false);
-    await access(`${lockPath}/owner.json`);
+    assert.equal(settled, true, "owned atomic release must not wait for the reclaim guard");
+    await assert.rejects(access(lockPath), { code: "ENOENT" });
     await releaseExternalGuard();
     await guardedRelease;
     await assert.rejects(access(lockPath));
     assert.equal((await store.read()).generation, 3);
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("fresh live owners back off without reclaim-helper churn", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-live-precheck-"));
+  const path = join(root, "workers.json");
+  const lockPath = `${path}.lock`;
+  try {
+    await mkdir(lockPath, { mode: 0o700 });
+    await writeFile(`${lockPath}/owner.json`, `${JSON.stringify({ pid: process.pid, token: "live-owner", createdAt: Date.now() })}\n`);
+    const store = new WorkerStore(path, { lockTimeoutMs: 60 });
+    await assert.rejects(store.compareAndSwap(0, () => undefined), /WORKER_STORE|Timed out waiting/);
+    await assert.rejects(access(`${lockPath}.reclaim`), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("release tombstones are unique, replacement-safe, and age-gated", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-release-tombstone-"));
+  const path = join(root, "workers.json");
+  const lockPath = `${path}.lock`;
+  try {
+    const fresh = `${lockPath}.released.fresh.token`;
+    const aged = `${lockPath}.released.aged.token`;
+    await mkdir(fresh, { mode: 0o700 });
+    await mkdir(aged, { mode: 0o700 });
+    await writeFile(`${fresh}/owner.json`, "fresh\n");
+    await writeFile(`${aged}/owner.json`, "aged\n");
+    await utimes(aged, new Date(0), new Date(0));
+
+    const store = new WorkerStore(path);
+    await store.compareAndSwap(0, () => undefined);
+    await access(fresh);
+    await assert.rejects(access(aged), { code: "ENOENT" });
+
+    await mkdir(lockPath, { mode: 0o700 });
+    await writeFile(`${lockPath}/owner.json`, `${JSON.stringify({ pid: process.pid, token: "replacement", createdAt: Date.now() })}\n`);
+    const instrumented = store as unknown as { releaseOwnedLock(lockPath: string, token: string): Promise<void> };
+    await assert.rejects(instrumented.releaseOwnedLock(lockPath, "not-replacement"), /token mismatch/);
+    assert.equal(JSON.parse(await readFile(`${lockPath}/owner.json`, "utf8")).token, "replacement");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a crash-left release tombstone does not block a replacement owner and is collected only after aging", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-release-crash-"));
+  const path = join(root, "workers.json");
+  const lockPath = `${path}.lock`;
+  const tombstone = `${lockPath}.released.crashed-owner.crash-id`;
+  try {
+    await mkdir(tombstone, { mode: 0o700 });
+    await writeFile(`${tombstone}/owner.json`, `${JSON.stringify({ pid: 2_147_483_647, token: "crashed-owner", createdAt: 0 })}\n`);
+
+    const store = new WorkerStore(path);
+    await store.compareAndSwap(0, () => undefined);
+    assert.equal((await store.read()).generation, 1);
+    await access(tombstone);
+
+    await utimes(tombstone, new Date(0), new Date(0));
+    await store.compareAndSwap(1, () => undefined);
+    await assert.rejects(access(tombstone), { code: "ENOENT" });
+    assert.equal((await store.read()).generation, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("current contenders interoperate with an old-process lock holder", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-old-holder-"));
+  const path = join(root, "workers.json");
+  const lockPath = `${path}.lock`;
+  const script = `
+    const fs = require("node:fs");
+    const lockPath = process.argv[1];
+    fs.mkdirSync(lockPath, { mode: 0o700 });
+    fs.writeFileSync(lockPath + "/owner.json", JSON.stringify({ pid: process.pid, token: "old-holder", createdAt: Date.now() }) + "\\n");
+    process.stdout.write("ready\\n");
+    setTimeout(() => { fs.rmSync(lockPath, { recursive: true, force: true }); }, 150);
+  `;
+  const child = spawn(process.execPath, ["-e", script, lockPath], { stdio: ["ignore", "pipe", "inherit"] });
+  try {
+    await once(child.stdout!, "data");
+    const store = new WorkerStore(path, { lockTimeoutMs: 2_000 });
+    await store.compareAndSwap(0, () => undefined);
+    assert.equal((await store.read()).generation, 1);
+    if (child.exitCode === null) await once(child, "exit");
+  } finally {
+    if (child.exitCode === null) child.kill();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -775,6 +869,8 @@ test("optional WorkerStore instrumentation reports timings and bytes without sta
     assert.ok(metrics.some((metric) => metric.operation === "commit" && metric.outcome === "ok" && (metric.bytes ?? 0) > 0));
     assert.ok(metrics.some((metric) => metric.operation === "read" && metric.outcome === "ok"));
     assert.ok(metrics.some((metric) => metric.operation === "lock_wait" && metric.outcome === "ok"));
+    assert.ok(metrics.some((metric) => metric.operation === "lock_release" && metric.outcome === "ok"));
+    assert.deepEqual(await store.inspectLock(), { present: false });
     assert.ok(metrics.every((metric) => Number.isFinite(metric.durationMs) && metric.durationMs >= 0));
     assert.equal(JSON.stringify(metrics).includes("task-instrumented"), false);
   } finally {

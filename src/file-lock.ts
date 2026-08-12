@@ -23,11 +23,11 @@ function waitForExit(child: ChildProcessWithoutNullStreams): Promise<{ code: num
  * this process keeps the helper's stdin pipe open. Parent exit closes the last
  * writer, `cat` observes EOF, and flock exits.
  */
-export async function acquireKernelFileLock(path: string, timeoutMs?: number): Promise<() => Promise<void>> {
+async function acquireKernelFileLockMode(path: string, timeoutMs?: number, nonblocking = false): Promise<() => Promise<void>> {
   if (timeoutMs !== undefined && (!Number.isFinite(timeoutMs) || timeoutMs <= 0)) throw new KernelFileLockError("Kernel file lock timeout must be positive");
   const child = spawn(FLOCK_PATH, [
     "--exclusive",
-    ...(timeoutMs === undefined ? [] : ["--wait", (timeoutMs / 1_000).toFixed(3)]),
+    ...(nonblocking ? ["--nonblock"] : timeoutMs === undefined ? [] : ["--wait", (timeoutMs / 1_000).toFixed(3)]),
     path,
     SHELL_PATH,
     "-c", `printf 'READY\\n'; exec ${CAT_PATH}`,
@@ -75,4 +75,18 @@ export async function acquireKernelFileLock(path: string, timeoutMs?: number): P
       throw new KernelFileLockError(`Kernel file lock helper for ${path} exited abnormally (code=${String(result.code)}, signal=${String(result.signal)})`);
     }
   };
+}
+
+export async function acquireKernelFileLock(path: string, timeoutMs?: number): Promise<() => Promise<void>> {
+  return acquireKernelFileLockMode(path, timeoutMs);
+}
+
+/** Try once without waiting. A held lock is reported as undefined. */
+export async function tryAcquireKernelFileLock(path: string): Promise<(() => Promise<void>) | undefined> {
+  try {
+    return await acquireKernelFileLockMode(path, undefined, true);
+  } catch (error) {
+    if (error instanceof KernelFileLockError && /code=1, signal=null/.test(error.message)) return undefined;
+    throw error;
+  }
 }

@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm, rmdir, stat } from "node:fs/promises";
-import { dirname } from "node:path";
+import { lstat, mkdir, open, readFile, readdir, rename, rm, rmdir, stat } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { types as utilTypes } from "node:util";
 import type {
@@ -29,6 +29,8 @@ const LOCK_STALE_MS = 120_000;
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
 const LOCK_RETRY_MIN_MS = 20;
 const LOCK_RETRY_JITTER_MS = 20;
+const LOCK_RELEASE_TOMBSTONE_MAX_AGE_MS = 120_000;
+const LOCK_RELEASE_TOMBSTONE_MARKER = ".released.";
 
 const LEGACY_STATES = new Set<LegacyWorkerState>([
   "provisioning", "running", "idle", "needs_attention", "completed", "failed", "stopping", "stopped", "lost",
@@ -80,13 +82,20 @@ export interface WorkerStoreFaultContext {
   tempPath: string;
 }
 
-export type WorkerStoreMetricOperation = "lock_wait" | "read" | "mutation" | "commit";
+export type WorkerStoreMetricOperation = "lock_wait" | "lock_live_backoff" | "lock_reclaim_guard" | "lock_release" | "tombstone_gc" | "read" | "mutation" | "commit";
 
 export interface WorkerStoreMetric {
   operation: WorkerStoreMetricOperation;
   durationMs: number;
   outcome: "ok" | "noop" | "error";
   bytes?: number;
+}
+
+export interface WorkerStoreLockDiagnostics {
+  present: boolean;
+  ownerPid?: number;
+  ownerAlive?: boolean;
+  ageMs?: number;
 }
 
 export interface WorkerStoreOptions {
@@ -1075,26 +1084,108 @@ export class WorkerStore {
     }
   }
 
-  private async cleanupFailedLockClaim(lockPath: string, ownerPath: string, token: string, guardHeld = false): Promise<void> {
-    const releaseGuard = guardHeld ? async () => undefined : await this.acquireLockMutationGuard(lockPath);
-    try {
+  private lockReleaseTombstonePath(lockPath: string, token: string): string {
+    return `${lockPath}${LOCK_RELEASE_TOMBSTONE_MARKER}${token}.${randomUUID()}`;
+  }
+
+  private async releaseOwnedLock(lockPath: string, token: string): Promise<void> {
+    await this.measured("lock_release", async () => {
+      const ownerPath = `${lockPath}/owner.json`;
+      await this.confirmLockOwner(ownerPath, token);
+      const tombstonePath = this.lockReleaseTombstonePath(lockPath, token);
+      await rename(lockPath, tombstonePath);
       try {
-        const owner = JSON.parse(await readFile(ownerPath, "utf8")) as { token?: unknown };
-        if (owner.token !== token) return;
-        await rm(lockPath, { recursive: true, force: true });
-        await this.syncDirectory(lockPath);
+        await this.confirmLockOwner(`${tombstonePath}/owner.json`, token);
       } catch (error) {
-        if (errorCode(error) !== "ENOENT") return;
-        try {
-          await rmdir(lockPath);
-          await this.syncDirectory(lockPath);
-        } catch (removeError) {
-          if (errorCode(removeError) !== "ENOENT" && errorCode(removeError) !== "ENOTEMPTY" && errorCode(removeError) !== "EEXIST") throw removeError;
-        }
+        // A replacement between confirmation and rename is not ours. Restore it
+        // rather than deleting it; a concurrently acquired new owner wins and
+        // leaves the displaced directory for age-gated collection.
+        await rename(tombstonePath, lockPath).catch(() => undefined);
+        throw error;
       }
-    } finally {
-      await releaseGuard();
+      await this.syncDirectory(lockPath);
+      await rm(tombstonePath, { recursive: true, force: true });
+      await this.syncDirectory(tombstonePath);
+    });
+  }
+
+  private async cleanupFailedLockClaim(lockPath: string, ownerPath: string, token: string, _guardHeld = false): Promise<void> {
+    try {
+      const owner = JSON.parse(await readFile(ownerPath, "utf8")) as { token?: unknown };
+      if (owner.token !== token) return;
+      await this.releaseOwnedLock(lockPath, token);
+    } catch (error) {
+      // An owner-less directory from our failed metadata creation can be
+      // removed only if it is still empty. A replacement owner makes rmdir
+      // fail with ENOTEMPTY, preserving the replacement without a guard wait.
+      if (errorCode(error) !== "ENOENT") return;
+      try {
+        await rmdir(lockPath);
+        await this.syncDirectory(lockPath);
+      } catch (removeError) {
+        if (errorCode(removeError) !== "ENOENT" && errorCode(removeError) !== "ENOTEMPTY" && errorCode(removeError) !== "EEXIST") throw removeError;
+      }
     }
+  }
+
+  private async collectAgedLockReleaseTombstones(lockPath: string): Promise<void> {
+    const startedAt = this.options.instrumentation ? process.hrtime.bigint() : undefined;
+    let collected = false;
+    const parent = dirname(lockPath);
+    const prefix = `${basename(lockPath)}${LOCK_RELEASE_TOMBSTONE_MARKER}`;
+    let entries: string[];
+    try {
+      entries = (await readdir(parent)).filter((entry) => entry.startsWith(prefix));
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return;
+      throw error;
+    }
+    for (const entry of entries) {
+      const path = join(parent, entry);
+      try {
+        const info = await lstat(path);
+        if (!info.isDirectory() || info.isSymbolicLink()) continue;
+        const ageMs = Math.max(0, this.options.now() - info.mtimeMs);
+        if (ageMs <= LOCK_RELEASE_TOMBSTONE_MAX_AGE_MS) continue;
+        await rm(path, { recursive: true, force: true });
+        await this.syncDirectory(path);
+        collected = true;
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") throw error;
+      }
+    }
+    if (collected) this.metric("tombstone_gc", startedAt, "ok");
+  }
+
+  private async inspectFreshLiveLock(lockPath: string, ownerPath: string): Promise<{ live: boolean; ownerPid?: number; ownerAlive?: boolean; lockAgeMs?: number }> {
+    try {
+      const lockStat = await stat(lockPath);
+      const lockAgeMs = Math.max(0, this.options.now() - lockStat.mtimeMs);
+      let ownerPid: number | undefined;
+      try {
+        const owner = JSON.parse(await readFile(ownerPath, "utf8")) as { pid?: unknown; token?: unknown };
+        if (Number.isSafeInteger(owner.pid) && (owner.pid as number) > 0 && typeof owner.token === "string" && owner.token.length > 0) {
+          ownerPid = owner.pid as number;
+        }
+      } catch {
+        // Guarded inspection remains authoritative for missing/partial owners.
+      }
+      const ownerAlive = ownerPid === undefined ? undefined : isProcessAlive(ownerPid);
+      return { live: ownerAlive === true && lockAgeMs <= LOCK_STALE_MS, ownerPid, ownerAlive, lockAgeMs };
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return { live: false };
+      throw error;
+    }
+  }
+
+  async inspectLock(): Promise<WorkerStoreLockDiagnostics> {
+    const lock = await this.inspectFreshLiveLock(`${this.path}.lock`, `${this.path}.lock/owner.json`);
+    return {
+      present: lock.lockAgeMs !== undefined,
+      ...(lock.ownerPid !== undefined ? { ownerPid: lock.ownerPid } : {}),
+      ...(lock.ownerAlive !== undefined ? { ownerAlive: lock.ownerAlive } : {}),
+      ...(lock.lockAgeMs !== undefined ? { ageMs: Math.round(lock.lockAgeMs) } : {}),
+    };
   }
 
   private async acquireLock(): Promise<() => Promise<void>> {
@@ -1103,6 +1194,7 @@ export class WorkerStore {
     const ownerPath = `${lockPath}/owner.json`;
     const token = randomUUID();
     const startedAt = Date.now();
+    await this.collectAgedLockReleaseTombstones(lockPath);
     let lastOwnerPid: number | undefined;
     let lastOwnerAlive: boolean | undefined;
     let lastLockAgeMs: number | undefined;
@@ -1124,10 +1216,25 @@ export class WorkerStore {
         if (errorCode(error) !== "EEXIST") throw error;
       }
       if (!acquired) {
+        const precheck = await this.inspectFreshLiveLock(lockPath, ownerPath);
+        lastOwnerPid = precheck.ownerPid;
+        lastOwnerAlive = precheck.ownerAlive;
+        lastLockAgeMs = precheck.lockAgeMs;
+        if (precheck.live) {
+          this.metric("lock_live_backoff", this.options.instrumentation ? process.hrtime.bigint() : undefined, "ok");
+          const retryBudgetMs = this.options.lockTimeoutMs - (Date.now() - startedAt);
+          if (retryBudgetMs <= 0) break;
+          const retryMs = LOCK_RETRY_MIN_MS + Math.floor(Math.random() * (LOCK_RETRY_JITTER_MS + 1));
+          await delay(Math.min(retryMs, retryBudgetMs));
+          continue;
+        }
         let releaseGuard: () => Promise<void>;
+        const guardStartedAt = this.options.instrumentation ? process.hrtime.bigint() : undefined;
         try {
           releaseGuard = await this.acquireLockMutationGuard(lockPath, remainingMs);
+          this.metric("lock_reclaim_guard", guardStartedAt, "ok");
         } catch (error) {
+          this.metric("lock_reclaim_guard", guardStartedAt, "error");
           if (Date.now() - startedAt >= this.options.lockTimeoutMs) break;
           throw error;
         }
@@ -1178,17 +1285,10 @@ export class WorkerStore {
       }
       if (acquired) {
         return async () => {
-          // Releasing an owned lock must not time out: abandoning it while this
-          // process remains alive would make every future caller treat it as live.
-          const releaseMutationGuard = await this.acquireLockMutationGuard(lockPath);
-          try {
-            const owner = JSON.parse(await readFile(ownerPath, "utf8")) as { token?: unknown };
-            if (owner.token !== token) throw new WorkerStoreError(`Owned worker state lock token changed ${lockPath}`, "WORKER_STORE_LOCK_FAILED");
-            await rm(lockPath, { recursive: true, force: true });
-            await this.syncDirectory(lockPath);
-          } finally {
-            await releaseMutationGuard();
-          }
+          // Atomic rename removes the owned path immediately without waiting on
+          // the shared reclaim guard. Unique tombstones are crash-recoverable
+          // and invisible to mixed-version lock contenders.
+          await this.releaseOwnedLock(lockPath, token);
         };
       }
       const retryBudgetMs = this.options.lockTimeoutMs - (Date.now() - startedAt);
