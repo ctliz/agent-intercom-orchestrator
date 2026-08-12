@@ -80,6 +80,15 @@ export interface WorkerStoreFaultContext {
   tempPath: string;
 }
 
+export type WorkerStoreMetricOperation = "lock_wait" | "read" | "mutation" | "commit";
+
+export interface WorkerStoreMetric {
+  operation: WorkerStoreMetricOperation;
+  durationMs: number;
+  outcome: "ok" | "noop" | "error";
+  bytes?: number;
+}
+
 export interface WorkerStoreOptions {
   supportedFeatures?: readonly string[];
   legacyStoppingSettleMs?: number;
@@ -88,6 +97,8 @@ export interface WorkerStoreOptions {
   now?: () => number;
   faultInjector?: (point: WorkerStoreFaultPoint, context: WorkerStoreFaultContext) => void | Promise<void>;
   lockTimeoutMs?: number;
+  /** Optional content-free timing observations. Callback failures are ignored. */
+  instrumentation?: (metric: Readonly<WorkerStoreMetric>) => void;
 }
 
 export interface WorkerStoreCommit<T> {
@@ -722,8 +733,7 @@ function storedState(state: WorkerStateFileV3): Record<string, unknown> {
 }
 
 function serializedState(state: WorkerStateFileV3): string {
-  const canonical = parseV3File(storedState(state), false);
-  return `${JSON.stringify(storedState(canonical), null, 2)}\n`;
+  return `${JSON.stringify(storedState(state), null, 2)}\n`;
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -802,6 +812,32 @@ export class WorkerStore {
     const operation = this.queue.catch(() => undefined).then(fn);
     this.queue = operation.then(() => undefined, () => undefined);
     return operation;
+  }
+
+  private metric(operation: WorkerStoreMetricOperation, startedAt: bigint | undefined, outcome: WorkerStoreMetric["outcome"], bytes?: number): void {
+    if (startedAt === undefined || !this.options.instrumentation) return;
+    try {
+      this.options.instrumentation({
+        operation,
+        durationMs: Number(process.hrtime.bigint() - startedAt) / 1_000_000,
+        outcome,
+        ...(bytes === undefined ? {} : { bytes }),
+      });
+    } catch {
+      // Observability must never affect store correctness or availability.
+    }
+  }
+
+  private async measured<T>(operation: WorkerStoreMetricOperation, fn: () => Promise<T>): Promise<T> {
+    const startedAt = this.options.instrumentation ? process.hrtime.bigint() : undefined;
+    try {
+      const result = await fn();
+      this.metric(operation, startedAt, "ok");
+      return result;
+    } catch (error) {
+      this.metric(operation, startedAt, "error");
+      throw error;
+    }
   }
 
   private async syncDirectory(path = this.path): Promise<void> {
@@ -955,6 +991,38 @@ export class WorkerStore {
     throw new WorkerStoreValidationError(`unsupported or corrupt worker state version ${String(version)}`);
   }
 
+  /**
+   * Read only a healthy canonical v3 snapshot without touching the writer lock.
+   * Any absence, legacy schema, or parse ambiguity is deliberately retried under
+   * the lock, where migration/quarantine ordering remains authoritative.
+   */
+  private async loadCanonicalV3LockFree(): Promise<WorkerStateFileV3 | undefined> {
+    const poisonBefore = await this.readPoisonMarker();
+    if (poisonBefore) {
+      throw new WorkerStorePoisonedError(`Worker state ${this.path} is quarantined: ${poisonBefore.reason}`, poisonBefore);
+    }
+    let raw: string;
+    try {
+      raw = await readFile(this.path, "utf8");
+    } catch (error) {
+      if (errorCode(error) === "ENOENT") return undefined;
+      throw new WorkerStoreError(`Could not read worker state ${this.path}: ${errorText(error)}`, "WORKER_STORE_READ_FAILED");
+    }
+    let parsed: { state: WorkerStateFileV3; sourceVersion: 1 | 2 | 3 };
+    try {
+      parsed = this.parseRaw(raw);
+    } catch (error) {
+      if (error instanceof WorkerStoreUnsupportedVersionError || error instanceof WorkerStoreUnsupportedFeatureError) throw error;
+      return undefined;
+    }
+    if (parsed.sourceVersion !== 3) return undefined;
+    const poisonAfter = await this.readPoisonMarker();
+    if (poisonAfter) {
+      throw new WorkerStorePoisonedError(`Worker state ${this.path} is quarantined: ${poisonAfter.reason}`, poisonAfter);
+    }
+    return parsed.state;
+  }
+
   private async loadLocked(): Promise<LoadedState> {
     await this.assertNotPoisonedLocked();
     let raw: string;
@@ -981,6 +1049,17 @@ export class WorkerStore {
     }
   }
 
+  private async writeLockOwner(ownerPath: string, token: string): Promise<void> {
+    // Owner metadata is advisory for stale-lock diagnostics and recovery, not
+    // committed state. A fresh owner-less directory fails closed until stale.
+    const ownerHandle = await open(ownerPath, "wx", 0o600);
+    try {
+      await ownerHandle.writeFile(`${JSON.stringify({ pid: process.pid, token, createdAt: this.options.now() })}\n`, "utf8");
+    } finally {
+      await ownerHandle.close();
+    }
+  }
+
   private async acquireLock(): Promise<() => Promise<void>> {
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const lockPath = `${this.path}.lock`;
@@ -993,53 +1072,70 @@ export class WorkerStore {
     while (Date.now() - startedAt < this.options.lockTimeoutMs) {
       const remainingMs = this.options.lockTimeoutMs - (Date.now() - startedAt);
       if (remainingMs <= 0) break;
-      let releaseGuard: () => Promise<void>;
-      try {
-        releaseGuard = await this.acquireLockMutationGuard(lockPath, remainingMs);
-      } catch (error) {
-        if (Date.now() - startedAt >= this.options.lockTimeoutMs) break;
-        throw error;
-      }
       let acquired = false;
       try {
+        await mkdir(lockPath, { recursive: false, mode: 0o700 });
         try {
-          await mkdir(lockPath, { recursive: false, mode: 0o700 });
-          try {
-            await this.writeSmallDurable(ownerPath, `${JSON.stringify({ pid: process.pid, token, createdAt: this.options.now() })}\n`);
-            acquired = true;
-          } catch (error) {
-            await rm(lockPath, { recursive: true, force: true });
-            throw error;
-          }
+          await this.writeLockOwner(ownerPath, token);
+          acquired = true;
         } catch (error) {
-          if (errorCode(error) !== "EEXIST") throw error;
+          await rm(lockPath, { recursive: true, force: true });
+          throw error;
         }
-        if (!acquired) {
+      } catch (error) {
+        if (errorCode(error) !== "EEXIST") throw error;
+      }
+      if (!acquired) {
+        let releaseGuard: () => Promise<void>;
+        try {
+          releaseGuard = await this.acquireLockMutationGuard(lockPath, remainingMs);
+        } catch (error) {
+          if (Date.now() - startedAt >= this.options.lockTimeoutMs) break;
+          throw error;
+        }
+        try {
+          // The owner may have released between our failed mkdir and acquiring
+          // the guard. Retry under the guard before inspecting/reclaiming.
           try {
-            const lockStat = await stat(lockPath);
-            let ownerPid: number | undefined;
+            await mkdir(lockPath, { recursive: false, mode: 0o700 });
             try {
-              const owner = JSON.parse(await readFile(ownerPath, "utf8")) as { pid?: unknown };
-              if (Number.isSafeInteger(owner.pid) && (owner.pid as number) > 0) ownerPid = owner.pid as number;
-            } catch {
-              // No creator can be writing while this mutation guard is held; age is the fail-closed fallback for a prior crash.
-            }
-            lastOwnerPid = ownerPid;
-            lastOwnerAlive = ownerPid === undefined ? undefined : isProcessAlive(ownerPid);
-            lastLockAgeMs = Math.max(0, this.options.now() - lockStat.mtimeMs);
-            const stale = ownerPid !== undefined
-              ? !lastOwnerAlive
-              : lastLockAgeMs > LOCK_STALE_MS;
-            if (stale) {
+              await this.writeLockOwner(ownerPath, token);
+              acquired = true;
+            } catch (error) {
               await rm(lockPath, { recursive: true, force: true });
-              await this.syncDirectory(lockPath);
+              throw error;
             }
           } catch (error) {
-            if (errorCode(error) !== "ENOENT") throw error;
+            if (errorCode(error) !== "EEXIST") throw error;
           }
+          if (!acquired) {
+            try {
+              const lockStat = await stat(lockPath);
+              let ownerPid: number | undefined;
+              try {
+                const owner = JSON.parse(await readFile(ownerPath, "utf8")) as { pid?: unknown };
+                if (Number.isSafeInteger(owner.pid) && (owner.pid as number) > 0) ownerPid = owner.pid as number;
+              } catch {
+                // Owner creation can race this guarded inspection; age is the
+                // fail-closed fallback for a malformed or crash-left owner.
+              }
+              lastOwnerPid = ownerPid;
+              lastOwnerAlive = ownerPid === undefined ? undefined : isProcessAlive(ownerPid);
+              lastLockAgeMs = Math.max(0, this.options.now() - lockStat.mtimeMs);
+              const stale = ownerPid !== undefined
+                ? !lastOwnerAlive
+                : lastLockAgeMs > LOCK_STALE_MS;
+              if (stale) {
+                await rm(lockPath, { recursive: true, force: true });
+                await this.syncDirectory(lockPath);
+              }
+            } catch (error) {
+              if (errorCode(error) !== "ENOENT") throw error;
+            }
+          }
+        } finally {
+          await releaseGuard();
         }
-      } finally {
-        await releaseGuard();
       }
       if (acquired) {
         return async () => {
@@ -1071,7 +1167,15 @@ export class WorkerStore {
   }
 
   private async withLock<T>(fn: () => Promise<T>): Promise<T> {
-    const release = await this.acquireLock();
+    const startedAt = this.options.instrumentation ? process.hrtime.bigint() : undefined;
+    let release: (() => Promise<void>) | undefined;
+    try {
+      release = await this.acquireLock();
+      this.metric("lock_wait", startedAt, "ok");
+    } catch (error) {
+      this.metric("lock_wait", startedAt, "error");
+      throw error;
+    }
     try {
       return await fn();
     } finally {
@@ -1231,6 +1335,17 @@ export class WorkerStore {
   }
 
   private async durableCommit(text: string, previousRaw?: string): Promise<void> {
+    const startedAt = this.options.instrumentation ? process.hrtime.bigint() : undefined;
+    try {
+      await this.durableCommitUnmeasured(text, previousRaw);
+      this.metric("commit", startedAt, "ok", Buffer.byteLength(text));
+    } catch (error) {
+      this.metric("commit", startedAt, "error", Buffer.byteLength(text));
+      throw error;
+    }
+  }
+
+  private async durableCommitUnmeasured(text: string, previousRaw?: string): Promise<void> {
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const tempPath = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
     let handle: Awaited<ReturnType<typeof open>> | undefined;
@@ -1306,13 +1421,17 @@ export class WorkerStore {
     this.assertPendingRecordsPreserved(previous, normalized, context.allowPendingResolution);
     const text = serializedState(normalized);
     await this.durableCommit(text, context.loaded.raw);
-    const committed = parseV3File(JSON.parse(text), false);
+    const committed = cloneState(normalized);
     context.loaded = { state: committed, raw: text, sourceVersion: 3 };
     this.publish(state, committed);
   }
 
   async read(): Promise<WorkerStateFileV3> {
-    return this.enqueue(() => this.withLock(async () => cloneState((await this.loadLocked()).state)));
+    return this.enqueue(() => this.measured("read", async () => {
+      const fast = await this.loadCanonicalV3LockFree();
+      if (fast) return cloneState(fast);
+      return this.withLock(async () => cloneState((await this.loadLocked()).state));
+    }));
   }
 
   /** Persist a validated v3 commit. Version-1/2 inputs take the explicit migration path first. */
@@ -1330,7 +1449,7 @@ export class WorkerStore {
       if (loaded.sourceVersion === 3) return cloneState(loaded.state);
       const text = serializedState(loaded.state);
       await this.durableCommit(text, loaded.raw);
-      return cloneState(parseV3File(JSON.parse(text), false));
+      return cloneState(loaded.state);
     }));
   }
 
@@ -1342,8 +1461,15 @@ export class WorkerStore {
   async mutateConditionally<T>(
     fn: (state: WorkerStateFile) => { value: T; changed: boolean } | Promise<{ value: T; changed: boolean }>,
   ): Promise<T> {
-    const commit = await this.mutateWithGeneration(undefined, fn);
+    const commit = await this.mutateConditionallyWithSnapshot(fn);
     return commit.value;
+  }
+
+  /** Conditional mutation with the defensive snapshot linearized at its commit/no-op. */
+  async mutateConditionallyWithSnapshot<T>(
+    fn: (state: WorkerStateFileV3) => { value: T; changed: boolean } | Promise<{ value: T; changed: boolean }>,
+  ): Promise<WorkerStoreCommit<T>> {
+    return this.mutateWithGeneration(undefined, fn);
   }
 
   /** Lock-backed optimistic mutation. A supplied generation is checked before the callback runs. */
@@ -1351,17 +1477,24 @@ export class WorkerStore {
     expectedGeneration: number | undefined,
     fn: (state: WorkerStateFileV3) => { value: T; changed: boolean } | Promise<{ value: T; changed: boolean }>,
   ): Promise<WorkerStoreCommit<T>> {
-    return this.enqueue(() => this.withLock(async () => {
-      const loaded = await this.loadLocked();
-      if (expectedGeneration !== undefined && loaded.state.generation !== expectedGeneration) {
-        throw new WorkerStoreConflictError(expectedGeneration, loaded.state.generation);
-      }
-      const state = cloneState(loaded.state);
-      const context: HeldWriteContext = { loaded, allowPendingResolution: false };
-      const result = await fn(state);
-      if (result.changed) await this.writeLocked(state, context);
-      return { value: result.value, generation: context.loaded.state.generation, state: cloneState(context.loaded.state) };
-    }));
+    return this.enqueue(() => {
+      const startedAt = this.options.instrumentation ? process.hrtime.bigint() : undefined;
+      return this.withLock(async () => {
+        const loaded = await this.loadLocked();
+        if (expectedGeneration !== undefined && loaded.state.generation !== expectedGeneration) {
+          throw new WorkerStoreConflictError(expectedGeneration, loaded.state.generation);
+        }
+        const state = cloneState(loaded.state);
+        const context: HeldWriteContext = { loaded, allowPendingResolution: false };
+        const result = await fn(state);
+        if (result.changed) await this.writeLocked(state, context);
+        this.metric("mutation", startedAt, result.changed ? "ok" : "noop");
+        return { value: result.value, generation: context.loaded.state.generation, state: cloneState(context.loaded.state) };
+      }).catch((error) => {
+        this.metric("mutation", startedAt, "error");
+        throw error;
+      });
+    });
   }
 
   async compareAndSwap<T>(
@@ -1455,7 +1588,7 @@ export class WorkerStore {
       await rm(this.poisonPath());
       await this.syncDirectory();
       this.poisoned = undefined;
-      return cloneState(parseV3File(JSON.parse(text), false));
+      return cloneState(normalized);
     }));
   }
 
@@ -1472,10 +1605,11 @@ export class WorkerStore {
   }
 
   async remove(id: string): Promise<boolean> {
-    return this.mutate((state) => {
+    return this.mutateConditionally((state) => {
       const before = state.workers.length;
       state.workers = state.workers.filter((worker) => worker.id !== id);
-      return state.workers.length !== before;
+      const removed = state.workers.length !== before;
+      return { value: removed, changed: removed };
     });
   }
 }
