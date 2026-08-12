@@ -201,20 +201,30 @@ export async function listRuntimeRoots(agentDir: string): Promise<Array<{ worker
   }
 }
 
+export function boundedCleanupCandidates<T>(
+  candidates: T[],
+  maxCandidates: number,
+): { admitted: T[]; deferred: T[] } {
+  const limit = Number.isSafeInteger(maxCandidates) && maxCandidates >= 0 ? maxCandidates : 0;
+  return { admitted: candidates.slice(0, limit), deferred: candidates.slice(limit) };
+}
+
 export async function executeCleanupCandidatesIsolated<T>(
   candidates: T[],
   execute: (candidate: T) => Promise<boolean>,
-): Promise<{ executed: T[]; errors: Array<{ candidate: T; error: string }> }> {
+  shouldContinue: () => boolean = () => true,
+): Promise<{ executed: T[]; errors: Array<{ candidate: T; error: string }>; deferred: T[] }> {
   const executed: T[] = [];
   const errors: Array<{ candidate: T; error: string }> = [];
-  for (const candidate of candidates) {
+  for (const [index, candidate] of candidates.entries()) {
+    if (!shouldContinue()) return { executed, errors, deferred: candidates.slice(index) };
     try {
       if (await execute(candidate)) executed.push(candidate);
     } catch (error) {
       errors.push({ candidate, error: error instanceof Error ? error.message : String(error) });
     }
   }
-  return { executed, errors };
+  return { executed, errors, deferred: [] };
 }
 
 function claims(state: WorkerStateFile): RuntimeCleanupClaim[] {

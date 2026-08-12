@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { DEFAULT_CONFIG, mergeConfig, readConfig, writeConfigDefaults } from "../src/config.ts";
 import {
+  boundedCleanupCandidates,
   deleteOrphanRuntimeSafely,
   deleteTerminalRuntimeBatchSafely,
   deleteTerminalRuntimeSafely,
@@ -69,6 +70,22 @@ test("cleanup execution isolates one candidate failure and continues", async () 
   });
   assert.deepEqual(result.executed, ["good"]);
   assert.deepEqual(result.errors, [{ candidate: "bad", error: "unsafe runtime path" }]);
+  assert.deepEqual(result.deferred, []);
+});
+
+test("cleanup candidate budget preserves order and reports deferred work", () => {
+  assert.deepEqual(boundedCleanupCandidates(["stop", "prune", "cache", "orphan"], 2), {
+    admitted: ["stop", "prune"],
+    deferred: ["cache", "orphan"],
+  });
+});
+
+test("cleanup execution stops admitting work when the time budget expires", async () => {
+  let checks = 0;
+  const result = await executeCleanupCandidatesIsolated(["first", "second", "third"], async () => true, () => checks++ < 1);
+  assert.deepEqual(result.executed, ["first"]);
+  assert.deepEqual(result.deferred, ["second", "third"]);
+  assert.deepEqual(result.errors, []);
 });
 
 test("batch cleanup bounds verified unit enumeration for 500 unit-less expired workers", async () => {

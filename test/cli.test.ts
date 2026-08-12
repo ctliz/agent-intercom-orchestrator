@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { acquireKernelFileLock } from "../src/file-lock.ts";
 
 async function runChild(script: URL, env: NodeJS.ProcessEnv, input?: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
   const child = spawn(process.execPath, ["--experimental-strip-types", script.pathname], {
@@ -213,6 +214,66 @@ test("internal manager heartbeat returns checkpoint requests without exposing a 
     assert.equal(response.result.details.checkpointRequests[0].target, "checkpoint-worker");
     assert.match(response.result.details.checkpointRequests[0].message, /Lifecycle checkpoint requested/);
   } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("explicit cleanup bypasses startup cleanup and runs one cleanup pass", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-fleet-single-cleanup-cli-"));
+  try {
+    const orchestratorDir = join(agentDir, "intercom", "orchestrator");
+    const binDir = join(agentDir, "bin");
+    const callsPath = join(agentDir, "systemctl.calls");
+    await mkdir(orchestratorDir, { recursive: true });
+    await mkdir(binDir, { recursive: true });
+    await writeFile(join(orchestratorDir, "config.json"), JSON.stringify({ cleanupExpiredOnStart: true }));
+    await writeFile(join(binDir, "systemctl"), `#!/bin/sh\nprintf '%s\\n' "$*" >> ${JSON.stringify(callsPath)}\nexit 0\n`, { mode: 0o755 });
+    const cli = new URL("../src/agent-fleet-cli.mjs", import.meta.url);
+    const result = await runChild(cli, {
+      ...process.env,
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      PI_CODING_AGENT_DIR: agentDir,
+      AGENT_INTERCOM_ORCHESTRATOR_DISABLED: "",
+      AGENT_INTERCOM_DISABLE_CLEANUP_TIMER: "1",
+    }, JSON.stringify({
+      managerSessionId: "cleanup-single-pass-test",
+      cwd: process.cwd(),
+      params: { action: "cleanup", execute: true },
+    }));
+    assert.equal(result.code, 0, result.stderr);
+    const calls = await readFile(callsPath, "utf8");
+    assert.equal(calls.split("\n").filter((line) => line.includes("list-units")).length, 1);
+    const cleanupState = JSON.parse(await readFile(join(orchestratorDir, "cleanup-run.json"), "utf8"));
+    assert.equal(cleanupState.outcome, "ok");
+    assert.equal(cleanupState.errors, 0);
+    assert.equal(cleanupState.deferred, 0);
+  } finally {
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("managerless cleanup skips while another cleanup run holds the crash-released lock", async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-fleet-coalesced-cleanup-cli-"));
+  let release: (() => Promise<void>) | undefined;
+  try {
+    const orchestratorDir = join(agentDir, "intercom", "orchestrator");
+    await mkdir(orchestratorDir, { recursive: true });
+    await writeFile(join(orchestratorDir, "config.json"), JSON.stringify({ cleanupExpiredOnStart: true }));
+    release = await acquireKernelFileLock(join(orchestratorDir, "cleanup-run.lock"), 1_000);
+    const script = new URL("../src/agent-fleet-cleanup.mjs", import.meta.url);
+    const { code, stdout, stderr } = await runChild(script, {
+      ...process.env,
+      PI_CODING_AGENT_DIR: agentDir,
+      AGENT_INTERCOM_ORCHESTRATOR_DISABLED: "",
+      AGENT_INTERCOM_DISABLE_CLEANUP_TIMER: "1",
+    });
+    assert.equal(code, 0, stderr);
+    const response = JSON.parse(stdout);
+    assert.equal(response.ok, true);
+    assert.equal(response.result.details.skipped, "in_progress");
+    assert.match(response.result.content[0].text, /another cleanup run is in progress/);
+  } finally {
+    await release?.();
     await rm(agentDir, { recursive: true, force: true });
   }
 });

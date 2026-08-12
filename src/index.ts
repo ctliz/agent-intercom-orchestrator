@@ -17,14 +17,16 @@ import { applyBossSystemdPausePlan, bossWorkerTimersSuspended, captureBossPaused
 import { assertTrustedLocalBossControllerTarget, assertTrustedLocalBossWorkerAdoptionAllowed, buildOptionalTrustedLocalBossTeamEnvironment, buildTrustedLocalBossParticipantPrompt, buildTrustedLocalBossSupervisionEnvironment, TRUSTED_LOCAL_BOSS_PARTICIPANT_HARNESS, TRUSTED_LOCAL_BOSS_PARTICIPANT_PROFILE, trustedLocalBossParticipantTargets, type TrustedLocalBossTeamIdentity } from "./boss-team-environment.ts";
 import { TRUSTED_LOCAL_BOSS_WARNING, TrustedLocalBossStore, type TrustedLocalBossAssignment, type TrustedLocalBossPausedTimer, type TrustedLocalBossPauseSettledTarget, type TrustedLocalBossResult, type TrustedLocalBossRun } from "./boss-trusted-local.ts";
 import { CLEANUP_SERVICE, CLEANUP_TIMER, ensureCleanupTimer } from "./cleanup-timer.ts";
+import { readCleanupRunDiagnostics, writeCleanupRunState, type CleanupRunDiagnostics } from "./cleanup-state.ts";
 import { addPiTools, buildPermissionEnvironment, buildPermissionUnitProperties, registerWorkerPermissionPolicy, SAFE_PI_BOSS_SUPERVISION_TOOLS } from "./permissions.ts";
 import { resolvePiRuntime } from "./pi-runtime.ts";
 import { prepareWorkerRuntime, workerRuntimeRoot, workerSocketRuntimeRoot } from "./runtime.ts";
 import { INTERCOM_CONTROL_RECEIVED_EVENT, INTERCOM_CONTROL_REGISTER_EVENT, INTERCOM_CONTROL_SEND_EVENT, registerOwnedWorkerReadinessProbeType, registerOwnedWorkerReadinessResponder, WORKER_READINESS_ACK, WORKER_READINESS_PROBE, WorkerReadinessAckTracker } from "./readiness.ts";
-import { captureCleanupUnitInventory, deleteOrphanRuntimeSafely, deleteTerminalRuntimeBatchSafely, deleteTerminalRuntimeSafely, executeCleanupCandidatesIsolated, existingTerminalCachePaths, listRuntimeRoots, recoverStaleRuntimeCleanupClaims, removeFullRuntimePathsSafely, terminalWorkerAt } from "./runtime-cleanup.ts";
+import { boundedCleanupCandidates, captureCleanupUnitInventory, deleteOrphanRuntimeSafely, deleteTerminalRuntimeBatchSafely, deleteTerminalRuntimeSafely, executeCleanupCandidatesIsolated, existingTerminalCachePaths, listRuntimeRoots, recoverStaleRuntimeCleanupClaims, removeFullRuntimePathsSafely, terminalWorkerAt } from "./runtime-cleanup.ts";
 import { detectHarnessAvailability, formatRoutingDecision, inferHarnessFromModel, normalizeModelForHarness, roleInstructionsForHarness, roleRequiresSubagents, resolveHarnessRoute, type HarnessAvailability, type RoutingDecision } from "./routing.ts";
+import { tryAcquireKernelFileLock } from "./file-lock.ts";
 import { WorkerStore } from "./store.ts";
-import { formatUnitStatus, getUnitStatus, getUserManagerHealth, launchUnit, listWorkerUnits, makeUnitName, parseDurationToSeconds, readUnitLogs, readUnitProcessTree, sanitizeUnitPart, stopUnit, systemdAvailable, waitForUnitRunning } from "./systemd.ts";
+import { formatUnitStatus, getUnitStatus, getUserManagerHealth, launchUnit, listWorkerUnits, makeUnitName, parseDurationToSeconds, readUnitLogs, readUnitProcessTree, sanitizeUnitPart, stopUnit, systemdAvailable, waitForUnitRunning, workerSubmissionRejection } from "./systemd.ts";
 import type { CommandRunner, Effort, Harness, OrchestratorConfig, PermissionProfile, RolePreset, WorkerRecord, WorkerRecordV3, WorkerStateFile, WorkerStateFileV3 } from "./types.ts";
 import {
   boundedLeaseExpiry,
@@ -142,7 +144,13 @@ type CleanupExecution = {
   candidates: CleanupCandidate[];
   handled: CleanupCandidate[];
   errors: Array<{ candidate: CleanupCandidate; error: string }>;
+  deferred: CleanupCandidate[];
+  budget?: { maxCandidates: number; deadlineMs: number; exhausted: boolean };
+  skipped?: "in_progress";
 };
+
+export const CLEANUP_RUN_MAX_CANDIDATES = 128;
+export const CLEANUP_RUN_BUDGET_MS = 9 * 60_000;
 
 type ResolvedSpawn = {
   harness: Harness;
@@ -170,6 +178,11 @@ type ResolvedRoute = {
 
 function textResult(text: string, details?: unknown) {
   return { content: [{ type: "text" as const, text }], details };
+}
+
+function formatCleanupDiagnostics(cleanup: CleanupRunDiagnostics): string {
+  const result = cleanup.result;
+  return `cleanup run: state=${cleanup.state} age-ms=${cleanup.ageMs ?? "unknown"}${result ? ` result=${result.outcome} candidates=${result.candidates ?? "unknown"} handled=${result.handled ?? "unknown"} errors=${result.errors ?? "unknown"} deferred=${result.deferred ?? "unknown"} budget-exhausted=${result.budgetExhausted ?? "unknown"}` : ""}`;
 }
 
 function managerSessionId(ctx: ExtensionContext): string {
@@ -603,7 +616,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   const openCodePeerDir = join(agentDir, "intercom", "orchestrator", "opencode-peers");
   const configuredManagerContext = process.env.AGENT_INTERCOM_MANAGER_CONTEXT;
   const managerOwnerContext = configuredManagerContext === "opencode" || configuredManagerContext === "headless_cli" ? configuredManagerContext : "pi";
-  const store = new WorkerStore(statePath, { legacyManagerContext: managerOwnerContext });
+  const store = new WorkerStore(statePath, {
+    legacyManagerContext: managerOwnerContext,
+    instrumentation: (metric) => console.error(`[agent-intercom-orchestrator] worker_store operation=${metric.operation} outcome=${metric.outcome} duration_ms=${metric.durationMs.toFixed(3)}${metric.bytes === undefined ? "" : ` bytes=${metric.bytes}`}`),
+  });
   const trustedLocalBossStore = new TrustedLocalBossStore(trustedLocalBossStatePath);
   const runner = runnerFor(pi);
   const readinessAcks = new WorkerReadinessAckTracker();
@@ -974,7 +990,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     });
   };
 
-  const cleanupExpired = async (execute: boolean, now = Date.now()): Promise<CleanupExecution> => {
+  const cleanupExpiredPass = async (execute: boolean, now = Date.now()): Promise<CleanupExecution> => {
     await recoverCleanupClaims();
     await reconcile();
     const pauseProtectedWorkerKeys = new Set(await trustedLocalBossStore.pauseProtectedWorkerKeys());
@@ -1043,10 +1059,16 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       }
     }
     const candidates: CleanupCandidate[] = [...liveCandidates, ...pruneCandidates, ...cacheCandidates, ...orphanCandidates];
-    if (!execute) return { candidates, handled: [], errors: [] };
+    if (!execute) return { candidates, handled: [], errors: [], deferred: [] };
+    const deadline = Date.now() + CLEANUP_RUN_BUDGET_MS;
+    const bounded = boundedCleanupCandidates(candidates, CLEANUP_RUN_MAX_CANDIDATES);
+    const admitted = new Set(bounded.admitted);
+    const deferred = new Set<CleanupCandidate>(bounded.deferred);
+    const withinDeadline = () => Date.now() < deadline;
     const handled = new Set<CleanupCandidate>();
     const errors: Array<{ candidate: CleanupCandidate; error: string }> = [];
-    const stopResult = await executeCleanupCandidatesIsolated(liveCandidates, async (candidate) => {
+    const admittedLive = liveCandidates.filter((candidate) => admitted.has(candidate));
+    const stopResult = await executeCleanupCandidatesIsolated(admittedLive, async (candidate) => {
       try {
         await stopWorker(candidate.worker, {
           reason: "idle-grace-expired",
@@ -1057,17 +1079,20 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         if (/lifecycle changed|renewed before expired cleanup/.test(error instanceof Error ? error.message : String(error))) return false;
         throw error;
       }
-    });
+    }, withinDeadline);
     for (const candidate of stopResult.executed) handled.add(candidate);
+    for (const candidate of stopResult.deferred) deferred.add(candidate);
     errors.push(...stopResult.errors);
 
-    const terminalCandidates = [...pruneCandidates, ...cacheCandidates];
+    const terminalCandidates = [...pruneCandidates, ...cacheCandidates].filter((candidate) => admitted.has(candidate));
+    const terminalReady = withinDeadline() ? terminalCandidates : [];
+    if (!withinDeadline()) terminalCandidates.forEach((candidate) => deferred.add(candidate));
     const terminalResult = await deleteTerminalRuntimeBatchSafely({
       store,
       runner,
       agentDir,
       preMoveInventory: cleanupInventory,
-      candidates: terminalCandidates.map((candidate) => {
+      candidates: terminalReady.map((candidate) => {
         const terminalAt = terminalWorkerAt(candidate.worker);
         if (terminalAt === undefined) throw new Error(`Worker ${candidate.worker.id} changed before runtime cleanup batching`);
         return {
@@ -1083,11 +1108,12 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       }),
     });
     terminalResult.deleted.forEach((deleted, index) => {
-      if (deleted) handled.add(terminalCandidates[index]);
+      if (deleted) handled.add(terminalReady[index]);
     });
-    errors.push(...terminalResult.errors.map(({ index, error }) => ({ candidate: terminalCandidates[index], error })));
+    errors.push(...terminalResult.errors.map(({ index, error }) => ({ candidate: terminalReady[index], error })));
 
-    const orphanResult = await executeCleanupCandidatesIsolated(orphanCandidates, async (candidate) => {
+    const admittedOrphans = orphanCandidates.filter((candidate) => admitted.has(candidate));
+    const orphanResult = await executeCleanupCandidatesIsolated(admittedOrphans, async (candidate) => {
       return deleteOrphanRuntimeSafely({
         store,
         runner,
@@ -1097,11 +1123,67 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         path: candidate.path,
         now,
       });
-    });
+    }, withinDeadline);
     for (const candidate of orphanResult.executed) handled.add(candidate);
+    for (const candidate of orphanResult.deferred) deferred.add(candidate);
     errors.push(...orphanResult.errors);
     await updateStatus();
-    return { candidates, handled: candidates.filter((candidate) => handled.has(candidate)), errors };
+    const deferredCandidates = candidates.filter((candidate) => deferred.has(candidate));
+    return {
+      candidates,
+      handled: candidates.filter((candidate) => handled.has(candidate)),
+      errors,
+      deferred: deferredCandidates,
+      budget: {
+        maxCandidates: CLEANUP_RUN_MAX_CANDIDATES,
+        deadlineMs: CLEANUP_RUN_BUDGET_MS,
+        exhausted: deferredCandidates.length > 0,
+      },
+    };
+  };
+
+  const cleanupRunLockPath = join(agentDir, "intercom", "orchestrator", "cleanup-run.lock");
+  const cleanupRunStatePath = join(agentDir, "intercom", "orchestrator", "cleanup-run.json");
+  const recordCleanupRun = async (state: Parameters<typeof writeCleanupRunState>[1]): Promise<void> => {
+    await writeCleanupRunState(cleanupRunStatePath, state).catch(() => {
+      console.error("[agent-intercom-orchestrator] cleanup_run_state outcome=error");
+    });
+  };
+  const cleanupExpired = async (execute: boolean, now = Date.now()): Promise<CleanupExecution> => {
+    if (!execute) return cleanupExpiredPass(false, now);
+    const startedAt = Date.now();
+    const release = await tryAcquireKernelFileLock(cleanupRunLockPath);
+    if (!release) {
+      console.error("[agent-intercom-orchestrator] cleanup_run outcome=coalesced");
+      return { candidates: [], handled: [], errors: [], deferred: [], skipped: "in_progress" };
+    }
+    await recordCleanupRun({ version: 1, outcome: "running", startedAt, updatedAt: startedAt });
+    try {
+      const result = await cleanupExpiredPass(true, now);
+      const finishedAt = Date.now();
+      const outcome = result.errors.length ? "partial" : "ok";
+      await recordCleanupRun({
+        version: 1,
+        outcome,
+        startedAt,
+        updatedAt: finishedAt,
+        durationMs: finishedAt - startedAt,
+        candidates: result.candidates.length,
+        handled: result.handled.length,
+        errors: result.errors.length,
+        deferred: result.deferred.length,
+        budgetExhausted: result.budget?.exhausted ?? false,
+      });
+      console.error(`[agent-intercom-orchestrator] cleanup_run outcome=${outcome} duration_ms=${finishedAt - startedAt} candidates=${result.candidates.length} handled=${result.handled.length} errors=${result.errors.length} deferred=${result.deferred.length} budget_exhausted=${result.budget?.exhausted ?? false}`);
+      return result;
+    } catch (error) {
+      const finishedAt = Date.now();
+      await recordCleanupRun({ version: 1, outcome: "error", startedAt, updatedAt: finishedAt, durationMs: finishedAt - startedAt });
+      console.error(`[agent-intercom-orchestrator] cleanup_run outcome=error duration_ms=${finishedAt - startedAt}`);
+      throw error;
+    } finally {
+      await release();
+    }
   };
 
   // Frequent manager heartbeats only observe their attached workers. Startup,
@@ -1372,15 +1454,8 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       && profile.mode === "persistent"
       && COORDINATED_ADAPTER_PROFILES.has(profileName);
     const managerHealth = await getUserManagerHealth(runner);
-    if (!managerHealth.responsive) {
-      throw new Error(`systemd user manager is not responsive; refusing worker submission: ${managerHealth.error ?? "unknown liveness failure"}`);
-    }
-    if (managerHealth.settled === false) {
-      throw new Error(`systemd user manager has ${managerHealth.persistentJobs?.length ?? managerHealth.jobCount ?? "unknown"} jobs that remained queued across the liveness window; refusing worker submission until the backlog clears`);
-    }
-    if ((managerHealth.jobCount ?? 0) > 32) {
-      throw new Error(`systemd user manager has ${managerHealth.jobCount} queued jobs; refusing worker submission until the backlog clears`);
-    }
+    const submissionRejection = workerSubmissionRejection(managerHealth);
+    if (submissionRejection) throw new Error(submissionRejection);
     if (permissionProfile.hardened) {
       const version = await systemdVersion(runner);
       if (version !== undefined && version < 257) throw new Error(`Permission profile ${permissionProfileName} requires systemd 257 or newer for PrivatePIDs (found ${version})`);
@@ -1665,6 +1740,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
 
       if (params.action === "status") {
         const reconciled = await reconcile();
+        const cleanup = await readCleanupRunDiagnostics(cleanupRunStatePath);
         const visible = params.all
           ? reconciled
           : workersAttachedToManager(reconciled, managerSessionId(ctx));
@@ -1675,9 +1751,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
             getUnitStatus(runner, workers[0].unit),
           ]);
           const processText = processes.tree || "(unit cgroup is empty or unloaded)";
-          return textResult(`${formatWorkers(workers)}\n\nSystemd: ${formatUnitStatus(unitStatus)}\n\nCgroup process tree:\n${processText}`, { workers, processes, unitStatus });
+          return textResult(`${formatWorkers(workers)}\n\n${formatCleanupDiagnostics(cleanup)}\n\nSystemd: ${formatUnitStatus(unitStatus)}\n\nCgroup process tree:\n${processText}`, { workers, cleanup, processes, unitStatus });
         }
-        return textResult(formatWorkers(workers), { workers });
+        return textResult(`${formatWorkers(workers)}\n\n${formatCleanupDiagnostics(cleanup)}`, { workers, cleanup });
       }
 
       if (params.action === "stop") {
@@ -1690,12 +1766,13 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
 
       if (params.action === "cleanup") {
         const result = await cleanupExpired(Boolean(params.execute));
+        if (result.skipped === "in_progress") return textResult("Cleanup skipped: another cleanup run is in progress.", result);
         if (result.candidates.length === 0) return textResult("No live workers need stopping, no terminal worker retention has expired, no disposable runtime caches remain, and no orphan runtimes exist.", result);
         const selected = params.execute ? result.handled : result.candidates;
         const lines = selected.map((candidate) => `${candidate.kind === "orphan" ? candidate.workerId : candidate.worker.id} [${candidate.kind}]: ${candidate.reason}`);
         const failures = result.errors.map(({ candidate, error }) => `${candidate.kind === "orphan" ? candidate.workerId : candidate.worker.id} [${candidate.kind}]: ${error}`);
         return textResult(
-          `${params.execute ? "Cleaned" : "Cleanup preview"}:\n${lines.join("\n") || "(no actions applied)"}${failures.length ? `\n\nFailed safely:\n${failures.join("\n")}` : ""}${params.execute ? "" : "\nRun cleanup with execute=true to stop expired live workers, prune retention-expired terminal workers, remove disposable caches, and delete orphan runtimes."}`,
+          `${params.execute ? "Cleaned" : "Cleanup preview"}:\n${lines.join("\n") || "(no actions applied)"}${failures.length ? `\n\nFailed safely:\n${failures.join("\n")}` : ""}${result.deferred.length ? `\n\nDeferred safely: ${result.deferred.length} candidate${result.deferred.length === 1 ? "" : "s"} remain for a later cleanup run.` : ""}${params.execute ? "" : "\nRun cleanup with execute=true to stop expired live workers, prune retention-expired terminal workers, remove disposable caches, and delete orphan runtimes."}`,
           result,
         );
       }
@@ -1808,12 +1885,16 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           mountfsd: managedHelpers[1].code === 0 ? managedHelpers[1].stdout.trim() || "active" : managedHelpers[1].stdout.trim() || "inactive",
         };
         const state = await store.read();
+        const lock = await store.inspectLock();
+        const claimCount = state.runtimeCleanupClaims?.length ?? 0;
+        const cleanup = await readCleanupRunDiagnostics(cleanupRunStatePath);
+        const admissionReason = workerSubmissionRejection(managerHealth) ?? "admitted";
         const recordedUnits = new Set(state.workers.map((worker) => worker.unit).filter(Boolean));
         const units = available ? await listWorkerUnits(runner) : [];
         const untrackedUnits = units.filter((unit) => !recordedUnits.has(unit));
         return textResult(
-          [`systemd user manager: ${available ? "available" : "unavailable"} responsive=${managerHealth.responsive} settled=${managerHealth.settled ?? "unknown"} jobs=${managerHealth.jobCount ?? "unknown"}${managerHealth.error ? ` error=${managerHealth.error}` : ""} version=${installedSystemdVersion ?? "unknown"} bubblewrap=${bubblewrapAvailable ? "available" : "missing"} hardened-profiles=${hardenedProfilesReady}`, ...(managerHealth.jobs?.length ? [`systemd queued jobs: ${managerHealth.jobs.slice(0, 10).join(" | ")}${managerHealth.jobs.length > 10 ? ` | +${managerHealth.jobs.length - 10} more` : ""}`] : []), `managed user namespaces: nsresourced=${managedUserNamespaces.nsresourced} mountfsd=${managedUserNamespaces.mountfsd}`, `cleanup timer: enabled=${cleanupTimerStatus.enabled} active=${cleanupTimerStatus.active} source-current=${cleanupTimerStatus.sourceCurrent}`, `Pi peer launcher: ${PI_PEER_LAUNCHER}`, `Adapter readiness launcher: ${ADAPTER_READINESS_LAUNCHER}`, `OpenCode peer launcher: ${OPENCODE_PEER_LAUNCHER}`, `OpenCode Intercom plugin: ${opencodeIntercomPlugin}`, `adapter versions: ${adapterDrift.length ? `${adapterDrift.map((adapter) => `${adapter.id}=${adapter.current ?? "missing"}->${adapter.latest ?? "unknown"}`).join(", ")} — run agent_fleet update for commands` : "coordinated"}`, `permission profiles: ${Object.keys(config.permissionProfiles).sort().join(", ")}`, `config: ${configPath}`, `state: ${statePath}`, `untracked worker units: ${untrackedUnits.length ? untrackedUnits.join(", ") : "none"}`, ...profileLines].join("\n"),
-          { systemd: available, managerHealth, systemdVersion: installedSystemdVersion, bubblewrapAvailable, hardenedProfilesReady, managedUserNamespaces, cleanupTimerStatus, piPeerLauncher: PI_PEER_LAUNCHER, adapterReadinessLauncher: ADAPTER_READINESS_LAUNCHER, opencodePeerLauncher: OPENCODE_PEER_LAUNCHER, opencodeIntercomPlugin, adapters, configPath, statePath, untrackedUnits },
+          [`systemd user manager: ${available ? "available" : "unavailable"} responsive=${managerHealth.responsive} parsed=${managerHealth.parsed ?? "unknown"} settled=${managerHealth.settled ?? "unknown"} jobs=${managerHealth.jobCount ?? "unknown"} admission=${admissionReason}${managerHealth.error ? ` error=${managerHealth.error}` : ""} version=${installedSystemdVersion ?? "unknown"} bubblewrap=${bubblewrapAvailable ? "available" : "missing"} hardened-profiles=${hardenedProfilesReady}`, ...(managerHealth.jobRecords?.length ? [`systemd job records: ${managerHealth.jobRecords.slice(0, 10).map((job) => `id=${job.id},unit=${job.unit},type=${job.type},state=${job.state}`).join(" | ")}${managerHealth.jobRecords.length > 10 ? ` | +${managerHealth.jobRecords.length - 10} more` : ""}`] : []), `worker store lock: present=${lock.present} owner-pid=${lock.ownerPid ?? "unknown"} owner-alive=${lock.ownerAlive ?? "unknown"} age-ms=${lock.ageMs ?? "unknown"} cleanup-claims=${claimCount}`, formatCleanupDiagnostics(cleanup), `managed user namespaces: nsresourced=${managedUserNamespaces.nsresourced} mountfsd=${managedUserNamespaces.mountfsd}`, `cleanup timer: enabled=${cleanupTimerStatus.enabled} active=${cleanupTimerStatus.active} source-current=${cleanupTimerStatus.sourceCurrent}`, `Pi peer launcher: ${PI_PEER_LAUNCHER}`, `Adapter readiness launcher: ${ADAPTER_READINESS_LAUNCHER}`, `OpenCode peer launcher: ${OPENCODE_PEER_LAUNCHER}`, `OpenCode Intercom plugin: ${opencodeIntercomPlugin}`, `adapter versions: ${adapterDrift.length ? `${adapterDrift.map((adapter) => `${adapter.id}=${adapter.current ?? "missing"}->${adapter.latest ?? "unknown"}`).join(", ")} — run agent_fleet update for commands` : "coordinated"}`, `permission profiles: ${Object.keys(config.permissionProfiles).sort().join(", ")}`, `config: ${configPath}`, `state: ${statePath}`, `untracked worker units: ${untrackedUnits.length ? untrackedUnits.join(", ") : "none"}`, ...profileLines].join("\n"),
+          { systemd: available, managerHealth, admissionReason, lock, claimCount, cleanup, systemdVersion: installedSystemdVersion, bubblewrapAvailable, hardenedProfilesReady, managedUserNamespaces, cleanupTimerStatus, piPeerLauncher: PI_PEER_LAUNCHER, adapterReadinessLauncher: ADAPTER_READINESS_LAUNCHER, opencodePeerLauncher: OPENCODE_PEER_LAUNCHER, opencodeIntercomPlugin, adapters, configPath, statePath, untrackedUnits },
         );
       }
 
@@ -2832,7 +2913,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       }
       if (ctx.hasUI && !(await ctx.ui.confirm("Apply worker cleanup?", summary))) return;
       const result = await cleanupExpired(true);
-      ctx.ui.notify(`Applied ${result.handled.length} cleanup action${result.handled.length === 1 ? "" : "s"}${result.errors.length ? `; ${result.errors.length} failed safely` : ""}.`, result.errors.length ? "warning" : "info");
+      if (result.skipped === "in_progress") {
+        ctx.ui.notify("Cleanup skipped because another cleanup run is in progress.", "info");
+        return;
+      }
+      ctx.ui.notify(`Applied ${result.handled.length} cleanup action${result.handled.length === 1 ? "" : "s"}${result.errors.length ? `; ${result.errors.length} failed safely` : ""}${result.deferred.length ? `; ${result.deferred.length} deferred safely` : ""}.`, result.errors.length || result.deferred.length ? "warning" : "info");
     },
   });
 
