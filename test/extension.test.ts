@@ -258,6 +258,10 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     assert.match(diagnosed.content[0].text, /manager: harness=pi; profile=pi-peer; model=provider\/manager; effort=high/);
     assert.match(diagnosed.content[0].text, /worker: harness=pi; profile=pi-peer; model=provider\/worker; effort=medium/);
     assert.match(diagnosed.content[0].text, /models: warning/);
+    await assert.rejects(
+      tools.get("boss").execute("boss-source-without-worktree", { action: "create", goal: "invalid explicit source", sourcePath: resources[1][0], requirements: { edit: true } }, new AbortController().signal, () => {}, ctx),
+      /sourcePath requires an explicit worktree/,
+    );
     const blocked = await tools.get("boss").execute(
       "boss-capability-gap-test",
       { action: "create", goal: "test and publish through Git", requirements: { tests: true, gitTransport: "write" } },
@@ -288,7 +292,7 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     );
     const created = await tools.get("boss").execute(
       "boss-launch-test",
-      { action: "create", goal: "ship supervised Ralph loops", requirements: { worktree: "write", edit: true } },
+      { action: "create", goal: "ship supervised Ralph loops", sourcePath: resources[1][0], requirements: { worktree: "write", edit: true } },
       new AbortController().signal,
       () => {},
       ctx,
@@ -310,6 +314,7 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     const canonicalCwd = created.details.run.resource.path as string;
     assert.equal(created.details.run.resource.revision, 1);
     assert.equal(canonicalCwd, join(agentDir, "boss-worktrees", bossRunId));
+    assert.equal(created.details.run.resource.gitCommonDirectory, join(resources[1][0], ".git"), "explicit sourcePath selects the source repository without attaching it as the run cwd");
     assert.deepEqual(created.details.run.assignments.map((assignment: any) => assignment.resourceRevision), [1, 1, 1]);
     const suffix = bossRunId.slice(-12);
     const orchestratorExtension = new URL("../src/index.ts", import.meta.url).pathname;

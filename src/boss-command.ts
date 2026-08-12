@@ -28,7 +28,7 @@ export interface BossCreateRequirements {
 export type BossCommandRequest =
   | { action: "status"; bossRunId?: string }
   | { action: "doctor" | "plan" }
-  | { action: "create"; goal: string; requirements?: BossCreateRequirements }
+  | { action: "create"; goal: string; requirements?: BossCreateRequirements; sourcePath?: string }
   | { action: "freeze"; bossRunId: string; expectedAcceptanceRevision: number; expectedDesignRevision: number }
   | { action: "unfreeze"; bossRunId: string; expectedFreezeRevision: number; expectedFingerprintSha256: string }
   | { action: "resume" | "pause" | "cancel" | "proof" | "approve" | "reject"; bossRunId: string; note?: string };
@@ -48,7 +48,7 @@ export function parseBossRunId(value: string | undefined): string {
   return id;
 }
 
-export function bossCreateRequest(goal: string | undefined, requirements?: BossCreateRequirements): BossCommandRequest {
+export function bossCreateRequest(goal: string | undefined, requirements?: BossCreateRequirements, sourcePath?: string): BossCommandRequest {
   const normalizedGoal = goal?.trim() ?? "";
   if (!normalizedGoal) throw new Error("Boss create requires one explicit goal.");
   if (requirements !== undefined && (requirements === null || typeof requirements !== "object" || Array.isArray(requirements))) {
@@ -67,10 +67,14 @@ export function bossCreateRequest(goal: string | undefined, requirements?: BossC
     ...(requirements?.tests ? { tests: true } : {}),
     ...(requirements?.gitTransport ? { gitTransport: requirements.gitTransport } : {}),
   };
+  const normalizedSourcePath = sourcePath?.trim() || undefined;
+  if (normalizedSourcePath && !normalizedSourcePath.startsWith("/")) throw new Error("Boss create sourcePath must be absolute.");
+  if (normalizedSourcePath && !normalizedRequirements.worktree) throw new Error("Boss create sourcePath requires an explicit worktree read or write requirement.");
   return {
     action: "create",
     goal: normalizedGoal,
     ...(Object.keys(normalizedRequirements).length ? { requirements: normalizedRequirements } : {}),
+    ...(normalizedSourcePath ? { sourcePath: normalizedSourcePath } : {}),
   };
 }
 
