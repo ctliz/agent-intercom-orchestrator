@@ -29,6 +29,7 @@ const LOCK_STALE_MS = 120_000;
 const DEFAULT_LOCK_TIMEOUT_MS = 30_000;
 const LOCK_RETRY_MIN_MS = 20;
 const LOCK_RETRY_JITTER_MS = 20;
+const LOCK_LIVE_BACKOFF_MAX_MS = 500;
 const LOCK_RELEASE_TOMBSTONE_MAX_AGE_MS = 120_000;
 const LOCK_RELEASE_TOMBSTONE_MARKER = ".released.";
 
@@ -1157,7 +1158,7 @@ export class WorkerStore {
     if (collected) this.metric("tombstone_gc", startedAt, "ok");
   }
 
-  private async inspectFreshLiveLock(lockPath: string, ownerPath: string): Promise<{ live: boolean; ownerPid?: number; ownerAlive?: boolean; lockAgeMs?: number }> {
+  private async inspectLiveLockOwner(lockPath: string, ownerPath: string): Promise<{ live: boolean; ownerPid?: number; ownerAlive?: boolean; lockAgeMs?: number }> {
     try {
       const lockStat = await stat(lockPath);
       const lockAgeMs = Math.max(0, this.options.now() - lockStat.mtimeMs);
@@ -1171,7 +1172,10 @@ export class WorkerStore {
         // Guarded inspection remains authoritative for missing/partial owners.
       }
       const ownerAlive = ownerPid === undefined ? undefined : isProcessAlive(ownerPid);
-      return { live: ownerAlive === true && lockAgeMs <= LOCK_STALE_MS, ownerPid, ownerAlive, lockAgeMs };
+      // A verified live PID is authoritative regardless of directory age. Lock
+      // age is only a fail-closed fallback when owner metadata is absent or
+      // malformed; it must never send a live owner into reclaim-guard churn.
+      return { live: ownerAlive === true, ownerPid, ownerAlive, lockAgeMs };
     } catch (error) {
       if (errorCode(error) === "ENOENT") return { live: false };
       throw error;
@@ -1179,7 +1183,7 @@ export class WorkerStore {
   }
 
   async inspectLock(): Promise<WorkerStoreLockDiagnostics> {
-    const lock = await this.inspectFreshLiveLock(`${this.path}.lock`, `${this.path}.lock/owner.json`);
+    const lock = await this.inspectLiveLockOwner(`${this.path}.lock`, `${this.path}.lock/owner.json`);
     return {
       present: lock.lockAgeMs !== undefined,
       ...(lock.ownerPid !== undefined ? { ownerPid: lock.ownerPid } : {}),
@@ -1198,6 +1202,7 @@ export class WorkerStore {
     let lastOwnerPid: number | undefined;
     let lastOwnerAlive: boolean | undefined;
     let lastLockAgeMs: number | undefined;
+    let liveBackoffMs = LOCK_RETRY_MIN_MS;
     while (Date.now() - startedAt < this.options.lockTimeoutMs) {
       const remainingMs = this.options.lockTimeoutMs - (Date.now() - startedAt);
       if (remainingMs <= 0) break;
@@ -1216,7 +1221,7 @@ export class WorkerStore {
         if (errorCode(error) !== "EEXIST") throw error;
       }
       if (!acquired) {
-        const precheck = await this.inspectFreshLiveLock(lockPath, ownerPath);
+        const precheck = await this.inspectLiveLockOwner(lockPath, ownerPath);
         lastOwnerPid = precheck.ownerPid;
         lastOwnerAlive = precheck.ownerAlive;
         lastLockAgeMs = precheck.lockAgeMs;
@@ -1224,10 +1229,12 @@ export class WorkerStore {
           this.metric("lock_live_backoff", this.options.instrumentation ? process.hrtime.bigint() : undefined, "ok");
           const retryBudgetMs = this.options.lockTimeoutMs - (Date.now() - startedAt);
           if (retryBudgetMs <= 0) break;
-          const retryMs = LOCK_RETRY_MIN_MS + Math.floor(Math.random() * (LOCK_RETRY_JITTER_MS + 1));
+          const retryMs = liveBackoffMs + Math.floor(Math.random() * (LOCK_RETRY_JITTER_MS + 1));
           await delay(Math.min(retryMs, retryBudgetMs));
+          liveBackoffMs = Math.min(LOCK_LIVE_BACKOFF_MAX_MS, liveBackoffMs * 2);
           continue;
         }
+        liveBackoffMs = LOCK_RETRY_MIN_MS;
         let releaseGuard: () => Promise<void>;
         const guardStartedAt = this.options.instrumentation ? process.hrtime.bigint() : undefined;
         try {
