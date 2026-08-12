@@ -9,6 +9,13 @@ function commandResult() {
   return { stdout: "", stderr: "", code: 0, killed: false };
 }
 
+test("typed Boss notes preserve content but reject whitespace-only placeholders", async () => {
+  const { normalizeBossToolNote } = await import("../src/index.ts");
+  assert.equal(normalizeBossToolNote(undefined), undefined);
+  assert.equal(normalizeBossToolNote("   "), undefined);
+  assert.equal(normalizeBossToolNote("  exact review note  "), "exact review note");
+});
+
 test("empty RPC bootstrap detection defers only known-empty discovery sessions", async () => {
   const { isEmptyRpcBootstrapSession } = await import("../src/index.ts");
   const context = (mode: string, entries?: Array<{ type?: string }>) => ({

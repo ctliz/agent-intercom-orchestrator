@@ -176,6 +176,11 @@ function managerSessionId(ctx: ExtensionContext): string {
   return ctx.sessionManager.getSessionId() || ctx.sessionManager.getSessionFile() || `process-${process.pid}`;
 }
 
+export function normalizeBossToolNote(note: string | undefined): string | undefined {
+  const normalized = note?.trim();
+  return normalized || undefined;
+}
+
 export function isEmptyRpcBootstrapSession(ctx: ExtensionContext): boolean {
   if (ctx.mode !== "rpc") return false;
   const sessionManager = ctx.sessionManager as typeof ctx.sessionManager & {
@@ -2553,6 +2558,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       // require placeholders for fields that are irrelevant to this action;
       // those placeholders must remain inert rather than becoming authority or
       // accidental doctor/plan arguments.
+      const normalizedNote = normalizeBossToolNote(params.note);
       const request: BossCommandRequest = params.action === "create"
         ? bossCreateRequest(params.goal, params.requirements ?? undefined)
         : params.action === "doctor" || params.action === "plan"
@@ -2566,7 +2572,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
                 : {
                     action: params.action,
                     bossRunId: parseBossRunId(params.bossRunId),
-                    ...(params.note ? { note: params.note } : {}),
+                    ...(normalizedNote ? { note: normalizedNote } : {}),
                   };
       const result = await executeTrustedLocalBoss(request, ctx);
       return {
