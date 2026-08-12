@@ -473,6 +473,31 @@ test("owner metadata write failure removes the incomplete uncontended claim", as
   }
 });
 
+test("failed fast-path cleanup cannot delete a replacement lock owner", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v2-failed-claim-replacement-"));
+  const path = join(root, "workers.json");
+  const lockPath = `${path}.lock`;
+  const ownerPath = `${lockPath}/owner.json`;
+  try {
+    const store = new WorkerStore(path);
+    const instrumented = store as unknown as {
+      writeLockOwner(ownerPath: string, token: string): Promise<void>;
+    };
+    instrumented.writeLockOwner = async () => {
+      await rm(lockPath, { recursive: true, force: true });
+      await mkdir(lockPath, { mode: 0o700 });
+      await writeFile(ownerPath, `${JSON.stringify({ pid: process.pid, token: "replacement-owner", createdAt: Date.now() })}\n`);
+      throw new Error("simulated replaced claim");
+    };
+
+    await assert.rejects(store.compareAndSwap(0, () => undefined), /simulated replaced claim/);
+    const owner = JSON.parse(await readFile(ownerPath, "utf8")) as { token?: unknown };
+    assert.equal(owner.token, "replacement-owner");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("contended acquisition retries mkdir under the guard after an owner release race", async () => {
   const root = await mkdtemp(join(tmpdir(), "worker-store-v2-release-race-"));
   const path = join(root, "workers.json");

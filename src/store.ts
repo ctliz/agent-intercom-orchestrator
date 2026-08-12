@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdir, open, readFile, rename, rm, stat } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm, rmdir, stat } from "node:fs/promises";
 import { dirname } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { types as utilTypes } from "node:util";
@@ -993,8 +993,12 @@ export class WorkerStore {
 
   /**
    * Read only a healthy canonical v3 snapshot without touching the writer lock.
-   * Any absence, legacy schema, or parse ambiguity is deliberately retried under
-   * the lock, where migration/quarantine ordering remains authoritative.
+   * This is an atomic-file snapshot, not a writer-linearizable or crash-durable
+   * observation: it may see the state immediately before an in-flight commit or
+   * after rename but before the writer's directory fsync completes. Callers that
+   * mutate still revalidate under the writer lock. Any absence, legacy schema,
+   * or parse ambiguity is deliberately retried under the lock, where migration
+   * and quarantine ordering remains authoritative.
    */
   private async loadCanonicalV3LockFree(): Promise<WorkerStateFileV3 | undefined> {
     const poisonBefore = await this.readPoisonMarker();
@@ -1051,12 +1055,45 @@ export class WorkerStore {
 
   private async writeLockOwner(ownerPath: string, token: string): Promise<void> {
     // Owner metadata is advisory for stale-lock diagnostics and recovery, not
-    // committed state. A fresh owner-less directory fails closed until stale.
+    // committed state. A fresh owner-less directory fails closed until stale;
+    // after a crash, missing or partial metadata can therefore delay recovery
+    // until LOCK_STALE_MS rather than permitting immediate dead-PID detection.
     const ownerHandle = await open(ownerPath, "wx", 0o600);
     try {
       await ownerHandle.writeFile(`${JSON.stringify({ pid: process.pid, token, createdAt: this.options.now() })}\n`, "utf8");
     } finally {
       await ownerHandle.close();
+    }
+  }
+
+  private async confirmLockOwner(ownerPath: string, token: string): Promise<void> {
+    try {
+      const owner = JSON.parse(await readFile(ownerPath, "utf8")) as { token?: unknown };
+      if (owner.token !== token) throw new Error("token mismatch");
+    } catch (error) {
+      throw new WorkerStoreError(`Could not confirm worker state lock owner ${ownerPath}: ${errorText(error)}`, "WORKER_STORE_LOCK_FAILED");
+    }
+  }
+
+  private async cleanupFailedLockClaim(lockPath: string, ownerPath: string, token: string, guardHeld = false): Promise<void> {
+    const releaseGuard = guardHeld ? async () => undefined : await this.acquireLockMutationGuard(lockPath);
+    try {
+      try {
+        const owner = JSON.parse(await readFile(ownerPath, "utf8")) as { token?: unknown };
+        if (owner.token !== token) return;
+        await rm(lockPath, { recursive: true, force: true });
+        await this.syncDirectory(lockPath);
+      } catch (error) {
+        if (errorCode(error) !== "ENOENT") return;
+        try {
+          await rmdir(lockPath);
+          await this.syncDirectory(lockPath);
+        } catch (removeError) {
+          if (errorCode(removeError) !== "ENOENT" && errorCode(removeError) !== "ENOTEMPTY" && errorCode(removeError) !== "EEXIST") throw removeError;
+        }
+      }
+    } finally {
+      await releaseGuard();
     }
   }
 
@@ -1077,9 +1114,10 @@ export class WorkerStore {
         await mkdir(lockPath, { recursive: false, mode: 0o700 });
         try {
           await this.writeLockOwner(ownerPath, token);
+          await this.confirmLockOwner(ownerPath, token);
           acquired = true;
         } catch (error) {
-          await rm(lockPath, { recursive: true, force: true });
+          await this.cleanupFailedLockClaim(lockPath, ownerPath, token);
           throw error;
         }
       } catch (error) {
@@ -1100,9 +1138,10 @@ export class WorkerStore {
             await mkdir(lockPath, { recursive: false, mode: 0o700 });
             try {
               await this.writeLockOwner(ownerPath, token);
+              await this.confirmLockOwner(ownerPath, token);
               acquired = true;
             } catch (error) {
-              await rm(lockPath, { recursive: true, force: true });
+              await this.cleanupFailedLockClaim(lockPath, ownerPath, token, true);
               throw error;
             }
           } catch (error) {
