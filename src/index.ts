@@ -2553,6 +2553,10 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       note: Type.Optional(Type.String({ description: "Optional control or decision note." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      // Empty RPC discovery sessions deliberately defer heavy startup. A real
+      // typed Boss call is an execution boundary, so establish the exact
+      // Controller session and event bridge before readiness or mutation.
+      await initializeSession(ctx);
       if (params.action !== "create" && params.requirements !== undefined && params.requirements !== null) throw new Error("Boss create requirements are accepted only for action=create; use null as the explicit strict-schema absence placeholder.");
       // Dispatch by action instead of reconstructing the interactive `/boss`
       // command from every populated schema field. Strict-schema clients may
