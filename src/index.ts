@@ -618,7 +618,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   const managerOwnerContext = configuredManagerContext === "opencode" || configuredManagerContext === "headless_cli" ? configuredManagerContext : "pi";
   const store = new WorkerStore(statePath, {
     legacyManagerContext: managerOwnerContext,
-    instrumentation: (metric) => console.error(`[agent-intercom-orchestrator] worker_store operation=${metric.operation} outcome=${metric.outcome} duration_ms=${metric.durationMs.toFixed(3)}${metric.bytes === undefined ? "" : ` bytes=${metric.bytes}`}`),
+    ...(process.env.AGENT_INTERCOM_ORCHESTRATOR_METRICS === "1"
+      ? { instrumentation: (metric) => console.error(`[agent-intercom-orchestrator] worker_store operation=${metric.operation} outcome=${metric.outcome} duration_ms=${metric.durationMs.toFixed(3)}${metric.bytes === undefined ? "" : ` bytes=${metric.bytes}`}`) }
+      : {}),
   });
   const trustedLocalBossStore = new TrustedLocalBossStore(trustedLocalBossStatePath);
   const runner = runnerFor(pi);
