@@ -40,7 +40,7 @@ export interface BossCommandContextLike {
 
 const BOSS_RUN_ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{7,127}$/;
 
-function parseRunId(value: string | undefined): string {
+export function parseBossRunId(value: string | undefined): string {
   const id = value?.trim() ?? "";
   if (!BOSS_RUN_ID.test(id)) {
     throw new Error("Boss run id must be 8-128 characters using letters, numbers, dot, underscore, or dash.");
@@ -93,10 +93,10 @@ export function parseBossCommand(input: string): BossCommandRequest {
     return { action };
   }
   if (action === "status") {
-    return remainder ? { action, bossRunId: parseRunId(remainder) } : { action };
+    return remainder ? { action, bossRunId: parseBossRunId(remainder) } : { action };
   }
   const parts = remainder.split(/\s+/).filter(Boolean);
-  const id = parseRunId(parts[0]);
+  const id = parseBossRunId(parts[0]);
   if (action === "freeze") {
     if (parts.length !== 3 || !/^\d+$/.test(parts[1] ?? "") || !/^\d+$/.test(parts[2] ?? "")) throw new Error("/boss freeze requires: <run> <expected-acceptance-revision> <expected-design-revision>.");
     const expectedAcceptanceRevision = Number(parts[1]);

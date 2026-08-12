@@ -9,7 +9,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DEFAULT_CONFIG, readConfig, resolveProfileCommand, writeConfigDefaults } from "./config.ts";
 import { observeBossCandidateFingerprint } from "./boss-candidate-fingerprint.ts";
-import { BOSS_CREATE_ACCESS_LEVELS, assertDirectInteractiveBossCommand, bossCreateRequest, parseBossCommand, type BossCommandRequest } from "./boss-command.ts";
+import { BOSS_CREATE_ACCESS_LEVELS, assertDirectInteractiveBossCommand, bossCreateRequest, parseBossCommand, parseBossRunId, type BossCommandRequest } from "./boss-command.ts";
 import { formatBossCreateCapabilityReport, inspectBossCreateCapabilities, type BossCreateCapabilityReport } from "./boss-create-capabilities.ts";
 import { cleanupProvisionedBossResource, observeProvisionedBossResource, preserveProvisionedBossResource, provisionBossLinkedWorktree, rollbackProvisionedBossWorktree, type ProvisionedBossWorktree } from "./boss-resource.ts";
 import { formatBossReadinessReport, formatBossSetupReport, inspectBossSetup, inspectTrustedLocalBossReadiness } from "./boss-setup.ts";
@@ -174,6 +174,11 @@ function textResult(text: string, details?: unknown) {
 
 function managerSessionId(ctx: ExtensionContext): string {
   return ctx.sessionManager.getSessionId() || ctx.sessionManager.getSessionFile() || `process-${process.pid}`;
+}
+
+export function normalizeBossToolNote(note: string | undefined): string | undefined {
+  const normalized = note?.trim();
+  return normalized || undefined;
 }
 
 export function isEmptyRpcBootstrapSession(ctx: ExtensionContext): boolean {
@@ -2548,13 +2553,27 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (params.action !== "create" && params.requirements !== undefined && params.requirements !== null) throw new Error("Boss create requirements are accepted only for action=create; use null as the explicit strict-schema absence placeholder.");
-      const request = params.action === "create"
+      // Dispatch by action instead of reconstructing the interactive `/boss`
+      // command from every populated schema field. Strict-schema clients may
+      // require placeholders for fields that are irrelevant to this action;
+      // those placeholders must remain inert rather than becoming authority or
+      // accidental doctor/plan arguments.
+      const normalizedNote = normalizeBossToolNote(params.note);
+      const request: BossCommandRequest = params.action === "create"
         ? bossCreateRequest(params.goal, params.requirements ?? undefined)
-        : params.action === "freeze"
-          ? parseBossCommand(`freeze ${params.bossRunId ?? ""} ${params.expectedAcceptanceRevision ?? ""} ${params.expectedDesignRevision ?? ""}`)
-          : params.action === "unfreeze"
-            ? parseBossCommand(`unfreeze ${params.bossRunId ?? ""} ${params.expectedFreezeRevision ?? ""} ${params.expectedFingerprintSha256 ?? ""}`)
-            : parseBossCommand(`${params.action}${params.bossRunId ? ` ${params.bossRunId}` : ""}${params.note ? ` ${params.note}` : ""}`);
+        : params.action === "doctor" || params.action === "plan"
+          ? { action: params.action }
+          : params.action === "status"
+            ? parseBossCommand(`status${params.bossRunId ? ` ${params.bossRunId}` : ""}`)
+            : params.action === "freeze"
+              ? parseBossCommand(`freeze ${params.bossRunId ?? ""} ${params.expectedAcceptanceRevision ?? ""} ${params.expectedDesignRevision ?? ""}`)
+              : params.action === "unfreeze"
+                ? parseBossCommand(`unfreeze ${params.bossRunId ?? ""} ${params.expectedFreezeRevision ?? ""} ${params.expectedFingerprintSha256 ?? ""}`)
+                : {
+                    action: params.action,
+                    bossRunId: parseBossRunId(params.bossRunId),
+                    ...(normalizedNote ? { note: normalizedNote } : {}),
+                  };
       const result = await executeTrustedLocalBoss(request, ctx);
       return {
         content: [{ type: "text", text: result.message }],

@@ -9,6 +9,13 @@ function commandResult() {
   return { stdout: "", stderr: "", code: 0, killed: false };
 }
 
+test("typed Boss notes preserve content but reject whitespace-only placeholders", async () => {
+  const { normalizeBossToolNote } = await import("../src/index.ts");
+  assert.equal(normalizeBossToolNote(undefined), undefined);
+  assert.equal(normalizeBossToolNote("   "), undefined);
+  assert.equal(normalizeBossToolNote("  exact review note  "), "exact review note");
+});
+
 test("empty RPC bootstrap detection defers only known-empty discovery sessions", async () => {
   const { isEmptyRpcBootstrapSession } = await import("../src/index.ts");
   const context = (mode: string, entries?: Array<{ type?: string }>) => ({
@@ -231,10 +238,20 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     assert.equal(execCalls, initializedExecCalls, "fresh per-emission contexts for one session must not repeat orchestration initialization");
     await assert.rejects(lifecycle.get("before_agent_start")?.({}, { ...ctx, sessionManager: { ...ctx.sessionManager, getSessionId: () => "different-controller" } }), /session changed .* before shutdown/);
     assert.match(JSON.stringify(tools.get("boss").parameters.properties.requirements), /\"type\":\"null\"/, "strict-schema callers need an explicit absence placeholder");
-    const planned = await tools.get("boss").execute("boss-plan-test", { action: "plan", requirements: null }, new AbortController().signal, () => {}, ctx);
+    const strictPlaceholders = {
+      goal: "strict-schema placeholder that must remain inert",
+      requirements: null,
+      bossRunId: "",
+      expectedAcceptanceRevision: 1,
+      expectedDesignRevision: 1,
+      expectedFreezeRevision: 1,
+      expectedFingerprintSha256: "0".repeat(64),
+      note: "strict-schema placeholder that must not become a doctor/plan argument",
+    };
+    const planned = await tools.get("boss").execute("boss-plan-test", { action: "plan", ...strictPlaceholders }, new AbortController().signal, () => {}, ctx);
     assert.match(planned.content[0].text, /Orc Boss setup plan: ready/);
     assert.match(planned.content[0].text, /No automatic install changes are proposed/);
-    const diagnosed = await tools.get("boss").execute("boss-doctor-test", { action: "doctor", requirements: null }, new AbortController().signal, () => {}, ctx);
+    const diagnosed = await tools.get("boss").execute("boss-doctor-test", { action: "doctor", ...strictPlaceholders }, new AbortController().signal, () => {}, ctx);
     assert.match(diagnosed.content[0].text, /Orc Boss trusted-local readiness: warning/);
     assert.match(diagnosed.content[0].text, /required-stack: ready/);
     assert.match(diagnosed.content[0].text, /topology: Manager, Worker, Scout, and Adversary launch as independent Pi peers pinned to profile=pi-peer/);
@@ -257,8 +274,18 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     assert.deepEqual(blocked.details.gaps, blocked.details.capabilityReport.probes);
     assert.match(blocked.content[0].text, /BOSS_CAPABILITY_GAP:[\s\S]*No Boss run was created/);
     assert.equal(launches.length, 0, "a requested capability gap must fail before staffing");
-    const afterGap = await tools.get("boss").execute("boss-after-gap-status", { action: "status" }, new AbortController().signal, () => {}, ctx);
+    const afterGap = await tools.get("boss").execute("boss-after-gap-status", { action: "status", ...strictPlaceholders }, new AbortController().signal, () => {}, ctx);
     assert.match(afterGap.content[0].text, /No Boss runs are owned by this Controller/);
+    await assert.rejects(
+      tools.get("boss").execute("boss-missing-id-placeholder", { action: "pause", ...strictPlaceholders }, new AbortController().signal, () => {}, ctx),
+      /Boss run id must be/,
+      "an irrelevant note placeholder must never become a mutation target",
+    );
+    await assert.rejects(
+      tools.get("boss").execute("boss-nonexact-id", { action: "cancel", ...strictPlaceholders, bossRunId: "boss-valid extra" }, new AbortController().signal, () => {}, ctx),
+      /Boss run id must be/,
+      "typed mutation IDs must be validated as the exact supplied field rather than tokenized",
+    );
     const created = await tools.get("boss").execute(
       "boss-launch-test",
       { action: "create", goal: "ship supervised Ralph loops", requirements: { worktree: "write", edit: true } },
