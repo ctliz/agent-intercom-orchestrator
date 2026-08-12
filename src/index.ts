@@ -2242,7 +2242,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         try {
           provisionedWorktree = await provisionBossLinkedWorktree({
             bossRunId,
-            sourceCwd: ctx.cwd,
+            sourceCwd: request.sourcePath ?? ctx.cwd,
             leaseRoot: config.boss.worktreeRoot,
             observe: async (provisioned) => {
               capabilityReport = await inspectBossCreateCapabilities({
@@ -2280,7 +2280,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
         }
       } else {
         if (request.requirements) {
-          capabilityReport = await inspectBossCreateCapabilities({ cwd: ctx.cwd, requirements: request.requirements, workerPermissionProfileName, workerPermissionProfile: workerPermissionProfile! });
+          capabilityReport = await inspectBossCreateCapabilities({ cwd: request.sourcePath ?? ctx.cwd, requirements: request.requirements, workerPermissionProfileName, workerPermissionProfile: workerPermissionProfile! });
           if (capabilityReport.status === "blocked") return { title: "Boss create capability gap", message: `BOSS_CAPABILITY_GAP:\n${formatBossCreateCapabilityReport(capabilityReport)}`, capabilityReport, created: false };
         }
         result = await trustedLocalBossStore.execute(request, managerSessionId(ctx));
@@ -2528,13 +2528,14 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use boss when the user asks the top-level Pi Controller to create or manage a Boss run; do not ask the user to type /boss.",
       "Boss runs use trusted-local advisory scoping, not protected or tamper-proof authority.",
-      "Pass structured create requirements only when the user explicitly requested those worktree, edit, test, or Git transport needs; never infer them from goal text. Strict-schema clients may pass `requirements: null` for non-create actions; null means absent authority and is never a create requirement.",
+      "Pass structured create requirements only when the user explicitly requested those worktree, edit, test, or Git transport needs; never infer them from goal text. Strict-schema clients may pass `requirements: null` for non-create actions; null means absent authority and is never a create requirement. When the Controller cwd is not the intended repository, create may use an explicit absolute `sourcePath` only together with a worktree requirement; Boss validates its canonical Git identity and still provisions a fresh run-owned worktree rather than attaching an existing one.",
       "Boss participants are independent Pi peers using the pre-onboarded Manager, Worker, Scout, and Adversary model/effort choices. Do not describe Boss as a Codex/Claude/OpenCode harness with native subagents, and do not imply per-run model overrides exist.",
       "Use exact bossRunId values returned by boss for status, pause, resume, freeze, unfreeze, proof, approval, rejection, and cancellation.",
     ],
     parameters: Type.Object({
       action: StringEnum(["create", "doctor", "plan", "status", "resume", "pause", "freeze", "unfreeze", "cancel", "proof", "approve", "reject"] as const),
       goal: Type.Optional(Type.String({ description: "Explicit goal; required for create." })),
+      sourcePath: Type.Optional(Type.String({ description: "Explicit absolute Git source checkout for create with a worktree requirement. Boss provisions a new run-owned canonical worktree; it does not attach this path." })),
       requirements: Type.Optional(Type.Union([
         Type.Null({ description: "Explicit absence placeholder for strict-schema clients. Required capabilities are never inferred from null." }),
         Type.Object({
@@ -2560,7 +2561,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
       // accidental doctor/plan arguments.
       const normalizedNote = normalizeBossToolNote(params.note);
       const request: BossCommandRequest = params.action === "create"
-        ? bossCreateRequest(params.goal, params.requirements ?? undefined)
+        ? bossCreateRequest(params.goal, params.requirements ?? undefined, params.sourcePath)
         : params.action === "doctor" || params.action === "plan"
           ? { action: params.action }
           : params.action === "status"

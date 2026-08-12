@@ -55,6 +55,9 @@ test("Boss tool create requirements use only explicit structured fields", () => 
     requirements: { worktree: "write", edit: true, tests: true },
   });
   assert.deepEqual(bossCreateRequest("inspect only", { edit: false, tests: false }), { action: "create", goal: "inspect only" });
+  assert.deepEqual(bossCreateRequest("provision explicitly", { worktree: "write" }, "  /srv/source/repo  "), { action: "create", goal: "provision explicitly", requirements: { worktree: "write" }, sourcePath: "/srv/source/repo" });
+  assert.throws(() => bossCreateRequest("work", { worktree: "write" }, "relative/repo"), /sourcePath must be absolute/);
+  assert.throws(() => bossCreateRequest("work", { edit: true }, "/srv/source/repo"), /sourcePath requires an explicit worktree/);
   assert.throws(() => bossCreateRequest("", { edit: true }), /requires one explicit goal/);
   assert.throws(() => bossCreateRequest("work", ["edit"] as any), /structured object/);
   assert.throws(() => bossCreateRequest("work", { worktree: "execute" } as any), /must be read or write/);
