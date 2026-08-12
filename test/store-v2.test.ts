@@ -427,7 +427,7 @@ test("CAS fences stale writers and a new incarnation advances workerGeneration",
   }
 });
 
-test("owned worker lock release uses an unbounded mutation guard wait", async () => {
+test("uncontended acquisition skips the mutation guard while owned release waits unbounded", async () => {
   const root = await mkdtemp(join(tmpdir(), "worker-store-v2-release-guard-"));
   const path = join(root, "workers.json");
   try {
@@ -442,8 +442,62 @@ test("owned worker lock release uses an unbounded mutation guard wait", async ()
       return await original(lockPath, timeoutMs);
     };
     await store.compareAndSwap(0, () => undefined);
-    assert.deepEqual(timeouts, [30_000, undefined]);
+    assert.deepEqual(timeouts, [undefined]);
     await assert.rejects(access(`${path}.lock`), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("owner metadata write failure removes the incomplete uncontended claim", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v2-owner-write-failure-"));
+  const path = join(root, "workers.json");
+  try {
+    const store = new WorkerStore(path);
+    const instrumented = store as unknown as {
+      writeLockOwner(ownerPath: string, token: string): Promise<void>;
+    };
+    const original = instrumented.writeLockOwner.bind(store);
+    instrumented.writeLockOwner = async () => {
+      throw new Error("simulated owner metadata failure");
+    };
+    await assert.rejects(store.compareAndSwap(0, () => undefined), /simulated owner metadata failure/);
+    await assert.rejects(access(`${path}.lock`), { code: "ENOENT" });
+
+    instrumented.writeLockOwner = original;
+    await store.compareAndSwap(0, () => undefined);
+    assert.equal((await store.read()).generation, 1);
+    await assert.rejects(access(`${path}.lock`), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("contended acquisition retries mkdir under the guard after an owner release race", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v2-release-race-"));
+  const path = join(root, "workers.json");
+  const lockPath = `${path}.lock`;
+  try {
+    await mkdir(lockPath, { mode: 0o700 });
+    await writeFile(`${lockPath}/owner.json`, `${JSON.stringify({ pid: process.pid, token: "releasing-owner", createdAt: Date.now() })}\n`);
+    const store = new WorkerStore(path);
+    const instrumented = store as unknown as {
+      acquireLockMutationGuard(lockPath: string, timeoutMs?: number): Promise<() => Promise<void>>;
+    };
+    const original = instrumented.acquireLockMutationGuard.bind(store);
+    let simulatedRelease = false;
+    instrumented.acquireLockMutationGuard = async (candidatePath, timeoutMs) => {
+      if (!simulatedRelease && timeoutMs !== undefined) {
+        simulatedRelease = true;
+        await rm(candidatePath, { recursive: true, force: true });
+      }
+      return await original(candidatePath, timeoutMs);
+    };
+
+    await store.compareAndSwap(0, () => undefined);
+    assert.equal(simulatedRelease, true);
+    assert.equal((await store.read()).generation, 1);
+    await assert.rejects(access(lockPath), { code: "ENOENT" });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -580,6 +634,136 @@ test("forgotten worker ids retain generation history across later reuse", async 
     snapshot = await store.read();
     assert.equal(snapshot.workers[0].workerGeneration, 2);
     assert.deepEqual(snapshot.workerGenerations, [{ workerId: "reused", generation: 2 }]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("removing an absent worker is a no-op without a generation bump or write", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-absent-remove-"));
+  const path = join(root, "workers.json");
+  try {
+    const store = new WorkerStore(path);
+    await store.upsert(apiWorker("present"));
+    const before = await readFile(path, "utf8");
+    assert.equal(await store.remove("absent"), false);
+    assert.equal(await readFile(path, "utf8"), before);
+    assert.equal((await store.read()).generation, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("healthy canonical v3 reads are lock-free and detached", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-lock-free-read-"));
+  const path = join(root, "workers.json");
+  try {
+    await new WorkerStore(path).upsert(apiWorker("fast-read"));
+    await rm(`${path}.lock.reclaim`, { force: true });
+    const metrics: Array<{ operation: string }> = [];
+    const store = new WorkerStore(path, { instrumentation: (metric) => metrics.push(metric) });
+    const snapshot = await store.read();
+    snapshot.workers[0].task = "memory-only";
+    assert.equal((await store.read()).workers[0].task, "task-fast-read");
+    assert.equal(metrics.filter((metric) => metric.operation === "lock_wait").length, 0);
+    await assert.rejects(access(`${path}.lock`), { code: "ENOENT" });
+    await assert.rejects(access(`${path}.lock.reclaim`), { code: "ENOENT" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("lock-free reads fail closed when poison appears after the state snapshot", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-lock-free-poison-race-"));
+  const path = join(root, "workers.json");
+  try {
+    await new WorkerStore(path).upsert(apiWorker("poison-race"));
+    const store = new WorkerStore(path);
+    const instrumented = store as unknown as {
+      readPoisonMarker(): Promise<{ version: 1; kind: "corrupt"; statePath: string; detectedAt: number; reason: string } | undefined>;
+    };
+    let checks = 0;
+    instrumented.readPoisonMarker = async () => {
+      checks += 1;
+      return checks === 2
+        ? { version: 1, kind: "corrupt", statePath: path, detectedAt: 1, reason: "injected post-snapshot poison" }
+        : undefined;
+    };
+    await assert.rejects(store.read(), WorkerStorePoisonedError);
+    assert.equal(checks, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("ENOENT and legacy reads fall back to the serialized locked path", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-read-fallback-"));
+  const absentPath = join(root, "absent.json");
+  const legacyPath = join(root, "legacy.json");
+  try {
+    const absentMetrics: Array<{ operation: string }> = [];
+    assert.equal((await new WorkerStore(absentPath, { instrumentation: (metric) => absentMetrics.push(metric) }).read()).generation, 0);
+    assert.equal(absentMetrics.filter((metric) => metric.operation === "lock_wait").length, 1);
+
+    await writeFile(legacyPath, JSON.stringify({ version: 1, workers: [legacyWorker("fallback", "running")] }));
+    const legacyMetrics: Array<{ operation: string }> = [];
+    const legacy = await new WorkerStore(legacyPath, { instrumentation: (metric) => legacyMetrics.push(metric) }).read();
+    assert.equal(legacy.version, 3);
+    assert.equal(legacy.workers[0].state, "registering");
+    assert.equal(legacyMetrics.filter((metric) => metric.operation === "lock_wait").length, 1);
+    assert.equal(JSON.parse(await readFile(legacyPath, "utf8")).version, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("conditional no-op preserves generation and bytes while returning a defensive snapshot", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-conditional-snapshot-"));
+  const path = join(root, "workers.json");
+  try {
+    const store = new WorkerStore(path);
+    await store.upsert(apiWorker("conditional"));
+    const before = await readFile(path, "utf8");
+    const commit = await store.mutateConditionallyWithSnapshot(() => ({ value: "miss", changed: false }));
+    assert.equal(commit.value, "miss");
+    assert.equal(commit.generation, 1);
+    assert.equal(commit.state.generation, 1);
+    assert.equal(await readFile(path, "utf8"), before);
+    commit.state.workers[0].task = "memory-only";
+    assert.equal((await store.read()).workers[0].task, "task-conditional");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("optional WorkerStore instrumentation reports timings and bytes without state contents", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-instrumentation-"));
+  const path = join(root, "workers.json");
+  const metrics: Array<{ operation: string; durationMs: number; outcome: string; bytes?: number }> = [];
+  try {
+    const store = new WorkerStore(path, { instrumentation: (metric) => metrics.push({ ...metric }) });
+    await store.mutateConditionally(() => ({ value: undefined, changed: false }));
+    await store.upsert(apiWorker("instrumented"));
+    await store.read();
+    assert.ok(metrics.some((metric) => metric.operation === "mutation" && metric.outcome === "noop"));
+    assert.ok(metrics.some((metric) => metric.operation === "mutation" && metric.outcome === "ok"));
+    assert.ok(metrics.some((metric) => metric.operation === "commit" && metric.outcome === "ok" && (metric.bytes ?? 0) > 0));
+    assert.ok(metrics.some((metric) => metric.operation === "read" && metric.outcome === "ok"));
+    assert.ok(metrics.some((metric) => metric.operation === "lock_wait" && metric.outcome === "ok"));
+    assert.ok(metrics.every((metric) => Number.isFinite(metric.durationMs) && metric.durationMs >= 0));
+    assert.equal(JSON.stringify(metrics).includes("task-instrumented"), false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("instrumentation callback failures do not affect store operations", async () => {
+  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-instrumentation-failure-"));
+  const path = join(root, "workers.json");
+  try {
+    const store = new WorkerStore(path, { instrumentation: () => { throw new Error("observer failed"); } });
+    await store.upsert(apiWorker("observer-safe"));
+    assert.equal((await store.read()).workers[0].id, "observer-safe");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
