@@ -626,18 +626,24 @@ test("malformed fresh owners wait for age while stale guard files recover throug
   }
 });
 
-test("fresh live owners back off without reclaim-helper churn", async () => {
-  const root = await mkdtemp(join(tmpdir(), "worker-store-v3-live-precheck-"));
-  const path = join(root, "workers.json");
-  const lockPath = `${path}.lock`;
-  try {
-    await mkdir(lockPath, { mode: 0o700 });
-    await writeFile(`${lockPath}/owner.json`, `${JSON.stringify({ pid: process.pid, token: "live-owner", createdAt: Date.now() })}\n`);
-    const store = new WorkerStore(path, { lockTimeoutMs: 60 });
-    await assert.rejects(store.compareAndSwap(0, () => undefined), /WORKER_STORE|Timed out waiting/);
-    await assert.rejects(access(`${lockPath}.reclaim`), { code: "ENOENT" });
-  } finally {
-    await rm(root, { recursive: true, force: true });
+test("live owners back off without reclaim-helper churn regardless of lock age", async () => {
+  for (const age of ["fresh", "stale"] as const) {
+    const root = await mkdtemp(join(tmpdir(), `worker-store-v3-live-precheck-${age}-`));
+    const path = join(root, "workers.json");
+    const lockPath = `${path}.lock`;
+    try {
+      await mkdir(lockPath, { mode: 0o700 });
+      await writeFile(`${lockPath}/owner.json`, `${JSON.stringify({ pid: process.pid, token: "live-owner", createdAt: Date.now() })}\n`);
+      if (age === "stale") await utimes(lockPath, new Date(0), new Date(0));
+      const metrics: Array<{ operation: string }> = [];
+      const store = new WorkerStore(path, { lockTimeoutMs: 120, instrumentation: (metric) => metrics.push(metric) });
+      await assert.rejects(store.compareAndSwap(0, () => undefined), /WORKER_STORE|Timed out waiting/);
+      await assert.rejects(access(`${lockPath}.reclaim`), { code: "ENOENT" });
+      assert.equal(metrics.some((metric) => metric.operation === "lock_live_backoff"), true);
+      assert.equal(metrics.some((metric) => metric.operation === "lock_reclaim_guard"), false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   }
 });
 
