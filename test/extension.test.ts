@@ -269,6 +269,16 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     assert.equal(launches.length, 0, "a requested capability gap must fail before staffing");
     const afterGap = await tools.get("boss").execute("boss-after-gap-status", { action: "status", ...strictPlaceholders }, new AbortController().signal, () => {}, ctx);
     assert.match(afterGap.content[0].text, /No Boss runs are owned by this Controller/);
+    await assert.rejects(
+      tools.get("boss").execute("boss-missing-id-placeholder", { action: "pause", ...strictPlaceholders }, new AbortController().signal, () => {}, ctx),
+      /Boss run id must be/,
+      "an irrelevant note placeholder must never become a mutation target",
+    );
+    await assert.rejects(
+      tools.get("boss").execute("boss-nonexact-id", { action: "cancel", ...strictPlaceholders, bossRunId: "boss-valid extra" }, new AbortController().signal, () => {}, ctx),
+      /Boss run id must be/,
+      "typed mutation IDs must be validated as the exact supplied field rather than tokenized",
+    );
     const created = await tools.get("boss").execute(
       "boss-launch-test",
       { action: "create", goal: "ship supervised Ralph loops", requirements: { worktree: "write", edit: true } },

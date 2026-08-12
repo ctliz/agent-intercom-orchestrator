@@ -9,7 +9,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { DEFAULT_CONFIG, readConfig, resolveProfileCommand, writeConfigDefaults } from "./config.ts";
 import { observeBossCandidateFingerprint } from "./boss-candidate-fingerprint.ts";
-import { BOSS_CREATE_ACCESS_LEVELS, assertDirectInteractiveBossCommand, bossCreateRequest, parseBossCommand, type BossCommandRequest } from "./boss-command.ts";
+import { BOSS_CREATE_ACCESS_LEVELS, assertDirectInteractiveBossCommand, bossCreateRequest, parseBossCommand, parseBossRunId, type BossCommandRequest } from "./boss-command.ts";
 import { formatBossCreateCapabilityReport, inspectBossCreateCapabilities, type BossCreateCapabilityReport } from "./boss-create-capabilities.ts";
 import { cleanupProvisionedBossResource, observeProvisionedBossResource, preserveProvisionedBossResource, provisionBossLinkedWorktree, rollbackProvisionedBossWorktree, type ProvisionedBossWorktree } from "./boss-resource.ts";
 import { formatBossReadinessReport, formatBossSetupReport, inspectBossSetup, inspectTrustedLocalBossReadiness } from "./boss-setup.ts";
@@ -2563,7 +2563,11 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
               ? parseBossCommand(`freeze ${params.bossRunId ?? ""} ${params.expectedAcceptanceRevision ?? ""} ${params.expectedDesignRevision ?? ""}`)
               : params.action === "unfreeze"
                 ? parseBossCommand(`unfreeze ${params.bossRunId ?? ""} ${params.expectedFreezeRevision ?? ""} ${params.expectedFingerprintSha256 ?? ""}`)
-                : parseBossCommand(`${params.action}${params.bossRunId ? ` ${params.bossRunId}` : ""}${params.note ? ` ${params.note}` : ""}`);
+                : {
+                    action: params.action,
+                    bossRunId: parseBossRunId(params.bossRunId),
+                    ...(params.note ? { note: params.note } : {}),
+                  };
       const result = await executeTrustedLocalBoss(request, ctx);
       return {
         content: [{ type: "text", text: result.message }],
