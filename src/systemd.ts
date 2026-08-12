@@ -70,42 +70,99 @@ function parseSystemctlShow(stdout: string): Record<string, string> {
   );
 }
 
+export type SystemdJob = {
+  id: number;
+  unit: string;
+  type: string;
+  state: "running" | "waiting";
+  raw: string;
+};
+
+export function parseSystemctlListJobs(stdout: string): SystemdJob[] {
+  const jobs: SystemdJob[] = [];
+  const ids = new Set<number>();
+  for (const rawLine of stdout.split("\n")) {
+    const raw = rawLine.trim();
+    if (!raw) continue;
+    const fields = raw.split(/\s+/);
+    if (fields.length !== 4) throw new Error(`malformed list-jobs record with ${fields.length} fields`);
+    const [idText, unit, type, state] = fields;
+    if (!/^[1-9]\d*$/.test(idText) || !unit || !/^[a-z][a-z-]*$/i.test(type)
+      || (state !== "running" && state !== "waiting")) {
+      throw new Error("malformed list-jobs record");
+    }
+    const id = Number(idText);
+    if (!Number.isSafeInteger(id) || ids.has(id)) throw new Error("invalid or duplicate list-jobs id");
+    ids.add(id);
+    jobs.push({ id, unit, type, state, raw });
+  }
+  return jobs;
+}
+
 export type UserManagerHealth = {
   responsive: boolean;
+  parsed?: boolean;
   settled?: boolean;
   jobCount?: number;
   jobs?: string[];
+  jobRecords?: SystemdJob[];
   persistentJobs?: string[];
+  overJobCap?: boolean;
   error?: string;
 };
+
+export function workerSubmissionRejection(health: UserManagerHealth): string | undefined {
+  if (!health.responsive) {
+    return `systemd user manager is not responsive; refusing worker submission: ${health.error ?? "unknown liveness failure"}`;
+  }
+  if (health.parsed === false) {
+    return `systemd user manager job state is ambiguous; refusing worker submission: ${health.error ?? "could not parse list-jobs"}`;
+  }
+  if (health.overJobCap || (health.jobCount ?? 0) > 32) {
+    return `systemd user manager has ${health.jobCount} queued jobs; refusing worker submission until the backlog drops below 33`;
+  }
+  return undefined;
+}
 
 export async function getUserManagerHealth(
   runner: CommandRunner,
   options: { settleMs?: number } = {},
 ): Promise<UserManagerHealth> {
-  const readJobs = async (): Promise<{ jobs?: string[]; error?: string }> => {
+  const readJobs = async (): Promise<{ responsive: boolean; jobs?: SystemdJob[]; error?: string }> => {
     const result = await runner.exec(
       "systemctl",
       ["--user", "list-jobs", "--no-legend", "--no-pager", "--plain"],
       { timeout: 5000 },
     );
-    if (result.killed) return { error: "systemctl list-jobs timed out" };
-    if (result.code !== 0) return { error: result.stderr.trim() || result.stdout.trim() || `systemctl list-jobs exited ${result.code}` };
-    return { jobs: result.stdout.split("\n").map((line) => line.trim()).filter(Boolean) };
+    if (result.killed) return { responsive: false, error: "systemctl list-jobs timed out" };
+    if (result.code !== 0) return { responsive: false, error: result.stderr.trim() || result.stdout.trim() || `systemctl list-jobs exited ${result.code}` };
+    try {
+      return { responsive: true, jobs: parseSystemctlListJobs(result.stdout) };
+    } catch (error) {
+      return { responsive: true, error: `could not parse systemctl list-jobs: ${error instanceof Error ? error.message : String(error)}` };
+    }
   };
   const first = await readJobs();
-  if (!first.jobs) return { responsive: false, error: first.error };
-  if (first.jobs.length === 0) return { responsive: true, settled: true, jobCount: 0, jobs: [] };
+  if (!first.jobs) return { responsive: first.responsive, parsed: false, error: first.error };
+  if (first.jobs.length === 0) return { responsive: true, parsed: true, settled: true, jobCount: 0, jobs: [], jobRecords: [], overJobCap: false };
+  if (first.jobs.length > 32) {
+    return { responsive: true, parsed: true, settled: false, jobCount: first.jobs.length, jobs: first.jobs.map((job) => job.raw), jobRecords: first.jobs, overJobCap: true };
+  }
   await delay(options.settleMs ?? 250);
   const second = await readJobs();
-  if (!second.jobs) return { responsive: false, error: second.error, jobCount: first.jobs.length, jobs: first.jobs };
-  const secondIds = new Set(second.jobs.map((line) => line.split(/\s+/, 1)[0]));
-  const persistentJobs = first.jobs.filter((line) => secondIds.has(line.split(/\s+/, 1)[0]));
+  if (!second.jobs) {
+    return { responsive: second.responsive, parsed: false, error: second.error, jobCount: first.jobs.length, jobs: first.jobs.map((job) => job.raw), jobRecords: first.jobs };
+  }
+  const secondIds = new Set(second.jobs.map((job) => job.id));
+  const persistentJobs = first.jobs.filter((job) => secondIds.has(job.id)).map((job) => job.raw);
   return {
     responsive: true,
+    parsed: true,
     settled: persistentJobs.length === 0,
     jobCount: second.jobs.length,
-    jobs: second.jobs,
+    jobs: second.jobs.map((job) => job.raw),
+    jobRecords: second.jobs,
+    overJobCap: second.jobs.length > 32,
     ...(persistentJobs.length ? { persistentJobs } : {}),
   };
 }
