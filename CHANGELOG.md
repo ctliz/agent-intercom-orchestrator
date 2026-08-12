@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Gate every typed Boss call on exact-session Orchestrator initialization, so deferred/reloaded RPC Controllers establish the Intercom event bridge before `doctor` readiness or create/mutation dispatch instead of falsely reporting the connected Controller as unregistered.
 - Add an explicit absolute Boss create `sourcePath` for worktree-provisioned runs, so a stable umbrella-level Controller can select and Git-verify the intended clean source repository while Boss creates a fresh run-owned canonical worktree and never implicitly attaches the source or another existing worktree.
 - Make typed Boss action dispatch ignore strict-schema placeholders that are irrelevant to `doctor`, `plan`, and status-all, rather than reconstructing interactive command arguments from every populated field; action-specific authority fields remain validated only for their owning action.
 - Defer heavy orchestration startup for known-empty RPC discovery sessions, then initialize exactly once for the stable Pi session identity before the first real turn even though Pi creates fresh lifecycle context objects.

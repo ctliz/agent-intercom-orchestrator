@@ -225,13 +225,17 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
     };
     const ctx: any = {
       cwd: resources[1][0], mode: "rpc", hasUI: false,
-      sessionManager: { getSessionId: () => "controller-exact-target", getSessionFile: () => undefined },
+      sessionManager: { getSessionId: () => "controller-exact-target", getSessionFile: () => undefined, getEntries: () => [] },
       ui: { setStatus() { if (contextStale) throw new Error("stale context used during reload shutdown"); }, notify() {} },
     };
     const extensionUrl = new URL(`../src/index.ts?boss-launch=${Date.now()}`, import.meta.url);
     const { default: extension } = await import(extensionUrl.href);
     extension(pi);
     await lifecycle.get("session_start")?.({}, ctx);
+    assert.equal(execCalls, 0, "known-empty RPC bootstrap must remain deferred before a real tool call");
+    const initialized = await tools.get("boss").execute("boss-init-gate-plan", { action: "plan", requirements: null }, new AbortController().signal, () => {}, ctx);
+    assert.match(initialized.content[0].text, /Orc Boss setup plan: ready/);
+    assert.ok(execCalls > 0, "a typed Boss call must initialize the exact Controller session before dispatch");
     const initializedExecCalls = execCalls;
     await lifecycle.get("before_agent_start")?.({}, { ...ctx });
     await lifecycle.get("before_agent_start")?.({}, { ...ctx, ui: { ...ctx.ui } });
