@@ -2548,13 +2548,22 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       if (params.action !== "create" && params.requirements !== undefined && params.requirements !== null) throw new Error("Boss create requirements are accepted only for action=create; use null as the explicit strict-schema absence placeholder.");
-      const request = params.action === "create"
+      // Dispatch by action instead of reconstructing the interactive `/boss`
+      // command from every populated schema field. Strict-schema clients may
+      // require placeholders for fields that are irrelevant to this action;
+      // those placeholders must remain inert rather than becoming authority or
+      // accidental doctor/plan arguments.
+      const request: BossCommandRequest = params.action === "create"
         ? bossCreateRequest(params.goal, params.requirements ?? undefined)
-        : params.action === "freeze"
-          ? parseBossCommand(`freeze ${params.bossRunId ?? ""} ${params.expectedAcceptanceRevision ?? ""} ${params.expectedDesignRevision ?? ""}`)
-          : params.action === "unfreeze"
-            ? parseBossCommand(`unfreeze ${params.bossRunId ?? ""} ${params.expectedFreezeRevision ?? ""} ${params.expectedFingerprintSha256 ?? ""}`)
-            : parseBossCommand(`${params.action}${params.bossRunId ? ` ${params.bossRunId}` : ""}${params.note ? ` ${params.note}` : ""}`);
+        : params.action === "doctor" || params.action === "plan"
+          ? { action: params.action }
+          : params.action === "status"
+            ? parseBossCommand(`status${params.bossRunId ? ` ${params.bossRunId}` : ""}`)
+            : params.action === "freeze"
+              ? parseBossCommand(`freeze ${params.bossRunId ?? ""} ${params.expectedAcceptanceRevision ?? ""} ${params.expectedDesignRevision ?? ""}`)
+              : params.action === "unfreeze"
+                ? parseBossCommand(`unfreeze ${params.bossRunId ?? ""} ${params.expectedFreezeRevision ?? ""} ${params.expectedFingerprintSha256 ?? ""}`)
+                : parseBossCommand(`${params.action}${params.bossRunId ? ` ${params.bossRunId}` : ""}${params.note ? ` ${params.note}` : ""}`);
       const result = await executeTrustedLocalBoss(request, ctx);
       return {
         content: [{ type: "text", text: result.message }],
