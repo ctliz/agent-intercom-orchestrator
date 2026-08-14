@@ -4,7 +4,7 @@ Status: implementation-ready after independent `claude/claude-fable-5` max revie
 
 ## Release target
 
-Ship trusted-local Boss as a supported surface of the public `@dataforxyz/agent-intercom-orchestrator` Pi package, using only Pi's public package, extension, command, tool, model-registry, UI, and settings surfaces. No Pi internal patch is required.
+Ship trusted-local Boss as a supported surface of the public `@ctliz/agent-intercom-orchestrator` Pi package, using only Pi's public package, extension, command, tool, model-registry, UI, and settings surfaces. No Pi internal patch is required.
 
 Every setup, diagnostic, status, proof, and documentation surface must retain this statement:
 
@@ -26,7 +26,7 @@ Every setup, diagnostic, status, proof, and documentation surface must retain th
 Required supported Boss stack:
 
 1. Pi CLI/runtime and a trusted installation of this Orchestrator package.
-2. `@dataforxyz/agent-intercom-pi` for Controller/participant communication and wake delivery.
+2. `@ctliz/agent-intercom-pi` for Controller/participant communication and wake delivery.
 3. `@tmustier/pi-ralph-wiggum` or the recognized `pi-extensions/pi-ralph-wiggum` Git resource for participant supervision.
 4. `pi-return-on` from the public `dataforxyz/pi-return-on` Git repository for the supported external-wait/wake runtime. Its package manifest is intentionally unpublished/private, so setup must install and update the recognized Git source rather than claim npm availability.
 5. Linux systemd user services, systemd 257 or newer for hardened profiles, and `/usr/bin/bwrap`.
@@ -119,7 +119,7 @@ Rules:
 ### 3. Correct package metadata
 
 - Move Pi-owned packages and `typebox` to `peerDependencies: { "*" }` per current Pi package documentation.
-- Keep `@dataforxyz/agent-intercom-core` pinned to the reviewed Git commit in `dependencies` and add it to `bundledDependencies`. It is not published on npm; bundling gives npm consumers deterministic offline package contents without requiring a Git fetch during Orchestrator installation. Tarball inspection must verify the bundled manifest, license, and imported runtime files.
+- Keep `@ctliz/agent-intercom-core` pinned to the reviewed Git commit in `dependencies` and add it to `bundledDependencies`. It is not published on npm; bundling gives npm consumers deterministic offline package contents without requiring a Git fetch during Orchestrator installation. Tarball inspection must verify the bundled manifest, license, and imported runtime files.
 - Update the dependency test to assert the documented peer contract, the exact bundled Core dependency, and packed production contents.
 - Add the setup binary to `bin` and ensure every required source file is in `files`.
 
@@ -238,6 +238,6 @@ The reviewer also requested dirty-clone warnings for Pi's own reconciliation com
 3. The LLM-callable `boss` tool is doctor/plan-only for setup. Apply remains a direct-user binary or interactive command operation.
 4. `boss.roles` plus a versioned onboarding record is the canonical preference surface; legacy role settings are preserved and used only as proposed migration inputs.
 5. First-run model onboarding is mandatory. No private development model identifier is treated as a public default.
-6. `@dataforxyz/agent-intercom-core` remains exact-commit-pinned and is bundled in the Orchestrator tarball.
+6. `@ctliz/agent-intercom-core` remains exact-commit-pinned and is bundled in the Orchestrator tarball.
 7. Orc Boss supports global required-stack package installs only; project-scoped packages do not satisfy participant readiness.
 8. The release version is intentionally not chosen in the implementation plan. Version selection is a release-management decision after required repositories, compatibility, CI, review, and publish authority are confirmed.

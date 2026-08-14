@@ -24,7 +24,7 @@ import {
   type BossRunAuthorityIdentity,
   type BrokerIdentityRecord,
   type BrokerIdentityVerificationContext,
-} from "@dataforxyz/agent-intercom-core/boss";
+} from "@ctliz/agent-intercom-core/boss";
 import { BOSS_PROTECTED_PREREQUISITES } from "./boss-command.ts";
 import {
   canonicalBossJson,
@@ -48,10 +48,10 @@ const PUBLIC_KEY_EXPORT = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(
 )), "export")!.value as (options: { type: "spki"; format: "der" }) => Buffer;
 
 export const BOSS_PREFLIGHT_ADAPTERS = [
-  { id: "pi", packageName: "@dataforxyz/agent-intercom-pi" },
-  { id: "codex", packageName: "@dataforxyz/agent-intercom-codex" },
-  { id: "claude", packageName: "@dataforxyz/agent-intercom-claude" },
-  { id: "opencode", packageName: "@dataforxyz/agent-intercom-opencode" },
+  { id: "pi", packageName: "@ctliz/agent-intercom-pi" },
+  { id: "codex", packageName: "@ctliz/agent-intercom-codex" },
+  { id: "claude", packageName: "@ctliz/agent-intercom-claude" },
+  { id: "opencode", packageName: "@ctliz/agent-intercom-opencode" },
 ] as const;
 
 export type BossPreflightErrorCode =

@@ -200,15 +200,15 @@ export async function prepareWorkerRuntime(
     environment.XDG_STATE_HOME,
     environment.XDG_CACHE_HOME,
     join(home, ".local", "bin"),
-    join(home, "src", "github.com", "dataforxyz"),
+    join(home, "src", "github.com", "ctliz"),
   ].map((path) => mkdir(toPersistent(path), { recursive: true, mode: 0o700 })));
   for (const file of ["_cliproxy-env", "_codex-cliproxy-args"]) {
     await copyOptional(join(sourceHome, ".local", "bin", file), toPersistent(join(home, ".local", "bin", file)));
   }
   for (const repository of ["agent-intercom-codex", "agent-intercom-claude"]) {
     await symlinkOptional(
-      join(sourceHome, "src", "github.com", "dataforxyz", repository),
-      toPersistent(join(home, "src", "github.com", "dataforxyz", repository)),
+      join(sourceHome, "src", "github.com", "ctliz", repository),
+      toPersistent(join(home, "src", "github.com", "ctliz", repository)),
     );
   }
   await copyAllowedShellEnvironment(

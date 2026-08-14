@@ -2,8 +2,8 @@
 
 Orc Boss is a trusted-local workflow for a top-level Pi Controller. It requires Linux, a responsive systemd user manager, an active Agent Intercom identity, and four globally configured Pi resources:
 
-1. [`dataforxyz/agent-intercom-pi`](https://github.com/dataforxyz/agent-intercom-pi)
-2. [`dataforxyz/agent-intercom-orchestrator`](https://github.com/dataforxyz/agent-intercom-orchestrator)
+1. [`ctliz/agent-intercom-pi`](https://github.com/ctliz/agent-intercom-pi)
+2. [`ctliz/agent-intercom-orchestrator`](https://github.com/ctliz/agent-intercom-orchestrator)
 3. the `pi-ralph-wiggum/index.ts` extension from [`dataforxyz/pi-extensions`](https://github.com/dataforxyz/pi-extensions)
 4. [`dataforxyz/pi-return-on`](https://github.com/dataforxyz/pi-return-on)
 
@@ -16,8 +16,8 @@ The setup path is preview-first. It does not overwrite unrelated Pi settings, pr
 Install the Intercom control plane and Orchestrator if they are not already available:
 
 ```bash
-pi install npm:@dataforxyz/agent-intercom-pi
-pi install npm:@dataforxyz/agent-intercom-orchestrator
+pi install git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2
+pi install git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2
 ```
 
 The Orchestrator package exposes `agent-intercom-boss-setup`. If your Pi package installation does not place package bins on `PATH`, invoke the package's `src/boss-setup-cli.mjs` with Node from its resolved Pi package directory.
@@ -83,11 +83,11 @@ agent-intercom-boss-setup --apply \
 
 For an already reviewed noninteractive transaction, add `--yes`. This is confirmation, not an override: blockers still fail closed. Apply installs only missing recognized resources, verifies the complete stack afterward, then writes onboarding configuration. Reapplying identical choices is configuration-idempotent.
 
-Setup may add these unpinned Git sources when they are missing:
+Setup may add these Git sources when they are missing:
 
 ```bash
-pi install git:github.com/dataforxyz/agent-intercom-pi
-pi install git:github.com/dataforxyz/agent-intercom-orchestrator
+pi install git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2
+pi install git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2
 pi install git:github.com/dataforxyz/pi-extensions
 pi install git:github.com/dataforxyz/pi-return-on
 ```

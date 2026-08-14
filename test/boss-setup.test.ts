@@ -8,7 +8,9 @@ import { applyBossSetup, BOSS_READINESS_SCHEMA_VERSION, BOSS_SETUP_SCHEMA_VERSIO
 import { DEFAULT_CONFIG } from "../src/config.ts";
 
 async function resource(agentDir: string, repo: string, name: string, extension: string): Promise<void> {
-  const root = join(agentDir, "git", "github.com", "dataforxyz", repo);
+  // Agent Intercom repos moved to the ctliz owner; third-party pi-* repos did not.
+  const owner = repo.startsWith("agent-intercom-") ? "ctliz" : "dataforxyz";
+  const root = join(agentDir, "git", "github.com", owner, repo);
   await mkdir(join(root, extension.includes("/") ? extension.slice(0, extension.lastIndexOf("/")) : "."), { recursive: true });
   await writeFile(join(root, "package.json"), JSON.stringify({ name, version: "1.0.0" }));
   await writeFile(join(root, extension), "export default function extension() {}\n");
@@ -21,12 +23,12 @@ async function resource(agentDir: string, repo: string, name: string, extension:
 
 test("Boss package settings preserve string and object entries with extension filters", () => {
   const parsed = parseBossPackageSettings({ packages: [
-    "git:github.com/dataforxyz/agent-intercom-pi",
+    "git:github.com/ctliz/agent-intercom-pi",
     { source: "git:github.com/dataforxyz/pi-extensions", extensions: ["pi-ralph-wiggum/index.ts"] },
     { source: "bad", extensions: [1] },
   ] });
   assert.deepEqual(parsed, [
-    { index: 0, source: "git:github.com/dataforxyz/agent-intercom-pi", objectEntry: false },
+    { index: 0, source: "git:github.com/ctliz/agent-intercom-pi", objectEntry: false },
     { index: 1, source: "git:github.com/dataforxyz/pi-extensions", objectEntry: true, extensions: ["pi-ralph-wiggum/index.ts"] },
     { index: 2, source: "bad", objectEntry: true, extensions: [] },
   ]);
@@ -37,14 +39,14 @@ test("Boss inventory recognizes the global four-resource stack and monorepo Ralp
   const agentDir = join(root, "agent");
   try {
     await Promise.all([
-      resource(agentDir, "agent-intercom-pi", "@dataforxyz/agent-intercom-pi", "index.ts"),
-      resource(agentDir, "agent-intercom-orchestrator", "@dataforxyz/agent-intercom-orchestrator", "src/index.ts"),
+      resource(agentDir, "agent-intercom-pi", "@ctliz/agent-intercom-pi", "index.ts"),
+      resource(agentDir, "agent-intercom-orchestrator", "@ctliz/agent-intercom-orchestrator", "src/index.ts"),
       resource(agentDir, "pi-extensions", "pi-extensions", "pi-ralph-wiggum/index.ts"),
       resource(agentDir, "pi-return-on", "pi-return-on", "src/index.ts"),
     ]);
     await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: [
-      "git:github.com/dataforxyz/agent-intercom-pi",
-      "git:github.com/dataforxyz/agent-intercom-orchestrator",
+      "git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2",
+      "git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2",
       { source: "git:github.com/dataforxyz/pi-extensions", extensions: ["pi-ralph-wiggum/index.ts"] },
       "git:github.com/dataforxyz/pi-return-on",
     ] }));
@@ -63,11 +65,11 @@ test("Boss inventory recognizes npm semver pins as blocking", async () => {
   const root = await mkdtemp(join(tmpdir(), "boss-setup-npm-pin-"));
   const agentDir = join(root, "agent");
   try {
-    const packageRoot = join(agentDir, "npm", "node_modules", "@dataforxyz", "agent-intercom-pi");
+    const packageRoot = join(agentDir, "npm", "node_modules", "@ctliz", "agent-intercom-pi");
     await mkdir(packageRoot, { recursive: true });
-    await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: "@dataforxyz/agent-intercom-pi", version: "0.9.3" }));
+    await writeFile(join(packageRoot, "package.json"), JSON.stringify({ name: "@ctliz/agent-intercom-pi", version: "0.9.3" }));
     await writeFile(join(packageRoot, "index.ts"), "export default function extension() {}\n");
-    await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:@dataforxyz/agent-intercom-pi@0.9.3"] }));
+    await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: ["npm:@ctliz/agent-intercom-pi@0.9.3"] }));
 
     const report = await inspectBossSetup({ agentDir });
     const intercom = report.resources.find((entry) => entry.id === "intercom-pi");
@@ -83,12 +85,12 @@ test("Boss inventory blocks dirty, pinned, duplicate, filtered, and missing reso
   const root = await mkdtemp(join(tmpdir(), "boss-setup-blocked-"));
   const agentDir = join(root, "agent");
   try {
-    await resource(agentDir, "agent-intercom-pi", "@dataforxyz/agent-intercom-pi", "index.ts");
-    await writeFile(join(agentDir, "git", "github.com", "dataforxyz", "agent-intercom-pi", "dirty.txt"), "dirty\n");
+    await resource(agentDir, "agent-intercom-pi", "@ctliz/agent-intercom-pi", "index.ts");
+    await writeFile(join(agentDir, "git", "github.com", "ctliz", "agent-intercom-pi", "dirty.txt"), "dirty\n");
     await resource(agentDir, "pi-extensions", "pi-extensions", "pi-ralph-wiggum/index.ts");
     const settings = { theme: "preserve-me", packages: [
-      "git:github.com/dataforxyz/agent-intercom-pi",
-      "git:github.com/dataforxyz/agent-intercom-pi",
+      "git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2",
+      "git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2",
       { source: "git:github.com/dataforxyz/pi-extensions#deadbeef", extensions: ["other.ts"], untouched: true },
     ] };
     await writeFile(join(agentDir, "settings.json"), JSON.stringify(settings));
@@ -122,8 +124,8 @@ test("Boss setup apply installs only missing resources and preserves unrelated c
     const configPath = join(agentDir, "intercom", "orchestrator", "config.json");
     await writeFile(configPath, JSON.stringify({ custom: { keep: true }, boss: { future: "keep" } }));
     const definitions = {
-      "git:github.com/dataforxyz/agent-intercom-pi": ["agent-intercom-pi", "@dataforxyz/agent-intercom-pi", "index.ts"],
-      "git:github.com/dataforxyz/agent-intercom-orchestrator": ["agent-intercom-orchestrator", "@dataforxyz/agent-intercom-orchestrator", "src/index.ts"],
+      "git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2": ["agent-intercom-pi", "@ctliz/agent-intercom-pi", "index.ts"],
+      "git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2": ["agent-intercom-orchestrator", "@ctliz/agent-intercom-orchestrator", "src/index.ts"],
       "git:github.com/dataforxyz/pi-extensions": ["pi-extensions", "pi-extensions", "pi-ralph-wiggum/index.ts"],
       "git:github.com/dataforxyz/pi-return-on": ["pi-return-on", "pi-return-on", "src/index.ts"],
     } as const;
@@ -242,9 +244,9 @@ test("Boss setup apply refuses unsafe existing package state before install or c
   const root = await mkdtemp(join(tmpdir(), "boss-setup-refuse-"));
   const agentDir = join(root, "agent");
   try {
-    await resource(agentDir, "agent-intercom-pi", "@dataforxyz/agent-intercom-pi", "index.ts");
-    await writeFile(join(agentDir, "git", "github.com", "dataforxyz", "agent-intercom-pi", "dirty"), "dirty");
-    await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: ["git:github.com/dataforxyz/agent-intercom-pi"] }));
+    await resource(agentDir, "agent-intercom-pi", "@ctliz/agent-intercom-pi", "index.ts");
+    await writeFile(join(agentDir, "git", "github.com", "ctliz", "agent-intercom-pi", "dirty"), "dirty");
+    await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: ["git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2"] }));
     let installs = 0;
     await assert.rejects(applyBossSetup({ agentDir, onboarding, install: async () => { installs += 1; } }), /BOSS_SETUP_BLOCKED.*dirty/s);
     assert.equal(installs, 0);
@@ -267,11 +269,15 @@ test("packed-style setup launcher emits stable JSON and apply requires onboardin
     assert.equal(output.mode, "plan");
     assert.equal(output.report.version, BOSS_SETUP_SCHEMA_VERSION);
     assert.equal(output.report.changes.length, 4);
+    const piChange = output.report.changes.find((c: any) => c.resource === "intercom-pi");
+    const orcChange = output.report.changes.find((c: any) => c.resource === "orchestrator");
+    assert.equal(piChange?.command, "pi install git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2");
+    assert.equal(orcChange?.command, "pi install git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2");
     const applied = spawnSync(process.execPath, [launcher.pathname, "--apply"], { encoding: "utf8", env: { ...process.env, PI_CODING_AGENT_DIR: agentDir } });
     assert.equal(applied.status, 3);
     assert.match(applied.stderr, /BOSS_SETUP_ONBOARDING_REQUIRED/);
 
-    const installedRoot = join(root, "project", "node_modules", "@dataforxyz", "agent-intercom-orchestrator");
+    const installedRoot = join(root, "project", "node_modules", "@ctliz", "agent-intercom-orchestrator");
     await mkdir(installedRoot, { recursive: true });
     await cp(new URL("../src", import.meta.url), join(installedRoot, "src"), { recursive: true });
     const installedLauncher = join(installedRoot, "src", "boss-setup-cli.mjs");

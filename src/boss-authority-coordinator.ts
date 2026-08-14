@@ -8,8 +8,8 @@ import {
   type AuthorityTransitionOperation,
   type AuthorityTransitionRecord,
   type AuthorityTransitionRequest,
-} from "@dataforxyz/agent-intercom-core/boss";
-import { canonicalJson } from "@dataforxyz/agent-intercom-core/canonical";
+} from "@ctliz/agent-intercom-core/boss";
+import { canonicalJson } from "@ctliz/agent-intercom-core/canonical";
 import {
   BossAuthorityQueryError,
   isBossAuthorityQueryClient,

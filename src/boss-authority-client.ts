@@ -14,8 +14,8 @@ import {
   type BrokerIdentityVerificationContext,
   type BrokerPeerExpectation,
   type ObservedBrokerPeer,
-} from "@dataforxyz/agent-intercom-core/boss";
-import { canonicalJson } from "@dataforxyz/agent-intercom-core/canonical";
+} from "@ctliz/agent-intercom-core/boss";
+import { canonicalJson } from "@ctliz/agent-intercom-core/canonical";
 
 export type BossAuthorityQueryErrorCode =
   | "invalid_configuration"

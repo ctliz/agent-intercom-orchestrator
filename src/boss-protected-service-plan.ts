@@ -4,17 +4,17 @@ import { isProxy } from "node:util/types";
 import {
   BROKER_PROTECTED_PROVIDER_ROOT,
   type BrokerProviderAttestation,
-} from "@dataforxyz/agent-intercom-core/boss";
+} from "@ctliz/agent-intercom-core/boss";
 
 export const BOSS_PROTECTED_SERVICE_MANIFEST_VERSION = "orc.boss-protected-service-manifest.v1" as const;
 export const BOSS_PROTECTED_SERVICE_RELEASE_AUTHORITY_VERSION = "orc.boss-protected-service-release-authority.v1" as const;
 export const BOSS_PROTECTED_SERVICE_PLAN_VERSION = "orc.boss-protected-service-plan.v1" as const;
 
 export const BOSS_PROTECTED_SERVICE_PROVIDERS = Object.freeze([
-  Object.freeze({ id: "pi", packageName: "@dataforxyz/agent-intercom-pi" }),
-  Object.freeze({ id: "codex", packageName: "@dataforxyz/agent-intercom-codex" }),
-  Object.freeze({ id: "claude", packageName: "@dataforxyz/agent-intercom-claude" }),
-  Object.freeze({ id: "opencode", packageName: "@dataforxyz/agent-intercom-opencode" }),
+  Object.freeze({ id: "pi", packageName: "@ctliz/agent-intercom-pi" }),
+  Object.freeze({ id: "codex", packageName: "@ctliz/agent-intercom-codex" }),
+  Object.freeze({ id: "claude", packageName: "@ctliz/agent-intercom-claude" }),
+  Object.freeze({ id: "opencode", packageName: "@ctliz/agent-intercom-opencode" }),
 ] as const);
 
 export const BOSS_PROTECTED_SERVICE_PATHS = Object.freeze({

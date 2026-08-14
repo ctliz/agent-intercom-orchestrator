@@ -20,14 +20,14 @@ test("adapter inspection preserves Pi and npm-global update sources", async () =
   try {
     await mkdir(agentDir, { recursive: true });
     await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: [
-      "git:github.com/dataforxyz/agent-intercom-pi",
-      "npm:@dataforxyz/agent-intercom-orchestrator",
+      "git:github.com/ctliz/agent-intercom-pi",
+      "npm:@ctliz/agent-intercom-orchestrator",
     ] }));
-    await packageRoot(join(agentDir, "git", "github.com", "dataforxyz", "agent-intercom-pi"), "@dataforxyz/agent-intercom-pi");
-    const orchestratorRoot = join(agentDir, "npm", "node_modules", "@dataforxyz", "agent-intercom-orchestrator");
-    await packageRoot(orchestratorRoot, "@dataforxyz/agent-intercom-orchestrator");
+    await packageRoot(join(agentDir, "git", "github.com", "ctliz", "agent-intercom-pi"), "@ctliz/agent-intercom-pi");
+    const orchestratorRoot = join(agentDir, "npm", "node_modules", "@ctliz", "agent-intercom-orchestrator");
+    await packageRoot(orchestratorRoot, "@ctliz/agent-intercom-orchestrator");
     for (const id of ["codex", "claude", "opencode"]) {
-      await packageRoot(join(globalRoot, "@dataforxyz", `agent-intercom-${id}`), `@dataforxyz/agent-intercom-${id}`);
+      await packageRoot(join(globalRoot, "@ctliz", `agent-intercom-${id}`), `@ctliz/agent-intercom-${id}`);
     }
 
     const adapters = await inspectAdapterFamily({ agentDir, currentPackageRoot: orchestratorRoot, globalNpmRoot: globalRoot, latest: async () => "0.9.4" });
@@ -47,8 +47,8 @@ test("adapter inspection preserves Pi and npm-global update sources", async () =
 test("pinned Pi package sources are reported instead of silently replaced", async () => {
   const root = await makeCanonicalTempDir("agent-intercom-pinned-");
   try {
-    await writeFile(join(root, "settings.json"), JSON.stringify({ packages: ["git:github.com/dataforxyz/agent-intercom-pi@v0.9.3"] }));
-    await packageRoot(join(root, "git", "github.com", "dataforxyz", "agent-intercom-pi"), "@dataforxyz/agent-intercom-pi");
+    await writeFile(join(root, "settings.json"), JSON.stringify({ packages: ["git:github.com/ctliz/agent-intercom-pi@v0.9.3"] }));
+    await packageRoot(join(root, "git", "github.com", "ctliz", "agent-intercom-pi"), "@ctliz/agent-intercom-pi");
     const adapters = await inspectAdapterFamily({ agentDir: root, currentPackageRoot: join(root, "missing"), globalNpmRoot: join(root, "global"), latest: async () => "0.9.4" });
     const pi = adapters.find((entry) => entry.id === "pi")!;
     assert.equal(pi.update, undefined);

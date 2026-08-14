@@ -6,7 +6,7 @@ import {
   type AuthorityTransitionEvent,
   type AuthorityTransitionOperation,
   type AuthorityTransitionRecord,
-} from "@dataforxyz/agent-intercom-core/boss";
+} from "@ctliz/agent-intercom-core/boss";
 import {
   BOSS_AUDIT_ENTRY_VERSION,
   BOSS_AUTHORITY_PROJECTION_VERSION,

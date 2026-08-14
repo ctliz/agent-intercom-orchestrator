@@ -4,7 +4,7 @@ import type {
   AuthorityTransitionOperation as CoreAuthorityTransitionOperation,
   BossParticipantRole as CoreBossParticipantRole,
   ParticipantState as CoreParticipantState,
-} from "@dataforxyz/agent-intercom-core/boss";
+} from "@ctliz/agent-intercom-core/boss";
 
 export const BOSS_CONTROLLER_STORE_VERSION = "orc.boss-controller-store.v1" as const;
 export const BOSS_RUN_VERSION = "orc.boss-run.v1" as const;

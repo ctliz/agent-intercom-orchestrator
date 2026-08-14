@@ -19,7 +19,7 @@ import {
   brokerFeatureSetHash,
   brokerIdentitySigningBytes,
   brokerProviderAttestationSigningBytes,
-} from "@dataforxyz/agent-intercom-core/boss";
+} from "@ctliz/agent-intercom-core/boss";
 import { BOSS_AUTHORITY_PROJECTION_VERSION } from "../src/boss-types.ts";
 import { sha256BossValue } from "../src/boss-types.ts";
 import {
@@ -70,7 +70,7 @@ function signedEvidence(ownerUid = OWNER_UID, bossBindingEpoch = 1): Evidence {
   const providerPublicKey = providerKeys.publicKey.export({ type: "spki", format: "pem" }).toString();
   const providerAttestation = {
     version: BROKER_PROVIDER_ATTESTATION_VERSION,
-    providerPackage: "@dataforxyz/agent-intercom-pi",
+    providerPackage: "@ctliz/agent-intercom-pi",
     providerVersion: "1.0.0",
     providerDigest: DIGEST,
     artifactPath: "/usr/lib/agent-intercom/providers/agent-intercom-pi/provider.mjs",

@@ -20,8 +20,8 @@ import {
   type AuthorityTransitionRecord,
   type AuthorityTransitionRequest,
   type BrokerIdentityRecord,
-} from "@dataforxyz/agent-intercom-core/boss";
-import { canonicalJson } from "@dataforxyz/agent-intercom-core/canonical";
+} from "@ctliz/agent-intercom-core/boss";
+import { canonicalJson } from "@ctliz/agent-intercom-core/canonical";
 import {
   BossAuthorityQueryError,
   createBossAuthorityQueryClient,
@@ -56,7 +56,7 @@ function fixture(): Fixture {
   const providerPublicKey = providerKeys.publicKey.export({ type: "spki", format: "pem" }).toString();
   const providerAttestation = {
     version: BROKER_PROVIDER_ATTESTATION_VERSION,
-    providerPackage: "@dataforxyz/agent-intercom-pi",
+    providerPackage: "@ctliz/agent-intercom-pi",
     providerVersion: "1.0.0",
     providerDigest: DIGEST,
     artifactPath: "/usr/lib/agent-intercom/providers/agent-intercom-pi/provider.mjs",

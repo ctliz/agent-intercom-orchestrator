@@ -10,7 +10,7 @@ import {
   type AuthorityTransitionEpochs,
   type AuthorityTransitionEvent,
   type AuthorityTransitionRecord,
-} from "@dataforxyz/agent-intercom-core/boss";
+} from "@ctliz/agent-intercom-core/boss";
 import {
   BossAuthorityReconciliationError,
   reconcileCommittedBossAuthorityTransition,

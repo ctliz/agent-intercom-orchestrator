@@ -118,12 +118,12 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
   process.env.AGENT_INTERCOM_MANAGER_CONTEXT = "headless_cli";
   try {
     const orchestratorDir = join(agentDir, "intercom", "orchestrator");
-    const intercomExtension = join(agentDir, "git", "github.com", "dataforxyz", "agent-intercom-pi", "index.ts");
+    const intercomExtension = join(agentDir, "git", "github.com", "ctliz", "agent-intercom-pi", "index.ts");
     const ralphExtension = join(agentDir, "git", "github.com", "dataforxyz", "pi-extensions", "pi-ralph-wiggum", "index.ts");
     const returnOnExtension = join(agentDir, "git", "github.com", "dataforxyz", "pi-return-on", "src", "index.ts");
     const resources = [
-      [dirname(intercomExtension), "@dataforxyz/agent-intercom-pi"],
-      [join(agentDir, "git", "github.com", "dataforxyz", "agent-intercom-orchestrator"), "@dataforxyz/agent-intercom-orchestrator"],
+      [dirname(intercomExtension), "@ctliz/agent-intercom-pi"],
+      [join(agentDir, "git", "github.com", "ctliz", "agent-intercom-orchestrator"), "@ctliz/agent-intercom-orchestrator"],
       [join(agentDir, "git", "github.com", "dataforxyz", "pi-extensions"), "pi-extensions"],
       [join(agentDir, "git", "github.com", "dataforxyz", "pi-return-on"), "pi-return-on"],
     ] as const;
@@ -145,8 +145,8 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
       spawnSync("git", ["-C", root, "commit", "-qm", "fixture"]);
     }
     await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: [
-      "git:github.com/dataforxyz/agent-intercom-pi",
-      "git:github.com/dataforxyz/agent-intercom-orchestrator",
+      "git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2",
+      "git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2",
       { source: "git:github.com/dataforxyz/pi-extensions", extensions: ["pi-ralph-wiggum/index.ts"] },
       "git:github.com/dataforxyz/pi-return-on",
     ] }));
@@ -1259,8 +1259,8 @@ test("concurrent spawns reserve a worker id before launching a systemd unit", { 
     const orchestratorDir = join(agentDir, "intercom", "orchestrator");
     await mkdir(orchestratorDir, { recursive: true });
     const executable = join(agentDir, "fake-pi");
-    const intercomExtension = join(agentDir, "git", "github.com", "dataforxyz", "agent-intercom-pi", "index.ts");
-    await mkdir(join(agentDir, "git", "github.com", "dataforxyz", "agent-intercom-pi"), { recursive: true });
+    const intercomExtension = join(agentDir, "git", "github.com", "ctliz", "agent-intercom-pi", "index.ts");
+    await mkdir(join(agentDir, "git", "github.com", "ctliz", "agent-intercom-pi"), { recursive: true });
     await writeFile(intercomExtension, "export default function () {}\n");
     await writeFile(executable, "#!/bin/sh\nexit 0\n");
     await chmod(executable, 0o755);

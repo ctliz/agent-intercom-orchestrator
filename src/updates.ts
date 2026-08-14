@@ -18,9 +18,44 @@ export interface AdapterVersion {
   source: "pi-git" | "pi-npm" | "npm-global" | "git" | "local" | "missing";
   root?: string;
   sourceSpec?: string;
-  status: "current" | "outdated" | "ahead" | "missing" | "unknown";
+  status: "current" | "outdated" | "ahead" | "missing" | "unknown" | "migration-required" | "dual-load";
   update?: UpdateCommand;
   blockedReason?: string;
+  /** Legacy `connect.1` install surfaces found for this adapter, if any. */
+  legacySurfaces?: LegacySurface[];
+}
+
+/**
+ * connect.1 shipped under `@dataforxyz/*`; connect.2 is `@ctliz/*`.
+ *
+ * The retired namespace is a *migration-detection input only*. It is never a
+ * healthy or current installation, is never auto-upgraded in place, and is
+ * never silently overwritten. It is deliberately confined to this registry and
+ * the migration docs so it cannot leak back into normal runtime imports.
+ */
+export const LEGACY_NPM_SCOPE = "@dataforxyz";
+export const CANONICAL_NPM_SCOPE = "@ctliz";
+export const LEGACY_GITHUB_OWNER = "dataforxyz";
+export const CANONICAL_GITHUB_OWNER = "ctliz";
+
+export type LegacySurfaceKind = "pi-settings" | "git-checkout" | "node-modules" | "global-bin";
+
+export interface LegacySurface {
+  kind: LegacySurfaceKind;
+  /** Filesystem path or settings spec that still carries the retired identity. */
+  detail: string;
+}
+
+export type MigrationCode = "OK" | "MIGRATION_REQUIRED" | "DUPLICATE_INSTALL";
+
+export interface MigrationDiagnosis {
+  code: MigrationCode;
+  /** True when setup/update must refuse to proceed. */
+  blocked: boolean;
+  summary: string;
+  legacySurfaces: LegacySurface[];
+  canonicalSurfaces: LegacySurface[];
+  remediation: string[];
 }
 
 export interface HarnessVersion {
@@ -39,11 +74,11 @@ export interface HarnessRuntime {
 }
 
 const ADAPTERS: Array<{ id: AdapterId; packageName: string; repo: string; binary?: "coi" | "cci" }> = [
-  { id: "pi", packageName: "@dataforxyz/agent-intercom-pi", repo: "agent-intercom-pi" },
-  { id: "codex", packageName: "@dataforxyz/agent-intercom-codex", repo: "agent-intercom-codex", binary: "coi" },
-  { id: "claude", packageName: "@dataforxyz/agent-intercom-claude", repo: "agent-intercom-claude", binary: "cci" },
-  { id: "opencode", packageName: "@dataforxyz/agent-intercom-opencode", repo: "agent-intercom-opencode" },
-  { id: "orchestrator", packageName: "@dataforxyz/agent-intercom-orchestrator", repo: "agent-intercom-orchestrator" },
+  { id: "pi", packageName: "@ctliz/agent-intercom-pi", repo: "agent-intercom-pi" },
+  { id: "codex", packageName: "@ctliz/agent-intercom-codex", repo: "agent-intercom-codex", binary: "coi" },
+  { id: "claude", packageName: "@ctliz/agent-intercom-claude", repo: "agent-intercom-claude", binary: "cci" },
+  { id: "opencode", packageName: "@ctliz/agent-intercom-opencode", repo: "agent-intercom-opencode" },
+  { id: "orchestrator", packageName: "@ctliz/agent-intercom-orchestrator", repo: "agent-intercom-orchestrator" },
 ];
 
 function shellQuote(value: string): string {
@@ -107,13 +142,58 @@ async function piPackageSources(agentDir: string): Promise<string[]> {
   return Array.isArray(settings?.packages) ? settings.packages.filter((entry: unknown): entry is string => typeof entry === "string") : [];
 }
 
+function legacyPackageName(adapter: { packageName: string }): string {
+  return adapter.packageName.replace(`${CANONICAL_NPM_SCOPE}/`, `${LEGACY_NPM_SCOPE}/`);
+}
+
+/**
+ * Matches a Pi settings spec to an adapter. The retired identity is matched on
+ * purpose so a `connect.1` install is *detected*, never so it is accepted.
+ */
 function sourceMatches(source: string, adapter: { packageName: string; repo: string }): boolean {
-  return source.includes(adapter.packageName) || source.includes(`dataforxyz/${adapter.repo}`);
+  return (
+    source.includes(adapter.packageName)
+    || source.includes(legacyPackageName(adapter))
+    || source.includes(`/${adapter.repo}`)
+    || source.includes(`/${adapter.repo}.git`)
+    || source.includes(`/${adapter.repo}@`)
+    || source.includes(`/${adapter.repo}#`)
+    || sourceIsLegacy(source, adapter)
+  );
+}
+
+function sourceIsLegacy(source: string, adapter: { packageName: string; repo: string }): boolean {
+  if (
+    source.includes(legacyPackageName(adapter))
+    || source.includes(`${LEGACY_GITHUB_OWNER}/${adapter.repo}`)
+  ) {
+    return true;
+  }
+  if (source.startsWith("git:github.com/") && source.includes(`${CANONICAL_GITHUB_OWNER}/${adapter.repo}`)) {
+    if (/@v?[\d.]+-connect\.2(?:$|[#?])/.test(source) || /@connect\.2(?:$|[#?])/.test(source)) {
+      return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 function rootFromPiSource(agentDir: string, source: string, adapter: { packageName: string; repo: string }): string | undefined {
-  if (source.startsWith("git:github.com/")) return join(agentDir, "git", "github.com", "dataforxyz", adapter.repo);
-  if (source.startsWith("npm:")) return join(agentDir, "npm", "node_modules", "@dataforxyz", adapter.repo);
+  if (source.startsWith("git:github.com/")) {
+    const match = /^git:github\.com\/([^/@#]+)\/([^/@#]+)/.exec(source);
+    if (match) {
+      return join(agentDir, "git", "github.com", match[1], match[2]);
+    }
+  }
+  if (source.startsWith("npm:")) {
+    const raw = source.slice(4);
+    const slash = raw.indexOf("/");
+    if (slash !== -1) {
+      const scope = raw.slice(0, slash);
+      const pkg = raw.slice(slash + 1).split("@")[0];
+      return join(agentDir, "npm", "node_modules", scope, pkg);
+    }
+  }
   return undefined;
 }
 
@@ -129,6 +209,253 @@ async function configuredOpenCodePluginRoot(home: string | undefined, packageNam
     }
   }
   return undefined;
+}
+
+async function manifestNameAt(root: string | undefined): Promise<string | undefined> {
+  if (!root) return undefined;
+  const manifest = await readJson(join(root, "package.json"));
+  return typeof manifest?.name === "string" ? manifest.name : undefined;
+}
+
+function isLegacyPackageName(name: string | undefined): boolean {
+  return typeof name === "string" && (name.startsWith(`${LEGACY_NPM_SCOPE}/agent-intercom-`) || name.startsWith(`${LEGACY_NPM_SCOPE}/`));
+}
+
+function isCanonicalPackageName(name: string | undefined): boolean {
+  return typeof name === "string" && (name.startsWith(`${CANONICAL_NPM_SCOPE}/agent-intercom-`) || name.startsWith(`${CANONICAL_NPM_SCOPE}/`));
+}
+
+function dedupeSurfaces(surfaces: LegacySurface[]): LegacySurface[] {
+  const seen = new Set<string>();
+  const result: LegacySurface[] = [];
+  for (const s of surfaces) {
+    const key = `${s.kind}:${s.detail}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      result.push(s);
+    }
+  }
+  return result;
+}
+
+/**
+ * Scans the *active install surfaces of the current OS user* for both legacy
+ * and canonical Agent Intercom namespaces.
+ *
+ * Primary classification fact is the resolved package manifest (`package.json`
+ * `name`), NOT purely the repository URL or filesystem directory owner.
+ * This ensures that a checkout at `github.com/ctliz/agent-intercom-pi` whose
+ * manifest still declares `@dataforxyz/agent-intercom-pi` is correctly diagnosed
+ * as `MIGRATION_REQUIRED`.
+ */
+async function scanAllInstallSurfaces(options: {
+  agentDir: string;
+  globalRoot?: string;
+  pathDirs?: string[];
+}): Promise<{ legacySurfaces: LegacySurface[]; canonicalSurfaces: LegacySurface[] }> {
+  const { agentDir } = options;
+  const legacySurfaces: LegacySurface[] = [];
+  const canonicalSurfaces: LegacySurface[] = [];
+
+  // 1. Pi settings package sources
+  for (const spec of await piPackageSources(agentDir)) {
+    if (!spec.includes("agent-intercom-")) continue;
+
+    let resolvedRoot: string | undefined;
+    if (spec.startsWith("git:github.com/")) {
+      const match = /^git:github\.com\/([^/@#]+)\/([^/@#]+)/.exec(spec);
+      if (match) {
+        resolvedRoot = join(agentDir, "git", "github.com", match[1], match[2]);
+      }
+    } else if (spec.startsWith("npm:")) {
+      const raw = spec.slice(4);
+      const slash = raw.indexOf("/");
+      if (slash !== -1) {
+        const scope = raw.slice(0, slash);
+        const pkg = raw.slice(slash + 1).split("@")[0];
+        resolvedRoot = join(agentDir, "npm", "node_modules", scope, pkg);
+      }
+    }
+
+    const manifestName = await manifestNameAt(resolvedRoot);
+    if (isLegacyPackageName(manifestName)) {
+      legacySurfaces.push({ kind: "pi-settings", detail: spec });
+    } else if (isCanonicalPackageName(manifestName)) {
+      canonicalSurfaces.push({ kind: "pi-settings", detail: spec });
+    } else if (spec.startsWith("npm:")) {
+      if (spec.includes(LEGACY_NPM_SCOPE)) {
+        legacySurfaces.push({ kind: "pi-settings", detail: spec });
+      } else if (spec.includes(CANONICAL_NPM_SCOPE)) {
+        canonicalSurfaces.push({ kind: "pi-settings", detail: spec });
+      } else {
+        legacySurfaces.push({ kind: "pi-settings", detail: spec });
+      }
+    } else if (spec.startsWith("git:github.com/")) {
+      if (spec.includes(`${LEGACY_GITHUB_OWNER}/`) || spec.includes(LEGACY_NPM_SCOPE)) {
+        legacySurfaces.push({ kind: "pi-settings", detail: spec });
+      } else if (spec.includes(`${CANONICAL_GITHUB_OWNER}/`)) {
+        if (/@v?[\d.]+-connect\.2(?:$|[#?])/.test(spec) || /@connect\.2(?:$|[#?])/.test(spec)) {
+          canonicalSurfaces.push({ kind: "pi-settings", detail: spec });
+        } else {
+          legacySurfaces.push({ kind: "pi-settings", detail: spec });
+        }
+      } else {
+        legacySurfaces.push({ kind: "pi-settings", detail: spec });
+      }
+    }
+  }
+
+  // 2. Git checkouts
+  for (const adapter of ADAPTERS) {
+    for (const owner of [LEGACY_GITHUB_OWNER, CANONICAL_GITHUB_OWNER]) {
+      const checkout = join(agentDir, "git", "github.com", owner, adapter.repo);
+      if (await exists(join(checkout, "package.json"))) {
+        const manifestName = await manifestNameAt(checkout);
+        if (isLegacyPackageName(manifestName)) {
+          legacySurfaces.push({ kind: "git-checkout", detail: checkout });
+        } else if (isCanonicalPackageName(manifestName)) {
+          canonicalSurfaces.push({ kind: "git-checkout", detail: checkout });
+        } else if (owner === LEGACY_GITHUB_OWNER) {
+          legacySurfaces.push({ kind: "git-checkout", detail: checkout });
+        } else if (owner === CANONICAL_GITHUB_OWNER) {
+          canonicalSurfaces.push({ kind: "git-checkout", detail: checkout });
+        }
+      }
+    }
+  }
+
+  // 3. Managed and global node_modules
+  for (const adapter of ADAPTERS) {
+    for (const scope of [LEGACY_NPM_SCOPE, CANONICAL_NPM_SCOPE]) {
+      const managed = join(agentDir, "npm", "node_modules", scope, adapter.repo);
+      if (await exists(join(managed, "package.json"))) {
+        const manifestName = await manifestNameAt(managed);
+        if (isLegacyPackageName(manifestName) || (manifestName === undefined && scope === LEGACY_NPM_SCOPE)) {
+          legacySurfaces.push({ kind: "node-modules", detail: managed });
+        } else if (isCanonicalPackageName(manifestName) || (manifestName === undefined && scope === CANONICAL_NPM_SCOPE)) {
+          canonicalSurfaces.push({ kind: "node-modules", detail: managed });
+        }
+      }
+
+      if (options.globalRoot) {
+        const global = join(options.globalRoot, scope, adapter.repo);
+        if (await exists(join(global, "package.json"))) {
+          const manifestName = await manifestNameAt(global);
+          if (isLegacyPackageName(manifestName) || (manifestName === undefined && scope === LEGACY_NPM_SCOPE)) {
+            legacySurfaces.push({ kind: "node-modules", detail: global });
+          } else if (isCanonicalPackageName(manifestName) || (manifestName === undefined && scope === CANONICAL_NPM_SCOPE)) {
+            canonicalSurfaces.push({ kind: "node-modules", detail: global });
+          }
+        }
+      }
+    }
+  }
+
+  // 4. Global bin links
+  for (const dir of options.pathDirs ?? []) {
+    for (const binary of ["coi", "cci", "agent-intercom-fleet"] as const) {
+      const link = join(dir, binary);
+      if (!(await exists(link))) continue;
+      let target: string;
+      try {
+        target = await realpath(link);
+      } catch {
+        continue;
+      }
+      let foundName: string | undefined;
+      for (const scope of [CANONICAL_NPM_SCOPE, LEGACY_NPM_SCOPE]) {
+        for (const repo of ["agent-intercom-codex", "agent-intercom-claude", "agent-intercom-orchestrator"]) {
+          const root = await packageRootFrom(target, `${scope}/${repo}`);
+          if (root) {
+            foundName = await manifestNameAt(root);
+            break;
+          }
+        }
+        if (foundName) break;
+      }
+      if (isLegacyPackageName(foundName)) {
+        legacySurfaces.push({ kind: "global-bin", detail: `${link} -> ${target}` });
+      } else if (isCanonicalPackageName(foundName)) {
+        canonicalSurfaces.push({ kind: "global-bin", detail: `${link} -> ${target}` });
+      } else if (target.includes(LEGACY_NPM_SCOPE) || target.includes(`${LEGACY_GITHUB_OWNER}/agent-intercom-`)) {
+        legacySurfaces.push({ kind: "global-bin", detail: `${link} -> ${target}` });
+      } else if (target.includes(CANONICAL_NPM_SCOPE) || target.includes(`${CANONICAL_GITHUB_OWNER}/agent-intercom-`)) {
+        canonicalSurfaces.push({ kind: "global-bin", detail: `${link} -> ${target}` });
+      }
+    }
+  }
+
+  return {
+    legacySurfaces: dedupeSurfaces(legacySurfaces),
+    canonicalSurfaces: dedupeSurfaces(canonicalSurfaces),
+  };
+}
+
+/**
+ * Fail-closed classification of the connect.1 -> connect.2 migration.
+ *
+ * - legacy only  -> MIGRATION_REQUIRED (blocked; uninstall-then-install plan)
+ * - both present -> DUPLICATE_INSTALL  (blocked; dual-load hard error)
+ *
+ * A legacy surface is never reported as current/healthy and is never upgraded
+ * in place, so setup and update cannot silently overwrite a connect.1 install.
+ */
+export async function diagnoseNamespaceMigration(options: {
+  agentDir: string;
+  globalRoot?: string;
+  pathDirs?: string[];
+}): Promise<MigrationDiagnosis> {
+  const { legacySurfaces, canonicalSurfaces } = await scanAllInstallSurfaces({
+    agentDir: options.agentDir,
+    globalRoot: options.globalRoot,
+    pathDirs: options.pathDirs,
+  });
+
+  if (legacySurfaces.length > 0 && canonicalSurfaces.length > 0) {
+    return {
+      code: "DUPLICATE_INSTALL",
+      blocked: true,
+      summary:
+        `Both ${LEGACY_NPM_SCOPE}/* (connect.1) and ${CANONICAL_NPM_SCOPE}/* (connect.2) install surfaces are present. `
+        + "Across npm/global/project/active-session surfaces they can load as separate extensions with conflicting binaries and separate broker registration paths.",
+      legacySurfaces,
+      canonicalSurfaces,
+      remediation: [
+        "Stop or close the installed broker-capable adapters.",
+        `Remove every ${LEGACY_NPM_SCOPE}/* spec, package, and binary link listed above.`,
+        "Re-run this check and confirm no legacy surface remains.",
+        "Only then reload or restart, and verify exactly one broker is running.",
+      ],
+    };
+  }
+
+  if (legacySurfaces.length > 0) {
+    return {
+      code: "MIGRATION_REQUIRED",
+      blocked: true,
+      summary: `Only ${LEGACY_NPM_SCOPE}/* (connect.1) install surfaces are present; connect.2 uses ${CANONICAL_NPM_SCOPE}/*.`,
+      legacySurfaces,
+      canonicalSurfaces,
+      remediation: [
+        "Back up the exact specs, lock files, and settings of every installed component.",
+        "Stop or close the installed broker-capable adapters.",
+        `Remove the ${LEGACY_NPM_SCOPE}/* specs, packages, and binary links listed above.`,
+        `Install the ${CANONICAL_NPM_SCOPE}/* connect.2 exact tags for the components you actually use.`,
+        "Reload or restart, then verify exactly one broker is running.",
+      ],
+    };
+  }
+
+  return {
+    code: "OK",
+    blocked: false,
+    summary: canonicalSurfaces.length > 0
+      ? `Only ${CANONICAL_NPM_SCOPE}/* (connect.2) install surfaces are present.`
+      : "No Agent Intercom install surfaces were found for this user.",
+    legacySurfaces,
+    canonicalSurfaces,
+    remediation: [],
+  };
 }
 
 export async function fetchLatestNpmVersion(packageName: string): Promise<string | undefined> {
@@ -170,10 +497,13 @@ export async function inspectAdapterFamily(options: {
     if (adapter.id === "orchestrator") root = root ?? options.currentPackageRoot;
     if (adapter.binary) root = root ?? await packageRootFrom(options.commandPaths?.[adapter.binary], adapter.packageName);
     if (adapter.id === "opencode") root = root ?? await configuredOpenCodePluginRoot(options.home, adapter.packageName);
-    root = root ?? (globalRoot ? await packageRootFrom(join(globalRoot, "@dataforxyz", adapter.repo), adapter.packageName) : undefined);
+    root = root ?? (globalRoot ? await packageRootFrom(join(globalRoot, CANONICAL_NPM_SCOPE, adapter.repo), adapter.packageName) : undefined);
     if (root && !(await exists(root))) root = undefined;
 
     const current = await versionAt(root);
+    const installedName = root ? (await readJson(join(root, "package.json")))?.name : undefined;
+    const legacyInstalled = isLegacyPackageName(installedName)
+      || (installedName === undefined && sourceSpec ? sourceIsLegacy(sourceSpec, adapter) : false);
     const latest = latestByPackage.get(adapter.packageName);
     let source: AdapterVersion["source"] = "missing";
     if (sourceSpec?.startsWith("git:")) source = "pi-git";
@@ -184,7 +514,14 @@ export async function inspectAdapterFamily(options: {
 
     let update: UpdateCommand | undefined;
     let blockedReason: string | undefined;
-    if (sourceSpec) {
+    if (legacyInstalled) {
+      // Fail closed: a retired-namespace install is never "current" and is
+      // never upgraded in place. Migration must remove it first.
+      blockedReason =
+        `MIGRATION_REQUIRED: ${legacyPackageName(adapter)} (connect.1) is installed. `
+        + `connect.2 ships as ${adapter.packageName}. Remove the legacy install before installing connect.2; `
+        + "side-by-side installation is not supported.";
+    } else if (sourceSpec) {
       if (/@v?\d+\.\d+\.\d+(?:$|[#?])/.test(sourceSpec)) {
         blockedReason = `Pi package source is pinned: ${sourceSpec}`;
       } else {
@@ -204,7 +541,28 @@ export async function inspectAdapterFamily(options: {
       blockedReason = `Local package source is not safely updateable: ${root}`;
     }
 
-    results.push({ id: adapter.id, packageName: adapter.packageName, current, latest, source, root, sourceSpec, status: statusFor(current, latest), update, blockedReason });
+    const legacySurfaces: LegacySurface[] | undefined = legacyInstalled
+      ? [
+          ...(sourceSpec && sourceIsLegacy(sourceSpec, adapter)
+            ? [{ kind: "pi-settings" as const, detail: sourceSpec }]
+            : []),
+          ...(root ? [{ kind: "node-modules" as const, detail: root }] : []),
+        ]
+      : undefined;
+
+    results.push({
+      id: adapter.id,
+      packageName: adapter.packageName,
+      current,
+      latest,
+      source,
+      root,
+      sourceSpec,
+      status: legacyInstalled ? "migration-required" : statusFor(current, latest),
+      update,
+      blockedReason,
+      legacySurfaces,
+    });
   }
   return results;
 }
@@ -218,7 +576,22 @@ export function formatAdapterVersions(adapters: AdapterVersion[]): string {
 }
 
 export function formatUpdatePlan(adapters: AdapterVersion[]): string {
+  // Legacy installs are surfaced first and can never be reported as current.
+  const migrating = adapters.filter((adapter) => adapter.status === "migration-required");
   const pending = adapters.filter((adapter) => adapter.status === "outdated" || adapter.status === "missing");
+  if (migrating.length > 0) {
+    const lines = [
+      `MIGRATION_REQUIRED: ${migrating.length} adapter(s) still use the retired ${LEGACY_NPM_SCOPE}/* namespace.`,
+      "Side-by-side installation is not supported. Remove connect.1 before installing connect.2.",
+    ];
+    for (const adapter of migrating) {
+      lines.push(`- ${adapter.id}: ${adapter.blockedReason ?? "legacy install detected"}`);
+      for (const surface of adapter.legacySurfaces ?? []) {
+        lines.push(`  ${surface.kind}: ${surface.detail}`);
+      }
+    }
+    return lines.join("\n");
+  }
   if (!pending.length) return "All detected Agent Intercom adapters are current.";
   const lines = ["Agent Intercom update plan:"];
   for (const adapter of pending) {

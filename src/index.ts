@@ -319,9 +319,12 @@ async function resolveInstalledPiExtension(candidates: string[], requirement: st
 }
 
 async function resolvePiIntercomExtension(agentDir: string): Promise<string> {
+  // connect.2 installs under the canonical ctliz owner / @ctliz scope. The
+  // retired dataforxyz paths are intentionally NOT accepted here: a connect.1
+  // install must be migrated, not loaded alongside connect.2.
   return resolveInstalledPiExtension([
-    join(agentDir, "git", "github.com", "dataforxyz", "agent-intercom-pi", "index.ts"),
-    join(agentDir, "npm", "node_modules", "@dataforxyz", "agent-intercom-pi", "index.ts"),
+    join(agentDir, "git", "github.com", "ctliz", "agent-intercom-pi", "index.ts"),
+    join(agentDir, "npm", "node_modules", "@ctliz", "agent-intercom-pi", "index.ts"),
   ], "Hardened Pi workers require agent-intercom-pi in the Pi git or npm package cache");
 }
 

@@ -4,7 +4,7 @@ import test from "node:test";
 import {
   BROKER_PROVIDER_ATTESTATION_VERSION,
   brokerProviderAttestationSigningBytes,
-} from "@dataforxyz/agent-intercom-core/boss";
+} from "@ctliz/agent-intercom-core/boss";
 import {
   BOSS_PROTECTED_SERVICE_MANIFEST_VERSION,
   BOSS_PROTECTED_SERVICE_PROVIDERS,

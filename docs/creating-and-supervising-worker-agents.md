@@ -85,7 +85,7 @@ All adapters share the same local broker and runtime directory. A session can on
 ### Pi
 
 ```bash
-pi install npm:@dataforxyz/agent-intercom-pi
+pi install git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2
 ```
 
 Restart Pi or run `/reload` in every already-open Pi session after an update.
@@ -108,7 +108,7 @@ intercom_list({})
 Install the orchestrator as a Pi package after `agent-intercom-pi`:
 
 ```bash
-pi install npm:@dataforxyz/agent-intercom-orchestrator
+pi install git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2
 ```
 
 This package loads two resources automatically:
@@ -148,8 +148,8 @@ The important pieces are:
 
 | Package | Purpose |
 |---|---|
-| [`agent-intercom-pi`](https://github.com/dataforxyz/agent-intercom-pi) | Native Intercom tools, inbound turns, status, and UI |
-| [`agent-intercom-orchestrator`](https://github.com/dataforxyz/agent-intercom-orchestrator) | Owned cross-harness coworker lifecycle, models, effort, defaults, and cleanup |
+| [`agent-intercom-pi`](https://github.com/ctliz/agent-intercom-pi) | Native Intercom tools, inbound turns, status, and UI |
+| [`agent-intercom-orchestrator`](https://github.com/ctliz/agent-intercom-orchestrator) | Owned cross-harness coworker lifecycle, models, effort, defaults, and cleanup |
 | [`pi-extensions`](https://github.com/dataforxyz/pi-extensions) | Ralph loop plus the selected UI, guidance, recap, and usage extensions |
 | [`pi-return-on`](https://github.com/dataforxyz/pi-return-on) | Wake the manager when a timer, process, file, port, URL, or other condition is ready |
 | [`phone-pi`](https://github.com/a2ajinkya/phone-pi) | Provides the `mobile-persona.ts` extension with `/mobile` and `/default` |
@@ -184,8 +184,8 @@ The following is a portable copy of the package and Return On portion of the man
     },
     "git:github.com/dataforxyz/pi-spend",
     "npm:pi-prompt-template-model",
-    "npm:@dataforxyz/agent-intercom-pi",
-    "npm:@dataforxyz/agent-intercom-orchestrator",
+    "git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2",
+    "git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2",
     "npm:pi-safe-compact",
     "npm:pi-mcp-adapter",
     "git:github.com/dataforxyz/pi-openai-fast@e0917469c325afceba93fc15e363721539cb9f19",
@@ -216,8 +216,8 @@ pi install git:github.com/dataforxyz/pi-return-on
 pi install git:github.com/dataforxyz/pi-extensions
 pi install git:github.com/dataforxyz/pi-spend
 pi install npm:pi-prompt-template-model
-pi install npm:@dataforxyz/agent-intercom-pi
-pi install npm:@dataforxyz/agent-intercom-orchestrator
+pi install git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2
+pi install git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2
 pi install npm:pi-safe-compact
 pi install npm:pi-mcp-adapter
 pi install git:github.com/dataforxyz/pi-openai-fast@e0917469c325afceba93fc15e363721539cb9f19
@@ -264,7 +264,7 @@ Install the adapter under OpenCode's configuration directory:
 ```bash
 mkdir -p ~/.config/opencode
 cd ~/.config/opencode
-npm install @dataforxyz/agent-intercom-opencode
+npm install github:ctliz/agent-intercom-opencode#v0.11.0-connect.2
 ```
 
 Add the server plugin to `~/.config/opencode/opencode.json`, using your absolute home path:
@@ -273,7 +273,7 @@ Add the server plugin to `~/.config/opencode/opencode.json`, using your absolute
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
-    "/home/you/.config/opencode/node_modules/@dataforxyz/agent-intercom-opencode/dist/plugin.mjs"
+    "/home/you/.config/opencode/node_modules/@ctliz/agent-intercom-opencode/dist/plugin.mjs"
   ]
 }
 ```
@@ -284,7 +284,7 @@ Add the TUI plugin separately in `~/.config/opencode/tui.json`:
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
-    "/home/you/.config/opencode/node_modules/@dataforxyz/agent-intercom-opencode/dist/tui.mjs"
+    "/home/you/.config/opencode/node_modules/@ctliz/agent-intercom-opencode/dist/tui.mjs"
   ]
 }
 ```
@@ -296,7 +296,8 @@ No wrapper alias is required for ordinary worker sessions. Once both plugins are
 To make one OpenCode session the primary fleet manager, install the orchestrator CLI:
 
 ```bash
-npm install -g @dataforxyz/agent-intercom-orchestrator
+git clone --depth 1 --branch v0.11.0-connect.2 https://github.com/ctliz/agent-intercom-orchestrator.git
+cd agent-intercom-orchestrator && npm ci && npm link
 ```
 
 Start the manager with a stable Intercom identity and explicit fleet opt-in:
@@ -318,10 +319,11 @@ Do not put `OPENCODE_INTERCOM_FLEET=1` in a machine-wide environment inherited b
 
 ### Codex
 
-Install globally:
+Install the command-line entry points on `PATH`:
 
 ```bash
-npm install -g @dataforxyz/agent-intercom-codex
+git clone --depth 1 --branch v0.11.0-connect.2 https://github.com/ctliz/agent-intercom-codex.git
+cd agent-intercom-codex && npm ci && npm link
 ```
 
 Register the MCP server:
@@ -344,10 +346,11 @@ coi --no-tui --name worker-a --id worker-a --cwd /path/to/repo
 
 ### Claude Code
 
-Install globally:
+Install the command-line entry points on `PATH`:
 
 ```bash
-npm install -g @dataforxyz/agent-intercom-claude
+git clone --depth 1 --branch v0.12.0-connect.2 https://github.com/ctliz/agent-intercom-claude.git
+cd agent-intercom-claude && npm ci && npm link
 ```
 
 Register the MCP server:

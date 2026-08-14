@@ -3,7 +3,7 @@ import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, wr
 import net from "node:net";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
-import { POLICY_SEMANTICS_HASH, POLICY_SEMANTICS_VERSION } from "@dataforxyz/agent-intercom-core";
+import { POLICY_SEMANTICS_HASH, POLICY_SEMANTICS_VERSION } from "@ctliz/agent-intercom-core";
 
 const MAX_FRAME_BYTES = 2 * 1024 * 1024;
 

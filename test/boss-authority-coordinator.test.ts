@@ -26,7 +26,7 @@ import {
   type AuthorityTransitionRecord,
   type AuthorityTransitionRequest,
   type BrokerIdentityRecord,
-} from "@dataforxyz/agent-intercom-core/boss";
+} from "@ctliz/agent-intercom-core/boss";
 import {
   BossAuthorityQueryError,
   createBossAuthorityQueryClient,
@@ -79,7 +79,7 @@ function authorityFixture(): AuthorityFixture {
   const providerKeys = generateKeyPairSync("ed25519");
   const providerAttestation = {
     version: BROKER_PROVIDER_ATTESTATION_VERSION,
-    providerPackage: "@dataforxyz/agent-intercom-pi",
+    providerPackage: "@ctliz/agent-intercom-pi",
     providerVersion: "1.0.0",
     providerDigest: DIGEST,
     artifactPath: "/usr/lib/agent-intercom/providers/agent-intercom-pi/provider.mjs",

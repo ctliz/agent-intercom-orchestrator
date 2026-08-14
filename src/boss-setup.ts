@@ -22,8 +22,10 @@ interface BossResourceDefinition {
 }
 
 const REQUIRED_RESOURCES: readonly BossResourceDefinition[] = [
-  { id: "intercom-pi", packageName: "@dataforxyz/agent-intercom-pi", source: "git:github.com/dataforxyz/agent-intercom-pi", repositoryPath: "dataforxyz/agent-intercom-pi", extensionPath: "index.ts" },
-  { id: "orchestrator", packageName: "@dataforxyz/agent-intercom-orchestrator", source: "git:github.com/dataforxyz/agent-intercom-orchestrator", repositoryPath: "dataforxyz/agent-intercom-orchestrator", extensionPath: "src/index.ts" },
+  // Agent Intercom packages moved to the ctliz owner in connect.2.
+  { id: "intercom-pi", packageName: "@ctliz/agent-intercom-pi", source: "git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2", repositoryPath: "ctliz/agent-intercom-pi", extensionPath: "index.ts" },
+  { id: "orchestrator", packageName: "@ctliz/agent-intercom-orchestrator", source: "git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2", repositoryPath: "ctliz/agent-intercom-orchestrator", extensionPath: "src/index.ts" },
+  // Third-party dependencies that genuinely live under the dataforxyz owner.
   { id: "ralph", packageName: "pi-extensions", source: "git:github.com/dataforxyz/pi-extensions", repositoryPath: "dataforxyz/pi-extensions", extensionPath: "pi-ralph-wiggum/index.ts" },
   { id: "return-on", packageName: "pi-return-on", source: "git:github.com/dataforxyz/pi-return-on", repositoryPath: "dataforxyz/pi-return-on", extensionPath: "src/index.ts", unpublished: true },
 ] as const;
@@ -152,8 +154,11 @@ function sourceMatches(entry: BossPackageSetting, definition: BossResourceDefini
   return entry.source.includes(definition.packageName);
 }
 
-function sourcePinned(source: string): boolean {
+function sourcePinned(source: string, expectedSource?: string): boolean {
   const normalized = normalizedSource(source);
+  if (expectedSource && normalized === normalizedSource(expectedSource)) {
+    return false;
+  }
   if (/^git:github\.com\/[^@#]+(?:@|#).+$/.test(normalized)) return true;
   return /^npm:(?:@[^/]+\/)?[^@]+@.+$/.test(source);
 }
@@ -190,7 +195,7 @@ async function inspectResource(agentDir: string, settings: BossPackageSetting[],
   const gitRoot = root ? gitValue(root, ["rev-parse", "--show-toplevel"]) : undefined;
   const dirty = gitRoot ? Boolean(gitValue(gitRoot, ["status", "--porcelain"])) : false;
   if (dirty) diagnostics.push(`Recognized Git checkout is dirty and must not be reset or replaced: ${gitRoot}`);
-  const pinned = configured.some((entry) => sourcePinned(entry.source));
+  const pinned = configured.some((entry) => sourcePinned(entry.source, definition.source));
   if (pinned) diagnostics.push("Package source is explicitly pinned; setup will not move the pin.");
   const blocking = configured.length !== 1 || !root || manifest?.name !== definition.packageName || !extensionExists || !enabledForController || dirty || pinned;
   const status: BossResourceStatus = blocking ? "blocked" : "ready";
