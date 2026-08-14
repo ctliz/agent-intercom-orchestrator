@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { applyCodexPermissionArgs, applyPiPermissionArgs } from "./permissions.ts";
+import { INTERCOM_SCOPE_ENV, parseIntercomScopeId, type IntercomScopeId } from "./protocol-v4-scope.ts";
 export { normalizeModelForHarness } from "./routing.ts";
 import type { Effort, Harness, LaunchProfile, ManagerOwnerBinding, ManagerOwnerKind, OrchestratorConfig, PermissionProfile, UnitStatus, WorkerRecord, WorkerState } from "./types.ts";
 
@@ -177,11 +178,23 @@ export function buildWorkerEnvironment(
   role: string,
   model?: string,
   ownership?: { runId: string; unit: string; managerSessionId: string; fresh?: boolean },
+  options?: { intercomScopeId?: IntercomScopeId },
 ): Record<string, string> {
+  // Scope is captured ONCE by the caller at extension initialization and
+  // passed in explicitly. This function must NEVER read process.env for
+  // scope — that would let a mutated env change the value observed by
+  // create/restart/resume/adopt/nested ownership paths after init. Any value
+  // supplied here is re-validated so a caller cannot smuggle an invalid
+  // string past the manager's original capture.
+  const rawScopeId = options?.intercomScopeId;
+  const scopeId = rawScopeId === undefined
+    ? undefined
+    : parseIntercomScopeId(rawScopeId, INTERCOM_SCOPE_ENV);
   const ownedEnvironment = {
     AGENT_INTERCOM_ROLE: role,
     AGENT_INTERCOM_WORKER_ID: workerId,
     AGENT_INTERCOM_OWNED: "1",
+    ...(scopeId ? { [INTERCOM_SCOPE_ENV]: scopeId } : {}),
     ...(ownership ? {
       AGENT_INTERCOM_RUN_ID: ownership.runId,
       AGENT_INTERCOM_SYSTEMD_UNIT: ownership.unit,

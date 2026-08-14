@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { hasFlock } from "./utils.ts";
 import { access, mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -501,7 +502,7 @@ test("failed fast-path cleanup cannot delete a replacement lock owner", async ()
   }
 });
 
-test("contended acquisition retries mkdir under the guard after an owner release race", async () => {
+test("contended acquisition retries mkdir under the guard after an owner release race", { skip: !hasFlock() }, async () => {
   const root = await mkdtemp(join(tmpdir(), "worker-store-v2-release-race-"));
   const path = join(root, "workers.json");
   const lockPath = `${path}.lock`;
@@ -561,7 +562,7 @@ test("worker lock timeout must be a positive safe integer", () => {
   assert.throws(() => new WorkerStore("/tmp/workers.json", { lockTimeoutMs: 1.5 }), /lockTimeoutMs must be a positive safe integer/);
 });
 
-test("concurrent stores reclaim one dead directory lock without deleting a replacement", async () => {
+test("concurrent stores reclaim one dead directory lock without deleting a replacement", { skip: !hasFlock() }, async () => {
   const root = await mkdtemp(join(tmpdir(), "worker-store-v2-stale-lock-"));
   const path = join(root, "workers.json");
   try {
@@ -582,7 +583,7 @@ test("concurrent stores reclaim one dead directory lock without deleting a repla
   }
 });
 
-test("malformed fresh owners wait for age while stale guard files recover through kernel locking", async () => {
+test("malformed fresh owners wait for age while stale guard files recover through kernel locking", { skip: !hasFlock() }, async () => {
   const root = await mkdtemp(join(tmpdir(), "worker-store-v2-reclaim-fail-closed-"));
   const path = join(root, "workers.json");
   const lockPath = `${path}.lock`;

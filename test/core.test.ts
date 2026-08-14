@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { existsSync } from "node:fs";
+import { hasFlock } from "./utils.ts";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -111,11 +113,11 @@ test("harness launch args include identity or the initial task", () => {
     assert.match(args.join(" "), /\.venv\/bin\/pytest/);
     assert.match(args.join(" "), /never claim it succeeded/);
   }
-  assert.equal(buildWorkerEnvironment("pi", "advisor-a", "advisor").AGENT_INTERCOM_ORCHESTRATOR_DISABLED, "1");
-  assert.equal(buildWorkerEnvironment("codex", "builder-a", "builder", "gpt-5.6-sol").CODEX_INTERCOM_MODEL, "gpt-5.6-sol");
+  assert.equal(buildWorkerEnvironment("pi", "advisor-a", "advisor", undefined, undefined, { intercomScopeId: "scope_1234567890abcdef" }).AGENT_INTERCOM_ORCHESTRATOR_DISABLED, "1");
+  assert.equal(buildWorkerEnvironment("codex", "builder-a", "builder", "gpt-5.6-sol", undefined, { intercomScopeId: "scope_1234567890abcdef" }).CODEX_INTERCOM_MODEL, "gpt-5.6-sol");
   const ownedEnv = buildWorkerEnvironment("pi", "advisor-a", "advisor", undefined, {
     runId: "run-a", unit: "worker-a.service", managerSessionId: "manager-a", fresh: true,
-  });
+  }, { intercomScopeId: "scope_1234567890abcdef" });
   assert.equal(ownedEnv.AGENT_INTERCOM_WORKER_ID, "advisor-a");
   assert.equal(ownedEnv.AGENT_INTERCOM_SYSTEMD_UNIT, "worker-a.service");
   assert.equal(ownedEnv.AGENT_INTERCOM_MANAGER_SESSION_ID, "manager-a");
@@ -503,7 +505,8 @@ test("profile command resolution verifies absolute and PATH executables", async 
   try {
     const nonExecutable = join(dir, "not-executable");
     await writeFile(nonExecutable, "#!/bin/sh\n");
-    assert.equal(resolveProfileCommand("/bin/true"), "/bin/true");
+    const truePath = existsSync("/bin/true") ? "/bin/true" : "/usr/bin/true";
+    assert.equal(resolveProfileCommand(truePath), truePath);
     assert.equal(resolveProfileCommand(nonExecutable), undefined);
     assert.equal(resolveProfileCommand("missing-command", dir), undefined);
   } finally {
@@ -724,7 +727,7 @@ test("default writes preserve an explicit default-valued routing object as autho
   }
 });
 
-test("worker store immediately reclaims a lock owned by a dead process", async () => {
+test("worker store immediately reclaims a lock owned by a dead process", { skip: !hasFlock() }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-dead-lock-test-"));
   try {
     const path = join(dir, "workers.json");
@@ -791,7 +794,7 @@ test("forget keeps the worker id reserved until its runtime deletion finishes", 
   }
 });
 
-test("worker store writes atomically and serializes concurrent mutations", async () => {
+test("worker store writes atomically and serializes concurrent mutations", { skip: !hasFlock() }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-test-"));
   try {
     const path = join(dir, "workers.json");
@@ -818,6 +821,6 @@ test("worker store writes atomically and serializes concurrent mutations", async
     const raw = await readFile(path, "utf8");
     assert.doesNotThrow(() => JSON.parse(raw));
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
   }
 });

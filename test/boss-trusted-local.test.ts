@@ -1,3 +1,4 @@
+import { hasFlock } from "./utils.ts";
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
@@ -104,7 +105,7 @@ async function applyPersistedPause(store: TrustedLocalBossStore, bossRunId: stri
   return store.finishPauseControl(status.run!.bossRunId, transition.actionId);
 }
 
-test("trusted-local Boss creates and reports an explicitly advisory run", async () => {
+test("trusted-local Boss creates and reports an explicitly advisory run", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create ship the useful workflow"), "manager-session-1");
@@ -131,7 +132,7 @@ test("trusted-local Boss creates and reports an explicitly advisory run", async 
   }
 });
 
-test("trusted-local Boss authorizes exact Controller freeze and unfreeze transitions", async () => {
+test("trusted-local Boss authorizes exact Controller freeze and unfreeze transitions", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   const bossRunId = "boss-11111111-1111-4111-8111-111111111111";
   try {
@@ -170,7 +171,7 @@ test("trusted-local Boss authorizes exact Controller freeze and unfreeze transit
   }
 });
 
-test("trusted-local Boss accepts stable handles as aliases while retaining exact ids", async () => {
+test("trusted-local Boss accepts stable handles as aliases while retaining exact ids", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     store.setHandlePrefix("orc");
@@ -186,7 +187,7 @@ test("trusted-local Boss accepts stable handles as aliases while retaining exact
   }
 });
 
-test("trusted-local Boss supports pause, resume, proof snapshot, and cancel", async () => {
+test("trusted-local Boss supports pause, resume, proof snapshot, and cancel", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create coordinate agents"), "manager-session-2");
@@ -204,7 +205,7 @@ test("trusted-local Boss supports pause, resume, proof snapshot, and cancel", as
   }
 });
 
-test("trusted-local Boss exposes only exact durable applying pause controls for restart reconciliation", async () => {
+test("trusted-local Boss exposes only exact durable applying pause controls for restart reconciliation", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create recover interrupted pause"), "controller-restart");
@@ -229,7 +230,7 @@ test("trusted-local Boss exposes only exact durable applying pause controls for 
   }
 });
 
-test("trusted-local Boss migrates v8/v6 accepted pauses without inventing degradation evidence", async () => {
+test("trusted-local Boss migrates v8/v6 accepted pauses without inventing degradation evidence", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   const path = join(dir, "runs.json");
   try {
@@ -263,7 +264,7 @@ test("trusted-local Boss migrates v8/v6 accepted pauses without inventing degrad
   }
 });
 
-test("trusted-local Boss migrates v9/v7 pause transitions without inventing per-target settlement", async () => {
+test("trusted-local Boss migrates v9/v7 pause transitions without inventing per-target settlement", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   const path = join(dir, "runs.json");
   try {
@@ -292,7 +293,7 @@ test("trusted-local Boss migrates v9/v7 pause transitions without inventing per-
   }
 });
 
-test("trusted-local Boss records accepted-pause degradation as observed evidence without new authorization", async () => {
+test("trusted-local Boss records accepted-pause degradation as observed evidence without new authorization", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create reconcile accepted pause"), "controller-degraded");
@@ -319,7 +320,7 @@ test("trusted-local Boss records accepted-pause degradation as observed evidence
   }
 });
 
-test("trusted-local Boss permits concurrent open runs and rejects premature approvals", async () => {
+test("trusted-local Boss permits concurrent open runs and rejects premature approvals", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create first goal"), "manager-session-3");
@@ -334,7 +335,7 @@ test("trusted-local Boss permits concurrent open runs and rejects premature appr
   }
 });
 
-test("trusted-local Boss owned status payload uses bossRunId as the deterministic timestamp tie-breaker", async () => {
+test("trusted-local Boss owned status payload uses bossRunId as the deterministic timestamp tie-breaker", { skip: !hasFlock() }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "boss-trusted-local-summary-tie-"));
   const store = new TrustedLocalBossStore(join(dir, "runs.json"), () => new Date(1_700_000_000_000));
   try {
@@ -349,7 +350,7 @@ test("trusted-local Boss owned status payload uses bossRunId as the deterministi
   }
 });
 
-test("trusted-local Boss serializes concurrent creates across Controllers and lists only owned runs", async () => {
+test("trusted-local Boss serializes concurrent creates across Controllers and lists only owned runs", { skip: !hasFlock() }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "boss-trusted-local-concurrent-"));
   const path = join(dir, "runs.json");
   let tick = 0;
@@ -375,7 +376,7 @@ test("trusted-local Boss serializes concurrent creates across Controllers and li
   }
 });
 
-test("trusted-local Boss denies cross-Controller detail and mutations before disclosure", async () => {
+test("trusted-local Boss denies cross-Controller detail and mutations before disclosure", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create controller private goal"), "controller-owner");
@@ -399,7 +400,7 @@ test("trusted-local Boss denies cross-Controller detail and mutations before dis
   }
 });
 
-test("trusted-local Boss terminal actions do not disturb sibling runs", async () => {
+test("trusted-local Boss terminal actions do not disturb sibling runs", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const first = await store.execute(parseBossCommand("create cancel only this run"), "controller-owner");
@@ -418,7 +419,7 @@ test("trusted-local Boss terminal actions do not disturb sibling runs", async ()
   }
 });
 
-test("trusted-local Boss reads v1 state and migrates it on the next write", async () => {
+test("trusted-local Boss reads v1 state and migrates it on the next write", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   const path = join(dir, "runs.json");
   try {
@@ -447,7 +448,7 @@ test("trusted-local Boss reads v1 state and migrates it on the next write", asyn
   }
 });
 
-test("trusted-local Boss reads v3 activity state and upgrades it without inventing a bind timestamp", async () => {
+test("trusted-local Boss reads v3 activity state and upgrades it without inventing a bind timestamp", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   const path = join(dir, "runs.json");
   try {
@@ -479,7 +480,7 @@ test("trusted-local Boss reads v3 activity state and upgrades it without inventi
   }
 });
 
-test("trusted-local Boss migrates v6/v4 proof packets with explicit unavailable bindings", async () => {
+test("trusted-local Boss migrates v6/v4 proof packets with explicit unavailable bindings", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   const path = join(dir, "runs.json");
   try {
@@ -516,7 +517,7 @@ test("trusted-local Boss migrates v6/v4 proof packets with explicit unavailable 
   }
 });
 
-test("trusted-local Boss migrates deployed v7/v5 bound proof, delivery, and decision history", async () => {
+test("trusted-local Boss migrates deployed v7/v5 bound proof, delivery, and decision history", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   const path = join(dir, "runs.json");
   try {
@@ -555,7 +556,7 @@ test("trusted-local Boss migrates deployed v7/v5 bound proof, delivery, and deci
   }
 });
 
-test("trusted-local Boss migrates v3 canonical proof, delivery, and decision history as explicitly unbound", async () => {
+test("trusted-local Boss migrates v3 canonical proof, delivery, and decision history as explicitly unbound", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   const path = join(dir, "runs.json");
   try {
@@ -596,7 +597,7 @@ test("trusted-local Boss migrates v3 canonical proof, delivery, and decision his
   }
 });
 
-test("trusted-local Boss upgrades active v3 canonical resources to initial Controller revisions and permits freeze", async () => {
+test("trusted-local Boss upgrades active v3 canonical resources to initial Controller revisions and permits freeze", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   const path = join(dir, "runs.json");
   try {
@@ -623,7 +624,7 @@ test("trusted-local Boss upgrades active v3 canonical resources to initial Contr
   }
 });
 
-test("trusted-local Boss refuses future schemas and freeze projections not derived from the audit ledger", async () => {
+test("trusted-local Boss refuses future schemas and freeze projections not derived from the audit ledger", { skip: !hasFlock() }, async () => {
   const first = await fixture();
   try {
     await first.store.execute(parseBossCommand("create reject future schema"), "controller-schema-gate");
@@ -649,7 +650,7 @@ test("trusted-local Boss refuses future schemas and freeze projections not deriv
   }
 });
 
-test("trusted-local Boss assigns deterministic handles while migrating v2 run records", async () => {
+test("trusted-local Boss assigns deterministic handles while migrating v2 run records", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   const path = join(dir, "runs.json");
   try {
@@ -685,7 +686,7 @@ test("trusted-local Boss assigns deterministic handles while migrating v2 run re
   }
 });
 
-test("trusted-local Boss records Manager staffing and lifecycle changes from ordinary fleet state", async () => {
+test("trusted-local Boss records Manager staffing and lifecycle changes from ordinary fleet state", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create staff and supervise"), "manager-session-5");
@@ -707,7 +708,7 @@ test("trusted-local Boss records Manager staffing and lifecycle changes from ord
   }
 });
 
-test("trusted-local Boss status exposes an honest persisted pending-decision owner", async () => {
+test("trusted-local Boss status exposes an honest persisted pending-decision owner", { skip: !hasFlock() }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "boss-trusted-local-pending-decision-"));
   let now = 1_700_000_000_000;
   const store = new TrustedLocalBossStore(join(dir, "runs.json"), () => new Date(now));
@@ -764,7 +765,7 @@ test("trusted-local Boss status exposes an honest persisted pending-decision own
   }
 });
 
-test("trusted-local Boss separates transport, acknowledgement, communication, and substantive checkpoints", async () => {
+test("trusted-local Boss separates transport, acknowledgement, communication, and substantive checkpoints", { skip: !hasFlock() }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "boss-trusted-local-communication-"));
   let now = 1_700_000_000_000;
   const store = new TrustedLocalBossStore(join(dir, "runs.json"), () => new Date(now));
@@ -829,7 +830,7 @@ test("trusted-local Boss separates transport, acknowledgement, communication, an
   }
 });
 
-test("trusted-local Boss revisions Worker and Scout assignments with ordinary delivery results and controls", async () => {
+test("trusted-local Boss revisions Worker and Scout assignments with ordinary delivery results and controls", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create staff the delivery ledger"), "manager-session-staff");
@@ -853,7 +854,7 @@ test("trusted-local Boss revisions Worker and Scout assignments with ordinary de
   }
 });
 
-test("trusted-local Boss fails the run when Manager launch or lifecycle fails", async () => {
+test("trusted-local Boss fails the run when Manager launch or lifecycle fails", { skip: !hasFlock() }, async () => {
   const first = await fixture();
   try {
     const created = await first.store.execute(parseBossCommand("create fail launch safely"), "manager-session-6");
@@ -892,7 +893,7 @@ test("trusted-local Boss fails the run when Manager launch or lifecycle fails", 
   }
 });
 
-test("trusted-local Boss keeps an accepted pause resumable when the intentionally-unfrozen Manager dies", async () => {
+test("trusted-local Boss keeps an accepted pause resumable when the intentionally-unfrozen Manager dies", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const controller = "controller-paused-manager-failure";
@@ -933,7 +934,7 @@ test("trusted-local Boss keeps an accepted pause resumable when the intentionall
   }
 });
 
-test("trusted-local Boss stales proof creation, delivery, and decision when the frozen candidate moves", async () => {
+test("trusted-local Boss stales proof creation, delivery, and decision when the frozen candidate moves", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const { created, fingerprint } = await createFrozenRun(store, "controller-stale-proof", "reject moving evidence");
@@ -960,7 +961,7 @@ test("trusted-local Boss stales proof creation, delivery, and decision when the 
   }
 });
 
-test("trusted-local Boss stales frozen evidence when resource, acceptance, or design revisions advance", async () => {
+test("trusted-local Boss stales frozen evidence when resource, acceptance, or design revisions advance", { skip: !hasFlock() }, async () => {
   const staffReviewer = async (store: TrustedLocalBossStore, bossRunId: string, controller: string) => {
     await store.recordManagerStarted(bossRunId, managerWorker(bossRunId));
     await store.execute(parseBossCommand(`proof ${bossRunId}`), controller);
@@ -998,7 +999,7 @@ test("trusted-local Boss stales frozen evidence when resource, acceptance, or de
   }
 });
 
-test("trusted-local Boss preservation release never removes a frozen candidate", () => {
+test("trusted-local Boss preservation release never removes a frozen candidate", { skip: !hasFlock() }, () => {
   const resource = canonicalResource("boss-22222222-2222-4222-8222-222222222222");
   const preserved = preserveProvisionedBossResource(resource, "authorized freeze remains current");
   assert.equal(preserved.removed, false);
@@ -1009,7 +1010,7 @@ test("trusted-local Boss preservation release never removes a frozen candidate",
   assert.match(preserved.dirtyStatus ?? "", /freeze remains current/);
 });
 
-test("trusted-local Boss binds advisory proof revisions to an assigned adversary decision", async () => {
+test("trusted-local Boss binds advisory proof revisions to an assigned adversary decision", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const { created, fingerprint } = await createFrozenRun(store, "manager-session-8", "prove and review");
@@ -1045,7 +1046,7 @@ test("trusted-local Boss binds advisory proof revisions to an assigned adversary
   }
 });
 
- test("trusted-local Boss fences session races and preserves terminal lifecycle", async () => {
+ test("trusted-local Boss fences session races and preserves terminal lifecycle", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create fence the owner"), "manager-session-owner");
@@ -1077,7 +1078,7 @@ test("trusted-local Boss binds advisory proof revisions to an assigned adversary
   }
 });
 
- test("trusted-local Boss rejects writer/parser bound violations without corrupting state", async () => {
+ test("trusted-local Boss rejects writer/parser bound violations without corrupting state", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     await assert.rejects(store.execute({ action: "create", goal: "x".repeat(10_001) }, "manager-session-bounds"), /exceeds 10000/);
@@ -1098,7 +1099,7 @@ test("trusted-local Boss binds advisory proof revisions to an assigned adversary
   }
 });
 
- test("trusted-local Boss retries transient adversary staffing failure with a new assignment revision", async () => {
+ test("trusted-local Boss retries transient adversary staffing failure with a new assignment revision", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const { created, fingerprint } = await createFrozenRun(store, "manager-session-reviewer-retry", "retry transient reviewer launch");
@@ -1124,7 +1125,7 @@ test("trusted-local Boss binds advisory proof revisions to an assigned adversary
   }
 });
 
-test("trusted-local Boss keeps proof delivery live at ledger capacity and retries the same revision", async () => {
+test("trusted-local Boss keeps proof delivery live at ledger capacity and retries the same revision", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const { created, fingerprint } = await createFrozenRun(store, "manager-session-proof-cap", "fill bounded delivery ledger");
@@ -1150,7 +1151,7 @@ test("trusted-local Boss keeps proof delivery live at ledger capacity and retrie
   }
 });
 
-test("trusted-local Boss keeps late reviewer assignment live at lifecycle capacity", async () => {
+test("trusted-local Boss keeps late reviewer assignment live at lifecycle capacity", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const { created, fingerprint } = await createFrozenRun(store, "manager-session-lifecycle-cap", "retain bounded lifecycle liveness");
@@ -1179,7 +1180,7 @@ test("trusted-local Boss keeps late reviewer assignment live at lifecycle capaci
   }
 });
 
-test("trusted-local Boss durably recovers the spawn-to-assignment binding gap across store instances", async () => {
+test("trusted-local Boss durably recovers the spawn-to-assignment binding gap across store instances", { skip: !hasFlock() }, async () => {
   const dir = await mkdtemp(join(tmpdir(), "boss-binding-recovery-"));
   const path = join(dir, "runs.json");
   const first = new TrustedLocalBossStore(path);
@@ -1223,7 +1224,7 @@ test("trusted-local Boss durably recovers the spawn-to-assignment binding gap ac
   }
 });
 
-test("trusted-local Boss recovery skips terminal runs so orphan containment remains available", async () => {
+test("trusted-local Boss recovery skips terminal runs so orphan containment remains available", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create fail before worker binding"), "controller-terminal-recovery");
@@ -1244,7 +1245,7 @@ test("trusted-local Boss recovery skips terminal runs so orphan containment rema
   }
 });
 
-test("trusted-local Boss identifies restart-visible uncorrelated Boss workers", async () => {
+test("trusted-local Boss identifies restart-visible uncorrelated Boss workers", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const missingRunWorker = managerWorker("boss-00000000-0000-4000-8000-000000000000", "working");
@@ -1269,7 +1270,7 @@ test("trusted-local Boss identifies restart-visible uncorrelated Boss workers", 
   }
 });
 
-test("trusted-local Boss projects missing workers and recovers pending cancellation", async () => {
+test("trusted-local Boss projects missing workers and recovers pending cancellation", { skip: !hasFlock() }, async () => {
   const first = await fixture();
   try {
     const created = await first.store.execute(parseBossCommand("create detect missing manager"), "manager-session-missing");
@@ -1316,7 +1317,7 @@ test("trusted-local Boss projects missing workers and recovers pending cancellat
   }
 });
 
-test("trusted-local Boss records durable Manager cancellation outcomes", async () => {
+test("trusted-local Boss records durable Manager cancellation outcomes", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     const created = await store.execute(parseBossCommand("create cancel exactly"), "manager-session-9");
@@ -1342,7 +1343,7 @@ test("trusted-local Boss records durable Manager cancellation outcomes", async (
   }
 });
 
-test("trusted-local Boss rejects malformed persisted state", async () => {
+test("trusted-local Boss rejects malformed persisted state", { skip: !hasFlock() }, async () => {
   const { dir, store } = await fixture();
   try {
     await store.execute(parseBossCommand("create valid goal"), "manager-session-4");

@@ -1,3 +1,4 @@
+import { hasFlock } from "./utils.ts";
 import assert from "node:assert/strict";
 import { access, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -483,7 +484,7 @@ test("proof, evidence, and approval remain revision-bound and content-addressed"
   assert.throws(() => parseBossControllerState(fabricatedApproval), /Boss participant/);
 });
 
-test("create/read/query return detached snapshots and persist mode 0600", async (context) => {
+test("create/read/query return detached snapshots and persist mode 0600", { skip: !hasFlock() }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "boss-store-detached-"));
   context.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })); });
   const path = join(root, "controller.json");
@@ -500,7 +501,7 @@ test("create/read/query return detached snapshots and persist mode 0600", async 
   await assert.rejects(store.query("participants", "../bad"), /ASCII identifier/);
 });
 
-test("CAS and transactions serialize revisions, require append-only audit, and reject stale callers", async (context) => {
+test("CAS and transactions serialize revisions, require append-only audit, and reject stale callers", { skip: !hasFlock() }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "boss-store-cas-"));
   context.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })); });
   const path = join(root, "controller.json");
@@ -533,7 +534,7 @@ test("CAS and transactions serialize revisions, require append-only audit, and r
   await assert.rejects(store.compareAndSwap(3, rewrittenAudit), /audit hash chain|append-only/);
 });
 
-test("controllerGeneration changes only through a newly committed reconciled takeover", async (context) => {
+test("controllerGeneration changes only through a newly committed reconciled takeover", { skip: !hasFlock() }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "boss-store-generation-"));
   context.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })); });
   const store = new BossStore(join(root, "controller.json"), { now: () => LATER });
@@ -575,7 +576,7 @@ test("controllerGeneration changes only through a newly committed reconciled tak
   }), /current generation|advance exactly once/);
 });
 
-test("terminal authority projections and approved evidence content cannot be substituted", async (context) => {
+test("terminal authority projections and approved evidence content cannot be substituted", { skip: !hasFlock() }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "boss-store-content-binding-"));
   context.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })); });
   const store = new BossStore(join(root, "controller.json"), { now: () => LATER });
@@ -612,7 +613,7 @@ test("terminal authority projections and approved evidence content cannot be sub
   }), /captured evidence is immutable/);
 });
 
-test("two store instances reclaim one dead lock without ABA and only one same-revision transaction commits", async (context) => {
+test("two store instances reclaim one dead lock without ABA and only one same-revision transaction commits", { skip: !hasFlock() }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "boss-store-lock-"));
   context.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })); });
   const path = join(root, "controller.json");
@@ -630,7 +631,7 @@ test("two store instances reclaim one dead lock without ABA and only one same-re
   await access(`${path}.lock.reclaim`);
 });
 
-test("the mutation guard serializes lock creation and normal release", async (context) => {
+test("the mutation guard serializes lock creation and normal release", { skip: !hasFlock() }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "boss-store-lock-guard-"));
   context.after(async () => { await rm(root, { recursive: true, force: true }); });
   const path = join(root, "controller.json");
@@ -662,7 +663,7 @@ test("the mutation guard serializes lock creation and normal release", async (co
   await assert.rejects(access(`${path}.lock`), { code: "ENOENT" });
 });
 
-test("owned lock release outwaits the normal acquisition timeout", async (context) => {
+test("owned lock release outwaits the normal acquisition timeout", { skip: !hasFlock() }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "boss-store-lock-release-"));
   context.after(async () => { await rm(root, { recursive: true, force: true }); });
   const path = join(root, "controller.json");
@@ -688,7 +689,7 @@ test("owned lock release outwaits the normal acquisition timeout", async (contex
   await assert.rejects(access(`${path}.lock`), { code: "ENOENT" });
 });
 
-test("corrupt state is copied to deterministic quarantine, preserved, and poisoned read-only", async (context) => {
+test("corrupt state is copied to deterministic quarantine, preserved, and poisoned read-only", { skip: !hasFlock() }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "boss-store-corrupt-"));
   context.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })); });
   const path = join(root, "controller.json");
@@ -707,7 +708,7 @@ test("corrupt state is copied to deterministic quarantine, preserved, and poison
   await assert.rejects(new BossStore(path).read(), BossStorePoisonedError);
 });
 
-test("unknown newer and unsupported-feature states are preserved without quarantine or downgrade", async (context) => {
+test("unknown newer and unsupported-feature states are preserved without quarantine or downgrade", { skip: !hasFlock() }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "boss-store-version-"));
   context.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })); });
   const path = join(root, "controller.json");
@@ -728,7 +729,7 @@ test("unknown newer and unsupported-feature states are preserved without quarant
   await assert.rejects(access(`${path}.poison`), { code: "ENOENT" });
 });
 
-test("all atomic crash points reconcile to exactly the old or new revision", async (context) => {
+test("all atomic crash points reconcile to exactly the old or new revision", { skip: !hasFlock() }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "boss-store-crash-matrix-"));
   context.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })); });
   const afterRename = new Set<BossStoreFaultPoint>(["after_rename", "after_directory_fsync"]);
@@ -756,7 +757,7 @@ test("all atomic crash points reconcile to exactly the old or new revision", asy
   }
 });
 
-test("stale temp files reconcile under lock and cannot shadow the authoritative state", async (context) => {
+test("stale temp files reconcile under lock and cannot shadow the authoritative state", { skip: !hasFlock() }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "boss-store-temp-reconcile-"));
   context.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })); });
   const path = join(root, "controller.json");
@@ -769,7 +770,7 @@ test("stale temp files reconcile under lock and cannot shadow the authoritative 
   assert.equal((await store.read()).revision, 2);
 });
 
-test("a persistence result matching neither old nor new is durably poisoned", async (context) => {
+test("a persistence result matching neither old nor new is durably poisoned", { skip: !hasFlock() }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "boss-store-poison-"));
   context.after(async () => { await import("node:fs/promises").then(({ rm }) => rm(root, { recursive: true, force: true })); });
   const path = join(root, "controller.json");

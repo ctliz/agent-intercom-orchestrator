@@ -2,10 +2,11 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { getUnitStatus, getUserManagerHealth, getWorkerUnitMutationGeneration, launchUnit, parseSystemctlListJobs, stopUnit, waitForUnitRunning, workerSubmissionRejection } from "../src/systemd.ts";
 import { stateFromUnit, unitRequiresStopFence } from "../src/workers.ts";
+import { hasSystemdUserManager } from "./utils.ts";
 
 const ok = (stdout = "") => ({ stdout, stderr: "", code: 0 });
 
-test("list-jobs parsing is strict and preserves structured records", () => {
+test("list-jobs parsing is strict and preserves structured records", { skip: !hasSystemdUserManager() }, () => {
   assert.deepEqual(parseSystemctlListJobs("17 worker-a.service start running\n18 worker-b.service stop waiting\n"), [
     { id: 17, unit: "worker-a.service", type: "start", state: "running", raw: "17 worker-a.service start running" },
     { id: 18, unit: "worker-b.service", type: "stop", state: "waiting", raw: "18 worker-b.service stop waiting" },
@@ -15,7 +16,7 @@ test("list-jobs parsing is strict and preserves structured records", () => {
   assert.throws(() => parseSystemctlListJobs("17 worker-a.service start running\n17 worker-b.service stop waiting\n"), /duplicate/);
 });
 
-test("user-manager health distinguishes diagnostics, cap, malformed output, and timeout", async () => {
+test("user-manager health distinguishes diagnostics, cap, malformed output, and timeout", { skip: !hasSystemdUserManager() }, async () => {
   let reads = 0;
   const healthy = await getUserManagerHealth({ async exec() {
     reads += 1;
@@ -59,7 +60,7 @@ test("user-manager health distinguishes diagnostics, cap, malformed output, and 
   assert.match(stalled.error ?? "", /timed out/);
 });
 
-test("worker admission allows unrelated persistent jobs below cap and fails closed otherwise", () => {
+test("worker admission allows unrelated persistent jobs below cap and fails closed otherwise", { skip: !hasSystemdUserManager() }, () => {
   assert.equal(workerSubmissionRejection({
     responsive: true,
     parsed: true,
@@ -73,7 +74,7 @@ test("worker admission allows unrelated persistent jobs below cap and fails clos
   assert.match(workerSubmissionRejection({ responsive: false, error: "timed out" }) ?? "", /not responsive.*timed out/);
 });
 
-test("launch is nonblocking and a killed submission is indeterminate", async () => {
+test("launch is nonblocking and a killed submission is indeterminate", { skip: !hasSystemdUserManager() }, async () => {
   const calls: string[][] = [];
   const beforeLaunch = getWorkerUnitMutationGeneration();
   await launchUnit({ async exec(_command, args) { calls.push(args); return ok(); } }, {
@@ -91,7 +92,7 @@ test("launch is nonblocking and a killed submission is indeterminate", async () 
   }), /determine whether .* submitted/);
 });
 
-test("stop attempts invalidate cleanup unit inventories", async () => {
+test("stop attempts invalidate cleanup unit inventories", { skip: !hasSystemdUserManager() }, async () => {
   const beforeStop = getWorkerUnitMutationGeneration();
   await stopUnit({ async exec(command, args) {
     if (command === "systemctl" && args.includes("show")) {
@@ -103,7 +104,7 @@ test("stop attempts invalidate cleanup unit inventories", async () => {
   assert.ok(getWorkerUnitMutationGeneration() > beforeStop);
 });
 
-test("queued jobs and activation evidence survive status parsing", async () => {
+test("queued jobs and activation evidence survive status parsing", { skip: !hasSystemdUserManager() }, async () => {
   const queued = await getUnitStatus({ async exec() { return ok(
     "LoadState=loaded\nActiveState=inactive\nSubState=dead\nMainPID=0\nResult=success\nExecMainStatus=0\nJob=77/start\nActiveEnterTimestampMonotonic=0\nInactiveEnterTimestampMonotonic=12\nExecMainStartTimestampMonotonic=0\n",
   ); } }, "queued.service");
@@ -117,7 +118,7 @@ test("queued jobs and activation evidence survive status parsing", async () => {
   assert.equal(stateFromUnit(timedOut, "registering"), "registering");
 });
 
-test("running verification waits through a queue and rejects an early crash", async () => {
+test("running verification waits through a queue and rejects an early crash", { skip: !hasSystemdUserManager() }, async () => {
   let reads = 0;
   const status = await waitForUnitRunning({ async exec() {
     reads += 1;
@@ -150,7 +151,7 @@ test("durable stop intent fences queued and late-active units without reviving t
   assert.equal(unitRequiresStopFence(worker, { verified: false, exists: false, error: "timeout" }), false, "indeterminate status cannot authorize a stop conclusion");
 });
 
-test("stop re-verifies after a timed-out request and waits for the queued job to clear", async () => {
+test("stop re-verifies after a timed-out request and waits for the queued job to clear", { skip: !hasSystemdUserManager() }, async () => {
   let shows = 0;
   const calls: Array<{ command: string; args: string[] }> = [];
   await stopUnit({ async exec(command, args) {

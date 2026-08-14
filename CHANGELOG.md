@@ -1,7 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.11.0-connect.1 - 2026-08-14
 
+- Support Protocol v4 broker-enforced scope isolation (`AGENT_INTERCOM_SCOPE_ID`) and canonical `ctliz` distribution.
+- Pin Core dependency to canonical commit `aad1985e125516b318181560293145bf2507cc6d` (`v0.1.0-connect.1`).
 - Treat a verified live WorkerStore owner PID as authoritative regardless of lock-directory age, with bounded exponential contender backoff, so long-lived owners never churn through the reclaim guard or risk live-lock recovery attempts.
 - Keep high-volume WorkerStore timing telemetry opt-in behind `AGENT_INTERCOM_ORCHESTRATOR_METRICS=1` instead of writing every operation to the interactive Pi terminal by default.
 - Admit worker submission while unrelated systemd user jobs remain queued below the hard 33-job cap, while continuing to fail closed on manager timeouts, command failures, malformed job output, and exact-unit readiness/fencing failures.

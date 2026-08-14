@@ -22,6 +22,7 @@ import { addPiTools, buildPermissionEnvironment, buildPermissionUnitProperties, 
 import { resolvePiRuntime } from "./pi-runtime.ts";
 import { prepareWorkerRuntime, workerRuntimeRoot, workerSocketRuntimeRoot } from "./runtime.ts";
 import { INTERCOM_CONTROL_RECEIVED_EVENT, INTERCOM_CONTROL_REGISTER_EVENT, INTERCOM_CONTROL_SEND_EVENT, registerOwnedWorkerReadinessProbeType, registerOwnedWorkerReadinessResponder, WORKER_READINESS_ACK, WORKER_READINESS_PROBE, WorkerReadinessAckTracker } from "./readiness.ts";
+import { intercomScopeIdFromEnv, type IntercomScopeId } from "./protocol-v4-scope.ts";
 import { boundedCleanupCandidates, captureCleanupUnitInventory, deleteOrphanRuntimeSafely, deleteTerminalRuntimeBatchSafely, deleteTerminalRuntimeSafely, executeCleanupCandidatesIsolated, existingTerminalCachePaths, listRuntimeRoots, recoverStaleRuntimeCleanupClaims, removeFullRuntimePathsSafely, terminalWorkerAt } from "./runtime-cleanup.ts";
 import { detectHarnessAvailability, formatRoutingDecision, inferHarnessFromModel, normalizeModelForHarness, roleInstructionsForHarness, roleRequiresSubagents, resolveHarnessRoute, type HarnessAvailability, type RoutingDecision } from "./routing.ts";
 import { tryAcquireKernelFileLock } from "./file-lock.ts";
@@ -600,6 +601,13 @@ function fleetPromptGuidelines(config: OrchestratorConfig): string[] {
 }
 
 export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
+  // Capture and validate the manager's Intercom scope EXACTLY ONCE, before any
+  // registration side effects (permission policy, readiness responders, event
+  // subscriptions). The captured value is frozen and reused for every
+  // subsequent create/restart/resume/adopt/nested ownership spawn even if
+  // process.env.AGENT_INTERCOM_SCOPE_ID is later mutated. An invalid non-empty
+  // value fails closed here and prevents extension registration.
+  const capturedIntercomScopeId: IntercomScopeId | undefined = intercomScopeIdFromEnv();
   registerWorkerPermissionPolicy(pi);
   const unsubscribeWorkerReadiness = registerOwnedWorkerReadinessResponder(pi);
   if (process.env.AGENT_INTERCOM_ORCHESTRATOR_DISABLED === "1") {
@@ -1410,6 +1418,9 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
   };
 
   const spawnWorker = async (params: FleetParams, ctx: ExtensionContext, resolved: ResolvedSpawn): Promise<WorkerRecord> => {
+    // The manager's scope was captured once at extension init as
+    // `capturedIntercomScopeId` and is passed unchanged into every worker
+    // environment. Per-spawn re-reads of process.env are forbidden here.
     const { harness, role, task, cwd, profileName, permissionProfileName, permissionProfile, model, effort, instructions } = resolved;
     if (harness === "opencode" && model && effort && effort !== "off") {
       const info = (await enumerateOpenCodeModelInfo()).find((candidate) => candidate.id === model);
@@ -1549,7 +1560,7 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           unit,
           managerSessionId: worker.managerSessionId,
           fresh: params.fresh,
-        }),
+        }, { intercomScopeId: capturedIntercomScopeId }),
         ...buildOptionalTrustedLocalBossTeamEnvironment(params.bossTeam),
         ...(params.bossTeam ? buildTrustedLocalBossSupervisionEnvironment(params.bossTeam, runtimeWorkerRoot!) : {}),
         ...(persistentOpenCode ? {

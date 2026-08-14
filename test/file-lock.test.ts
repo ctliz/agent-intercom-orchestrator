@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { hasFlock } from "./utils.ts";
 import { spawn } from "node:child_process";
 import { access, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -27,7 +28,7 @@ function waitForLine(stream: NodeJS.ReadableStream, expected: string): Promise<v
   });
 }
 
-test("kernel mutation lock can wait without a timeout for correctness-critical release", async () => {
+test("kernel mutation lock can wait without a timeout for correctness-critical release", { skip: !hasFlock() }, async () => {
   const root = await mkdtemp(join(tmpdir(), "kernel-file-lock-unbounded-"));
   const path = join(root, "store.lock.reclaim");
   try {
@@ -48,7 +49,7 @@ test("kernel mutation lock can wait without a timeout for correctness-critical r
   }
 });
 
-test("nonblocking kernel lock skips a concurrent holder and succeeds after release", async () => {
+test("nonblocking kernel lock skips a concurrent holder and succeeds after release", { skip: !hasFlock() }, async () => {
   const root = await mkdtemp(join(tmpdir(), "kernel-file-lock-nonblocking-"));
   const path = join(root, "cleanup-run.lock");
   try {
@@ -63,7 +64,7 @@ test("nonblocking kernel lock skips a concurrent holder and succeeds after relea
   }
 });
 
-test("kernel mutation lock survives a stale on-disk file and releases after holder SIGKILL", async () => {
+test("kernel mutation lock survives a stale on-disk file and releases after holder SIGKILL", { skip: !hasFlock() }, async () => {
   const root = await mkdtemp(join(tmpdir(), "kernel-file-lock-"));
   const path = join(root, "store.lock.reclaim");
   try {

@@ -3,6 +3,7 @@ import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { makeCanonicalTempDir } from "./utils.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { resolvePiRuntime } from "../src/pi-runtime.ts";
 import { detectHarnessVersions, formatAdapterVersions, formatHarnessVersions, formatUpdatePlan, inspectAdapterFamily } from "../src/updates.ts";
@@ -13,7 +14,7 @@ async function packageRoot(root: string, name: string, version = "0.9.3"): Promi
 }
 
 test("adapter inspection preserves Pi and npm-global update sources", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-updates-"));
+  const root = await makeCanonicalTempDir("agent-intercom-updates-");
   const agentDir = join(root, "agent");
   const globalRoot = join(root, "global", "node_modules");
   try {
@@ -44,7 +45,7 @@ test("adapter inspection preserves Pi and npm-global update sources", async () =
 });
 
 test("pinned Pi package sources are reported instead of silently replaced", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-pinned-"));
+  const root = await makeCanonicalTempDir("agent-intercom-pinned-");
   try {
     await writeFile(join(root, "settings.json"), JSON.stringify({ packages: ["git:github.com/dataforxyz/agent-intercom-pi@v0.9.3"] }));
     await packageRoot(join(root, "git", "github.com", "dataforxyz", "agent-intercom-pi"), "@dataforxyz/agent-intercom-pi");
@@ -58,7 +59,7 @@ test("pinned Pi package sources are reported instead of silently replaced", asyn
 });
 
 test("harness diagnostics use the verified manager Pi version without invoking its wrapper", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-manager-version-"));
+  const root = await makeCanonicalTempDir("agent-intercom-manager-version-");
   try {
     const managerMarker = join(root, "manager-invoked");
     const wrapperMarker = join(root, "wrapper-invoked");
@@ -107,7 +108,7 @@ test("harness diagnostics use the verified manager Pi version without invoking i
 });
 
 test("custom default Pi runtime diagnostics preserve the profile command fallback", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-profile-version-"));
+  const root = await makeCanonicalTempDir("agent-intercom-profile-version-");
   try {
     const wrapper = join(root, "custom-pi");
     await writeFile(wrapper, "#!/bin/sh\nprintf 'custom-pi 4.5.6\\n'\n");

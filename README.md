@@ -1,6 +1,32 @@
-# Orc Boss
+# Agent Intercom Orchestrator (Orc Boss)
 
-Orc Boss is the trusted-local Boss workflow and cross-harness Agent Intercom Orchestrator for independent coding agents.
+**Agent Intercom Orchestrator** (historically nicknamed **Orc Boss**) is the trusted-local Boss workflow and cross-harness lifecycle manager for independent coding agents within the Agent Intercom family.
+
+| Harness | Repository |
+|---|---|
+| Core / Protocol | [`agent-intercom-core`](https://github.com/ctliz/agent-intercom-core) |
+| Pi | [`agent-intercom-pi`](https://github.com/ctliz/agent-intercom-pi) |
+| Codex | [`agent-intercom-codex`](https://github.com/ctliz/agent-intercom-codex) |
+| Claude Code | [`agent-intercom-claude`](https://github.com/ctliz/agent-intercom-claude) |
+| OpenCode | [`agent-intercom-opencode`](https://github.com/ctliz/agent-intercom-opencode) |
+| Fleet lifecycle | [`agent-intercom-orchestrator`](https://github.com/ctliz/agent-intercom-orchestrator) |
+
+## Maintenance & Upstream Provenance
+
+- **Maintained by `ctliz`**: This distribution is maintained independently by [ctliz](https://github.com/ctliz).
+- **Upstream Heritage**: Grew from upstream [`dataforxyz/orcboss`](https://github.com/dataforxyz/orcboss) and `dataforxyz/agent-intercom-*`. This project is not officially endorsed by or affiliated with upstream organizations.
+- **Branding & Compatibility**: Orc Boss is preserved as a historical sub-brand/nickname; the package name `@dataforxyz/agent-intercom-orchestrator` and `agent_fleet` / `intercom_*` APIs remain unchanged.
+
+## Protocol v4 & Broker-Enforced Scope
+
+Agent Intercom protocol v4 introduces **broker-enforced scope routing** via `AGENT_INTERCOM_SCOPE_ID`:
+
+- **Registration**: Managed worker processes inherit `AGENT_INTERCOM_SCOPE_ID` from the launcher environment or explicitly clear it; team ownership via `intercom_team` operates independently of broker routing scope.
+- **Broker Enforcement**: The shared local broker stores the scope in its private `ConnectedSession` record and enforces same-scope discovery (`intercom_list`), naming, and prefix matching.
+- **Cross-Scope Routing**: Cross-scope messaging is fail-closed; communication across different scopes is permitted only when addressing an explicit full session ID.
+- **UX Routing Isolation**: Scope is designed for same-OS-user workflow isolation (e.g. per-project or per-workspace agent teams), **not** as a cryptographic security principal, tenant boundary, or authentication credential.
+- **Leak-Free**: The raw `scopeId` value never enters `SessionInfo`, list payloads, lifecycle events, frontend displays, or execution logs.
+- **Standalone First**: `AGENT_INTERCOM_SCOPE_ID` is a general shell/IDE/service launcher contract. Agent Intercom works completely standalone in any terminal, tmux window, or script; TmuxDeck is optional visual tooling.
 
 Use independent coding agents to keep each other working after one of them says the task is done.
 
@@ -15,8 +41,8 @@ A manager controls the agents, evidence, limits, context resets, and stopping ru
 The orchestrator is a Pi package containing both the `agent_fleet` extension and its Agent Skill. It requires Linux with a working systemd user manager. For ordinary fleet use, install the Pi Intercom adapter first so managed coworkers can communicate with the manager:
 
 ```bash
-pi install npm:@dataforxyz/agent-intercom-pi
-pi install npm:@dataforxyz/agent-intercom-orchestrator
+pi install git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.1
+pi install git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.1
 ```
 
 Use release tags matching the version you intend to run for Git-pinned installs; do not copy the obsolete `v0.9.3` pins from older documentation. Dirty or explicitly pinned Git installs are never replaced automatically.
@@ -122,10 +148,10 @@ See [`examples/orchestrator-config.json`](examples/orchestrator-config.json) and
 
 | Harness | Repository | Current best use |
 |---|---|---|
-| Pi | [`agent-intercom-pi`](https://github.com/dataforxyz/agent-intercom-pi) | Primary manager and proof advisor |
-| OpenCode | [`agent-intercom-opencode`](https://github.com/dataforxyz/agent-intercom-opencode) | Primary manager with opt-in fleet tools, or persistent worker |
-| Codex | [`agent-intercom-codex`](https://github.com/dataforxyz/agent-intercom-codex) | Wakeable builder through `coi` |
-| Claude Code | [`agent-intercom-claude`](https://github.com/dataforxyz/agent-intercom-claude) | Wakeable challenger or worker through `cci` |
+| Pi | [`agent-intercom-pi`](https://github.com/ctliz/agent-intercom-pi) | Primary manager and proof advisor |
+| OpenCode | [`agent-intercom-opencode`](https://github.com/ctliz/agent-intercom-opencode) | Primary manager with opt-in fleet tools, or persistent worker |
+| Codex | [`agent-intercom-codex`](https://github.com/ctliz/agent-intercom-codex) | Wakeable builder through `coi` |
+| Claude Code | [`agent-intercom-claude`](https://github.com/ctliz/agent-intercom-claude) | Wakeable challenger or worker through `cci` |
 
 The [worker guide](docs/creating-and-supervising-worker-agents.md#install-the-adapters) contains the complete installation instructions for all four harnesses, including enabling OpenCode as the primary manager.
 
@@ -134,7 +160,7 @@ The [worker guide](docs/creating-and-supervising-worker-agents.md#install-the-ad
 Pi and OpenCode now use the same worker store and lifecycle implementation. Pi exposes it through the extension tool, scoped footer, and `/agents*` commands. OpenCode exposes it through an opt-in native tool that invokes the packaged `agent-intercom-fleet` CLI.
 
 ```bash
-npm install -g @dataforxyz/agent-intercom-orchestrator
+pi install git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.1
 
 OPENCODE_INTERCOM_FLEET=1 \
 OPENCODE_INTERCOM_NAME=opencode-manager \
@@ -172,6 +198,14 @@ The release workflow verifies that the tag points into `main`, runs typecheck an
 tests, publishes the public npm package with trusted OIDC provenance, and creates
 the GitHub Release. Existing npm versions and GitHub Releases are skipped safely
 when a workflow is rerun.
+
+## Compatibility, Migration & Rollback
+
+- **Single Shared Broker**: All adapters on the machine connect to one local broker over a Unix domain socket (`~/.pi/agent/intercom/broker.sock` or `$PI_CODING_AGENT_DIR/intercom/broker.sock`).
+- **All-or-Nothing Family Upgrade**: Protocol v4 is a family-wide change. Every adapter on the machine (`pi`, `claude`, `codex`, `opencode`, `orchestrator`) must be upgraded together in the same maintenance window. A partially upgraded machine is not a supported configuration.
+- **Fail-Closed Legacy Handling**: An incompatible legacy (v3) broker or client fails closed. It is rejected at negotiation and never killed, never downgraded, and never allowed to form a second broker island.
+- **Scope Inheritance**: Workers inherit `AGENT_INTERCOM_SCOPE_ID` from the launch environment the Orchestrator constructs, or receive no scope when it is explicitly cleared. `intercom_team` is a separate mechanism and does not derive from the broker's scope partitioning.
+- **Family Rollback (all-or-nothing)**: Rolling back is family-wide. Restore the exact specs and lockfiles you backed up before the upgrade, for every adapter together, then reload all active agent sessions. There is no published pre-v4 tag under `ctliz` to roll back to, so a pre-upgrade backup of the exact installed specs/locks is the supported rollback material. Rolling back only one adapter leaves the family in an unsupported mixed state.
 
 ## License
 

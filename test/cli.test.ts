@@ -3,11 +3,13 @@ import { spawn } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { acquireKernelFileLock } from "../src/file-lock.ts";
+import { hasFlock } from "./utils.ts";
 
 async function runChild(script: URL, env: NodeJS.ProcessEnv, input?: string): Promise<{ code: number | null; stdout: string; stderr: string }> {
-  const child = spawn(process.execPath, ["--experimental-strip-types", script.pathname], {
+  const child = spawn(process.execPath, ["--experimental-strip-types", fileURLToPath(script)], {
     cwd: process.cwd(), env, stdio: ["pipe", "pipe", "pipe"],
   });
   let stdout = "";
@@ -22,7 +24,7 @@ async function runChild(script: URL, env: NodeJS.ProcessEnv, input?: string): Pr
   return { code, stdout, stderr };
 }
 
-test("agent-intercom-fleet CLI hosts the same agent_fleet tool for non-Pi managers", async () => {
+test("agent-intercom-fleet CLI hosts the same agent_fleet tool for non-Pi managers", { skip: !hasFlock() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-fleet-cli-"));
   try {
     const orchestratorDir = join(agentDir, "intercom", "orchestrator");
@@ -218,7 +220,7 @@ test("internal manager heartbeat returns checkpoint requests without exposing a 
   }
 });
 
-test("explicit cleanup bypasses startup cleanup and runs one cleanup pass", async () => {
+test("explicit cleanup bypasses startup cleanup and runs one cleanup pass", { skip: !hasFlock() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-fleet-single-cleanup-cli-"));
   try {
     const orchestratorDir = join(agentDir, "intercom", "orchestrator");
@@ -252,7 +254,7 @@ test("explicit cleanup bypasses startup cleanup and runs one cleanup pass", asyn
   }
 });
 
-test("managerless cleanup skips while another cleanup run holds the crash-released lock", async () => {
+test("managerless cleanup skips while another cleanup run holds the crash-released lock", { skip: !hasFlock() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-fleet-coalesced-cleanup-cli-"));
   let release: (() => Promise<void>) | undefined;
   try {
@@ -278,7 +280,7 @@ test("managerless cleanup skips while another cleanup run holds the crash-releas
   }
 });
 
-test("managerless cleanup wrapper executes exact fleet cleanup against the configured state", async () => {
+test("managerless cleanup wrapper executes exact fleet cleanup against the configured state", { skip: !hasFlock() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-fleet-cleanup-cli-"));
   try {
     const script = new URL("../src/agent-fleet-cleanup.mjs", import.meta.url);

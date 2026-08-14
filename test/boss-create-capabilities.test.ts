@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
+import { makeCanonicalTempDir } from "./utils.ts";
 import { formatBossCreateCapabilityReport, inspectBossCreateCapabilities } from "../src/boss-create-capabilities.ts";
 import { DEFAULT_PERMISSION_PROFILES } from "../src/permissions.ts";
 import type { PermissionProfile } from "../src/types.ts";
@@ -16,7 +17,7 @@ async function git(cwd: string, args: string[]): Promise<void> {
 }
 
 async function linkedWorktreeFixture() {
-  const dir = await mkdtemp(join(tmpdir(), "boss-create-capabilities-"));
+  const dir = await makeCanonicalTempDir("boss-create-capabilities-");
   const repository = join(dir, "repository");
   const worktree = join(dir, "feature");
   await mkdir(repository);
@@ -110,7 +111,7 @@ test("worktree write requires R|W|X on the canonical root", async () => {
 });
 
 test("marker-shaped directories cannot forge linked worktree identity", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "boss-create-forged-worktree-"));
+  const dir = await makeCanonicalTempDir("boss-create-forged-worktree-");
   try {
     const fake = join(dir, "fake");
     const admin = join(dir, "repository", ".git", "worktrees", "fake");

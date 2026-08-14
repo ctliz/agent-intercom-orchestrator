@@ -1,3 +1,4 @@
+import { hasFlock, hasSystemdUserManager } from "./utils.ts";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { access, chmod, mkdir, mkdtemp, readFile, rm, symlink, utimes, writeFile } from "node:fs/promises";
@@ -106,7 +107,7 @@ test("owned Boss participants cannot register /boss, boss, or agent_fleet when o
   }
 });
 
-test("Boss participant launches carry isolated Ralph state, exact extensions, tools, and role prompts", async () => {
+test("Boss participant launches carry isolated Ralph state, exact extensions, tools, and role prompts", { skip: !hasFlock() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-boss-launch-"));
   const runtimeDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-boss-runtime-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -767,7 +768,7 @@ test("Boss participant launches carry isolated Ralph state, exact extensions, to
   }
 });
 
-test("reconciliation retires completed one-shot units after preserving their completed state", async () => {
+test("reconciliation retires completed one-shot units after preserving their completed state", { skip: !hasFlock() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-retire-test-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -1112,7 +1113,7 @@ test("idle heartbeat with no attached live workers performs no unit checks or st
   }
 });
 
-test("stop patches the current worker record without clobbering concurrent metadata", async () => {
+test("stop patches the current worker record without clobbering concurrent metadata", { skip: !hasFlock() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-stop-patch-test-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -1188,7 +1189,7 @@ test("stop patches the current worker record without clobbering concurrent metad
   }
 });
 
-test("manager-received worker Intercom metadata renews only the matching owned worker", async () => {
+test("manager-received worker Intercom metadata renews only the matching owned worker", { skip: !hasFlock() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-activity-test-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -1248,7 +1249,9 @@ test("manager-received worker Intercom metadata renews only the matching owned w
   }
 });
 
-test("concurrent spawns reserve a worker id before launching a systemd unit", async () => {
+// Requires both flock (worker-id reservation lock) and a live systemd user
+// manager: the test drives an actual unit launch, not a stubbed one.
+test("concurrent spawns reserve a worker id before launching a systemd unit", { skip: !hasFlock() || !hasSystemdUserManager() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-spawn-reservation-test-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -1338,7 +1341,9 @@ test("concurrent spawns reserve a worker id before launching a systemd unit", as
   }
 });
 
-test("persistent OpenCode spawn persists resumable state before returning ready", async () => {
+// Requires both flock and a live systemd user manager: readiness is observed
+// from a real persistent unit.
+test("persistent OpenCode spawn persists resumable state before returning ready", { skip: !hasFlock() || !hasSystemdUserManager() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-opencode-state-test-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -1451,7 +1456,7 @@ test("persistent OpenCode spawn persists resumable state before returning ready"
   }
 });
 
-test("agent_fleet list and unqualified status default to the current manager's workers", async () => {
+test("agent_fleet list and unqualified status default to the current manager's workers", { skip: !hasFlock() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-manager-list-test-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -1540,7 +1545,7 @@ test("agent_fleet list and unqualified status default to the current manager's w
   }
 });
 
-test("cleanup prunes retention-expired terminal workers and preserves recent history", async () => {
+test("cleanup prunes retention-expired terminal workers and preserves recent history", { skip: !hasFlock() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-retention-cleanup-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -1667,7 +1672,7 @@ test("bulk prune requires acknowledgment and remains manager scoped", async () =
   }
 });
 
-test("forget requires explicit manager acknowledgment after a worker is stopped", async () => {
+test("forget requires explicit manager acknowledgment after a worker is stopped", { skip: !hasFlock() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-forget-ack-test-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;
@@ -1719,7 +1724,7 @@ test("forget requires explicit manager acknowledgment after a worker is stopped"
   }
 });
 
-test("extension registers discovery tools and interactive configuration commands", async () => {
+test("extension registers discovery tools and interactive configuration commands", { skip: !hasFlock() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-extension-test-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   const previousFetch = globalThis.fetch;
@@ -1832,7 +1837,7 @@ test("extension registers discovery tools and interactive configuration commands
   }
 });
 
-test("route previews automatic selection and explicit profile overrides without spawning", async () => {
+test("route previews automatic selection and explicit profile overrides without spawning", { skip: !hasFlock() }, async () => {
   const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-route-test-"));
   const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
   process.env.PI_CODING_AGENT_DIR = agentDir;

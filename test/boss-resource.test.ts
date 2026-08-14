@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
+import { hasFlock } from "./utils.ts";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
+import { makeCanonicalTempDir } from "./utils.ts";
 import { cleanupProvisionedBossResource, observeProvisionedBossResource, provisionBossLinkedWorktree, refreshProvisionedBossResource, rollbackProvisionedBossWorktree } from "../src/boss-resource.ts";
 import { TrustedLocalBossStore } from "../src/boss-trusted-local.ts";
 
@@ -15,7 +17,7 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
 }
 
 async function fixture(context: { after(fn: () => Promise<void>): void }) {
-  const root = await mkdtemp(join(tmpdir(), "boss-resource-"));
+  const root = await makeCanonicalTempDir("boss-resource-");
   context.after(() => rm(root, { recursive: true, force: true }));
   const repository = join(root, "repository");
   const worktree = join(root, "leased-worktree");
@@ -126,7 +128,7 @@ test("canonicalizes aliases and fails closed on mismatched reports, capability g
   }), /not descended/);
 });
 
-test("trusted-local store accepts one exact initial resource and migrates it durably", async (context) => {
+test("trusted-local store accepts one exact initial resource and migrates it durably", { skip: !hasFlock() }, async (context) => {
   const { root, worktree, baseSha } = await fixture(context);
   const store = new TrustedLocalBossStore(join(root, "runs.json"), () => new Date("2026-02-03T04:05:06.000Z"));
   const created = await store.execute({ action: "create", goal: "bind canonical resource" }, "controller-resource");
@@ -145,7 +147,7 @@ test("trusted-local store accepts one exact initial resource and migrates it dur
   await assert.rejects(store.recordProvisionedResource(created.run!.bossRunId, resource), /already has a canonical resource/);
 });
 
-test("persists a provisioned run and stamps every initial assignment with the resource revision", async (context) => {
+test("persists a provisioned run and stamps every initial assignment with the resource revision", { skip: !hasFlock() }, async (context) => {
   const { root, worktree, baseSha } = await fixture(context);
   const store = new TrustedLocalBossStore(join(root, "provisioned-runs.json"), () => new Date("2026-02-03T04:05:06.000Z"));
   const bossRunId = "boss-dddddddd-dddd-4ddd-8ddd-dddddddddddd";
@@ -155,7 +157,7 @@ test("persists a provisioned run and stamps every initial assignment with the re
   assert.deepEqual(result.run?.assignments.map((assignment) => assignment.resourceRevision), [1, 1, 1]);
 });
 
-test("refreshes resource observations with monotonic revisions and CAS persistence", async (context) => {
+test("refreshes resource observations with monotonic revisions and CAS persistence", { skip: !hasFlock() }, async (context) => {
   const { root, worktree, baseSha } = await fixture(context);
   const bossRunId = "boss-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
   const resource = await observeProvisionedBossResource({

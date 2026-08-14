@@ -3,6 +3,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { makeCanonicalTempDir } from "./utils.ts";
 import { DEFAULT_CONFIG } from "../src/config.ts";
 import { resolvePiRuntime } from "../src/pi-runtime.ts";
 import { buildWorkerArgs } from "../src/workers.ts";
@@ -25,7 +26,7 @@ async function fakeManagerPi(root: string, packageName = "@earendil-works/pi-cod
 }
 
 test("unchanged pi-peer uses the manager's concrete Pi package instead of its npx wrapper", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-pi-runtime-"));
+  const root = await makeCanonicalTempDir("agent-intercom-pi-runtime-");
   try {
     const manager = await fakeManagerPi(root);
     const profile = structuredClone(DEFAULT_CONFIG.profiles["pi-peer"]);
@@ -52,7 +53,7 @@ test("unchanged pi-peer uses the manager's concrete Pi package instead of its np
 });
 
 test("the legacy upstream Pi package name is also accepted", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-legacy-pi-runtime-"));
+  const root = await makeCanonicalTempDir("agent-intercom-legacy-pi-runtime-");
   try {
     const manager = await fakeManagerPi(root, "@mariozechner/pi-coding-agent");
     const profile = structuredClone(DEFAULT_CONFIG.profiles["pi-peer"]);
@@ -70,7 +71,7 @@ test("the legacy upstream Pi package name is also accepted", async () => {
 });
 
 test("the verified manager runtime rescues a missing built-in Pi wrapper", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-pi-runtime-rescue-"));
+  const root = await makeCanonicalTempDir("agent-intercom-pi-runtime-rescue-");
   try {
     const manager = await fakeManagerPi(root);
     const profile = structuredClone(DEFAULT_CONFIG.profiles["pi-peer"]);
@@ -94,7 +95,7 @@ test("the verified manager runtime rescues a missing built-in Pi wrapper", async
 });
 
 test("custom and explicitly overridden Pi profiles preserve their configured commands", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-pi-explicit-"));
+  const root = await makeCanonicalTempDir("agent-intercom-pi-explicit-");
   try {
     const manager = await fakeManagerPi(root);
     const builtIn = structuredClone(DEFAULT_CONFIG.profiles["pi-peer"]);
@@ -118,7 +119,7 @@ test("custom and explicitly overridden Pi profiles preserve their configured com
 });
 
 test("unverified manager entries fall back to the configured Pi command", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-pi-fallback-"));
+  const root = await makeCanonicalTempDir("agent-intercom-pi-fallback-");
   try {
     const manager = await fakeManagerPi(root);
     const unrelated = join(root, "not-the-declared-bin.js");
@@ -139,7 +140,7 @@ test("unverified manager entries fall back to the configured Pi command", async 
 });
 
 test("an unverified manager entry with no configured fallback remains unresolved", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-pi-no-runtime-"));
+  const root = await makeCanonicalTempDir("agent-intercom-pi-no-runtime-");
   try {
     const manager = await fakeManagerPi(root);
     const unrelated = join(root, "not-pi.js");
@@ -160,7 +161,7 @@ test("an unverified manager entry with no configured fallback remains unresolved
 });
 
 test("manager runtime prefix leaves persistent Pi session arguments unchanged", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-pi-session-"));
+  const root = await makeCanonicalTempDir("agent-intercom-pi-session-");
   try {
     const manager = await fakeManagerPi(root);
     const profile = structuredClone(DEFAULT_CONFIG.profiles["pi-peer"]);

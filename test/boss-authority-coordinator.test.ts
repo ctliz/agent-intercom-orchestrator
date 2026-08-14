@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { hasFlock } from "./utils.ts";
 import { generateKeyPairSync, sign } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -108,7 +109,7 @@ function authorityFixture(): AuthorityFixture {
     owningProviderPackage: providerAttestation.providerPackage,
     providerDigest: providerAttestation.providerDigest,
     providerVersion: providerAttestation.providerVersion,
-    baseProtocolVersion: 3,
+    baseProtocolVersion: 4,
     features,
     protocolFeatureContractHash: BOSS_RUN_PROTOCOL_FEATURE_CONTRACT_HASH,
     featureSetHash: brokerFeatureSetHash(features),
@@ -360,7 +361,7 @@ async function rejectsCode(
   return observed!;
 }
 
-test("uses signed peer-verified query evidence and durably reconciles exact replay", async (context) => {
+test("uses signed peer-verified query evidence and durably reconciles exact replay", { skip: !hasFlock() }, async (context) => {
   const values = authorityFixture();
   const store = await storeFixture(context);
   let queryCalls = 0;
@@ -408,7 +409,7 @@ test("uses signed peer-verified query evidence and durably reconciles exact repl
   assert.equal(eventCalls, 2);
 });
 
-test("rejects forged clients, non-concrete stores, hostile dependency records, and reconcile hooks", async (context) => {
+test("rejects forged clients, non-concrete stores, hostile dependency records, and reconcile hooks", { skip: !hasFlock() }, async (context) => {
   const values = authorityFixture();
   const store = await storeFixture(context);
   const client = queryClient(values);
@@ -473,7 +474,7 @@ test("rejects forged clients, non-concrete stores, hostile dependency records, a
   assert.equal((await store.read()).revision, 1);
 });
 
-test("rejects non-query and hostile query inputs before signed transport or event access", async (context) => {
+test("rejects non-query and hostile query inputs before signed transport or event access", { skip: !hasFlock() }, async (context) => {
   const values = authorityFixture();
   const store = await storeFixture(context);
   let transportCalls = 0;
@@ -508,7 +509,7 @@ test("rejects non-query and hostile query inputs before signed transport or even
   assert.equal((await store.read()).revision, 1);
 });
 
-test("rejects unavailable and hostile events without any durable mutation", async (context) => {
+test("rejects unavailable and hostile events without any durable mutation", { skip: !hasFlock() }, async (context) => {
   const values = authorityFixture();
   const store = await storeFixture(context);
   const client = queryClient(values);
@@ -541,7 +542,7 @@ test("rejects unavailable and hostile events without any durable mutation", asyn
   assert.equal(accessorInvoked, false);
 });
 
-test("detaches accepted event evidence before callback-owned TOCTOU mutation", async (context) => {
+test("detaches accepted event evidence before callback-owned TOCTOU mutation", { skip: !hasFlock() }, async (context) => {
   const values = authorityFixture();
   const store = await storeFixture(context);
   const rawEvent = structuredClone(values.event);
@@ -560,7 +561,7 @@ test("detaches accepted event evidence before callback-owned TOCTOU mutation", a
   assert.equal(rawEvent.brokerRevision, 500);
 });
 
-test("preserves accepted typed query and reconciliation source codes", async (context) => {
+test("preserves accepted typed query and reconciliation source codes", { skip: !hasFlock() }, async (context) => {
   const queryValues = authorityFixture();
   queryValues.observedPeer.clientUid = OWNER_UID;
   const queryStore = new BossStore(join(tmpdir(), "boss-query-error-store.json"));

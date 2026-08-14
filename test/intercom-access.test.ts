@@ -88,7 +88,7 @@ async function fakeBroker(socketPath: string, policyHash = "f3b00e503631bc91123a
 }
 
 test("enrollment CLI support writes the one-use secret only to a private file", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-access-cli-"));
+  const root = await mkdtemp(join("/tmp", "ai-acc-"));
   const agentDir = join(root, "agent");
   const intercomDir = join(agentDir, "intercom");
   const outputPath = join(root, "transfer", "credential.json");
@@ -119,7 +119,7 @@ test("enrollment CLI support writes the one-use secret only to a private file", 
 });
 
 test("delegated enrollment authenticates with a private parent credential and writes only the child token", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-delegate-cli-"));
+  const root = await mkdtemp(join("/tmp", "ai-del-"));
   const agentDir = join(root, "agent");
   const intercomDir = join(agentDir, "intercom");
   const parentCredential = join(root, "parent.json");
@@ -152,7 +152,7 @@ test("delegated enrollment authenticates with a private parent credential and wr
 });
 
 test("tree inspection returns metadata without exposing parent credentials", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-inspect-cli-"));
+  const root = await mkdtemp(join("/tmp", "ai-insp-"));
   const agentDir = join(root, "agent");
   const intercomDir = join(agentDir, "intercom");
   const credentialPath = join(root, "parent.json");
@@ -174,7 +174,7 @@ test("tree inspection returns metadata without exposing parent credentials", asy
 });
 
 test("adoption returns fenced metadata without credentials", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-adopt-cli-"));
+  const root = await mkdtemp(join("/tmp", "ai-adopt-"));
   const agentDir = join(root, "agent");
   const intercomDir = join(agentDir, "intercom");
   await mkdir(intercomDir, { recursive: true });
@@ -192,7 +192,7 @@ test("adoption returns fenced metadata without credentials", async () => {
 });
 
 test("revocation returns only affected identities and sends no credentials", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-revoke-cli-"));
+  const root = await mkdtemp(join("/tmp", "ai-rev-"));
   const agentDir = join(root, "agent");
   const intercomDir = join(agentDir, "intercom");
   await mkdir(intercomDir, { recursive: true });
@@ -219,7 +219,7 @@ test("tunnel and remote probe distinguish the authenticated listener from the au
 });
 
 test("enrollment fails closed when the broker policy hash differs", async () => {
-  const root = await mkdtemp(join(tmpdir(), "agent-intercom-access-cli-"));
+  const root = await mkdtemp(join("/tmp", "ai-acc-"));
   const agentDir = join(root, "agent");
   const intercomDir = join(agentDir, "intercom");
   const outputPath = join(root, "credential.json");

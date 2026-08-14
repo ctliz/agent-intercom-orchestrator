@@ -86,7 +86,7 @@ function fixture(): Fixture {
     owningProviderPackage: providerAttestation.providerPackage,
     providerDigest: providerAttestation.providerDigest,
     providerVersion: providerAttestation.providerVersion,
-    baseProtocolVersion: 3,
+    baseProtocolVersion: 4,
     features,
     protocolFeatureContractHash: BOSS_RUN_PROTOCOL_FEATURE_CONTRACT_HASH,
     featureSetHash: brokerFeatureSetHash(features),

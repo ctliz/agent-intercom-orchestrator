@@ -363,13 +363,15 @@ test("cross-harness Git guard allows inspection and blocks mutation", () => {
   const executableOverride = spawnSync(guard, ["status"], { env: { ...environment, AGENT_INTERCOM_REAL_GIT: "/bin/sh" }, encoding: "utf8" });
   assert.equal(executableOverride.status, 127);
 
-  const ghGuard = fileURLToPath(new URL("../src/guard-bin/gh", import.meta.url));
-  const ghEnvironment = { ...environment, AGENT_INTERCOM_REAL_GH: "/usr/bin/gh" };
-  const ghAllowed = spawnSync(ghGuard, ["pr", "view", "--help"], { env: ghEnvironment, encoding: "utf8" });
-  assert.equal(ghAllowed.status, 0);
-  const ghBlocked = spawnSync(ghGuard, ["pr", "merge", "42"], { env: ghEnvironment, encoding: "utf8" });
-  assert.equal(ghBlocked.status, 126);
-  assert.match(ghBlocked.stderr, /gh pr merge .*blocked/);
+  if (existsSync("/usr/bin/gh")) {
+    const ghGuard = fileURLToPath(new URL("../src/guard-bin/gh", import.meta.url));
+    const ghEnvironment = { ...environment, AGENT_INTERCOM_REAL_GH: "/usr/bin/gh" };
+    const ghAllowed = spawnSync(ghGuard, ["pr", "view", "--help"], { env: ghEnvironment, encoding: "utf8" });
+    assert.equal(ghAllowed.status, 0);
+    const ghBlocked = spawnSync(ghGuard, ["pr", "merge", "42"], { env: ghEnvironment, encoding: "utf8" });
+    assert.equal(ghBlocked.status, 126);
+    assert.match(ghBlocked.stderr, /gh pr merge .*blocked/);
+  }
   } finally {
     rmSync(symbolicRepo, { recursive: true, force: true });
   }
@@ -390,6 +392,10 @@ test("GitHub policy validates repository targets and API reads", () => {
 });
 
 test("cross-harness GitHub guard fails closed on targets, tokens, and executable overrides", (t) => {
+  if (!existsSync("/usr/bin/gh")) {
+    t.skip("real gh executable is absent");
+    return;
+  }
   const guard = fileURLToPath(new URL("../src/guard-bin/gh", import.meta.url));
   const allowed = spawnSync(guard, ["repo", "view", "--help"], { encoding: "utf8", env: { ...process.env, AGENT_INTERCOM_REAL_GH: "/usr/bin/gh" } });
   assert.equal(allowed.status, 0, allowed.stderr);

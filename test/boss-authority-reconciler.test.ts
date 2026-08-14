@@ -1,3 +1,4 @@
+import { hasFlock } from "./utils.ts";
 import assert from "node:assert/strict";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -179,7 +180,7 @@ async function fixture(context: test.TestContext): Promise<BossStore> {
   return store;
 }
 
-test("persists an exact committed takeover, chained audit, and generation advance before return", async (context) => {
+test("persists an exact committed takeover, chained audit, and generation advance before return", { skip: !hasFlock() }, async (context) => {
   const store = await fixture(context);
   const { transition, event } = evidence();
   const result = await reconcileCommittedBossAuthorityTransition(store, transition, event, { now: () => RECONCILED });
@@ -198,7 +199,7 @@ test("persists an exact committed takeover, chained audit, and generation advanc
   assert.equal(durable.audit[1].action, "authority.reconciled");
 });
 
-test("exact replay is idempotent and appends neither revision nor audit", async (context) => {
+test("exact replay is idempotent and appends neither revision nor audit", { skip: !hasFlock() }, async (context) => {
   const store = await fixture(context);
   const { transition, event } = evidence();
   await reconcileCommittedBossAuthorityTransition(store, transition, event, { now: () => RECONCILED });
@@ -208,7 +209,7 @@ test("exact replay is idempotent and appends neither revision nor audit", async 
   assert.equal(replay.state.audit.length, 2);
 });
 
-test("projects a committed participant binding without assigning Controller generation", async (context) => {
+test("projects a committed participant binding without assigning Controller generation", { skip: !hasFlock() }, async (context) => {
   const store = await fixture(context);
   const transition = {
     version: AUTHORITY_TRANSITION_VERSION,
@@ -264,7 +265,7 @@ test("projects a committed participant binding without assigning Controller gene
   assert.equal(result.state.controllerAuthorityTransitionId, "authority-controller-1");
 });
 
-test("subscriber, credential, and replacement transitions remain explicitly unsupported without atomic run-owned projections", async (context) => {
+test("subscriber, credential, and replacement transitions remain explicitly unsupported without atomic run-owned projections", { skip: !hasFlock() }, async (context) => {
   const store = await fixture(context);
   const unsupported = [
     {
@@ -332,7 +333,7 @@ test("subscriber, credential, and replacement transitions remain explicitly unsu
   }
 });
 
-test("record/event substitution, wrong run/controller/generation, and stale revision fail closed", async (context) => {
+test("record/event substitution, wrong run/controller/generation, and stale revision fail closed", { skip: !hasFlock() }, async (context) => {
   const store = await fixture(context);
   const cases: Array<[string, (transition: any, event: any) => void, string]> = [
     ["substitution", (_transition, event) => { event.target = { ...event.target, controllerPrincipalId: "controller-2" }; }, "evidence_mismatch"],
@@ -353,7 +354,7 @@ test("record/event substitution, wrong run/controller/generation, and stale revi
   assert.equal((await store.read()).revision, 1);
 });
 
-test("replay rejects other transition IDs that collide on idempotency key or broker revision", async (context) => {
+test("replay rejects other transition IDs that collide on idempotency key or broker revision", { skip: !hasFlock() }, async (context) => {
   const store = await fixture(context);
   const { transition, event } = evidence();
   const committed = await reconcileCommittedBossAuthorityTransition(store, transition, event, { now: () => RECONCILED });
@@ -376,7 +377,7 @@ test("replay rejects other transition IDs that collide on idempotency key or bro
   }
 });
 
-test("chronology fences against the maximum durable audit occurrence, not only the final sequence", async (context) => {
+test("chronology fences against the maximum durable audit occurrence, not only the final sequence", { skip: !hasFlock() }, async (context) => {
   const root = await mkdtemp(join(tmpdir(), "boss-authority-chronology-"));
   context.after(() => rm(root, { recursive: true, force: true }));
   const state = baseState();
@@ -405,7 +406,7 @@ test("chronology fences against the maximum durable audit occurrence, not only t
   );
 });
 
-test("prepared/aborted records and invalid chronology are explicitly unavailable", async (context) => {
+test("prepared/aborted records and invalid chronology are explicitly unavailable", { skip: !hasFlock() }, async (context) => {
   const store = await fixture(context);
   const aborted = structuredClone(evidence());
   aborted.transition.state = "aborted";
@@ -424,7 +425,7 @@ test("prepared/aborted records and invalid chronology are explicitly unavailable
   assert.equal((await store.read()).revision, 1);
 });
 
-test("unknown fields, accessors, proxies, and sparse data are rejected before Core parsing", async (context) => {
+test("unknown fields, accessors, proxies, and sparse data are rejected before Core parsing", { skip: !hasFlock() }, async (context) => {
   const store = await fixture(context);
   const unknown = structuredClone(evidence());
   (unknown.event as unknown as Record<string, unknown>).socketPath = "/guessed/authority.sock";
@@ -452,7 +453,7 @@ test("unknown fields, accessors, proxies, and sparse data are rejected before Co
   assert.equal((await store.read()).revision, 1);
 });
 
-test("audit ID callbacks receive detached evidence and cannot mutate the durable projection after its digest", async (context) => {
+test("audit ID callbacks receive detached evidence and cannot mutate the durable projection after its digest", { skip: !hasFlock() }, async (context) => {
   const store = await fixture(context);
   const { transition, event } = evidence();
   const result = await reconcileCommittedBossAuthorityTransition(store, transition, event, {
@@ -468,7 +469,7 @@ test("audit ID callbacks receive detached evidence and cannot mutate the durable
   assert.equal(result.state.audit.at(-1)?.auditEntryId, "audit-detached-callback");
 });
 
-test("a persist-then-throw ambiguity reconciles only the exact durable projection and audit", async (context) => {
+test("a persist-then-throw ambiguity reconciles only the exact durable projection and audit", { skip: !hasFlock() }, async (context) => {
   const store = await fixture(context);
   const { transition, event } = evidence();
   const ambiguousStore = {
@@ -485,7 +486,7 @@ test("a persist-then-throw ambiguity reconciles only the exact durable projectio
   assert.equal(result.state.audit.at(-1)?.action, "authority.reconciled");
 });
 
-test("a stale BossStore CAS propagates conflict and never reports reconciliation", async (context) => {
+test("a stale BossStore CAS propagates conflict and never reports reconciliation", { skip: !hasFlock() }, async (context) => {
   const store = await fixture(context);
   const { transition, event } = evidence();
   let raced = false;

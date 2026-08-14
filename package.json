@@ -1,6 +1,6 @@
 {
   "name": "@dataforxyz/agent-intercom-orchestrator",
-  "version": "0.10.0",
+  "version": "0.11.0-connect.1",
   "description": "Pi extension for creating and managing independent Agent Intercom coworkers across Pi, Codex, Claude Code, and OpenCode",
   "license": "AGPL-3.0-or-later",
   "type": "module",
@@ -12,9 +12,9 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dataforxyz/agent-intercom-orchestrator.git"
+    "url": "git+https://github.com/ctliz/agent-intercom-orchestrator.git"
   },
-  "homepage": "https://github.com/dataforxyz/agent-intercom-orchestrator#readme",
+  "homepage": "https://github.com/ctliz/agent-intercom-orchestrator#readme",
   "keywords": [
     "pi-package",
     "pi",
@@ -62,7 +62,7 @@
     ]
   },
   "dependencies": {
-    "@dataforxyz/agent-intercom-core": "git+https://github.com/dataforxyz/agent-intercom-core.git#8316cbab548f422ad11c78ed887fabeef94817c1"
+    "@dataforxyz/agent-intercom-core": "git+https://github.com/ctliz/agent-intercom-core.git#aad1985e125516b318181560293145bf2507cc6d"
   },
   "bundledDependencies": [
     "@dataforxyz/agent-intercom-core"
