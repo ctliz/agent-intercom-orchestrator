@@ -21,12 +21,13 @@ export interface AdapterVersion {
   status: "current" | "outdated" | "ahead" | "missing" | "unknown" | "migration-required" | "dual-load";
   update?: UpdateCommand;
   blockedReason?: string;
-  /** Legacy `connect.1` install surfaces found for this adapter, if any. */
+  /** Legacy `0.11.0-connect.1` (@dataforxyz/*) install surfaces found for this adapter, if any. */
   legacySurfaces?: LegacySurface[];
 }
 
 /**
- * connect.1 shipped under `@dataforxyz/*`; connect.2 is `@ctliz/*`.
+ * Historical 0.11.0-connect.1 shipped under `@dataforxyz/*`; canonical `@ctliz/*`
+ * began with 0.11.0-connect.2 and continues with coordinated 0.12.0-connect.1.
  *
  * The retired namespace is a *migration-detection input only*. It is never a
  * healthy or current installation, is never auto-upgraded in place, and is
@@ -148,7 +149,7 @@ function legacyPackageName(adapter: { packageName: string }): string {
 
 /**
  * Matches a Pi settings spec to an adapter. The retired identity is matched on
- * purpose so a `connect.1` install is *detected*, never so it is accepted.
+ * purpose so a legacy `0.11.0-connect.1` (@dataforxyz/*) install is *detected*, never so it is accepted.
  */
 function sourceMatches(source: string, adapter: { packageName: string; repo: string }): boolean {
   return (
@@ -162,6 +163,18 @@ function sourceMatches(source: string, adapter: { packageName: string; repo: str
   );
 }
 
+function isCanonicalGitSpec(spec: string): boolean {
+  if (
+    /@v?[\d.]+-connect\.2(?:$|[#?])/.test(spec)
+    || /@connect\.2(?:$|[#?])/.test(spec)
+    || /@v?0\.(?:1[2-9]|[2-9]\d)\.[\d.]+(?:-connect\.\d+)?(?:$|[#?])/.test(spec)
+    || /@v?[1-9]\d*\.[\d.]+(?:-connect\.\d+)?(?:$|[#?])/.test(spec)
+  ) {
+    return true;
+  }
+  return false;
+}
+
 function sourceIsLegacy(source: string, adapter: { packageName: string; repo: string }): boolean {
   if (
     source.includes(legacyPackageName(adapter))
@@ -170,7 +183,7 @@ function sourceIsLegacy(source: string, adapter: { packageName: string; repo: st
     return true;
   }
   if (source.startsWith("git:github.com/") && source.includes(`${CANONICAL_GITHUB_OWNER}/${adapter.repo}`)) {
-    if (/@v?[\d.]+-connect\.2(?:$|[#?])/.test(source) || /@connect\.2(?:$|[#?])/.test(source)) {
+    if (isCanonicalGitSpec(source)) {
       return false;
     }
     return true;
@@ -294,7 +307,7 @@ async function scanAllInstallSurfaces(options: {
       if (spec.includes(`${LEGACY_GITHUB_OWNER}/`) || spec.includes(LEGACY_NPM_SCOPE)) {
         legacySurfaces.push({ kind: "pi-settings", detail: spec });
       } else if (spec.includes(`${CANONICAL_GITHUB_OWNER}/`)) {
-        if (/@v?[\d.]+-connect\.2(?:$|[#?])/.test(spec) || /@connect\.2(?:$|[#?])/.test(spec)) {
+        if (isCanonicalGitSpec(spec)) {
           canonicalSurfaces.push({ kind: "pi-settings", detail: spec });
         } else {
           legacySurfaces.push({ kind: "pi-settings", detail: spec });
@@ -392,13 +405,13 @@ async function scanAllInstallSurfaces(options: {
 }
 
 /**
- * Fail-closed classification of the connect.1 -> connect.2 migration.
+ * Fail-closed classification of the 0.11.0-connect.1 (@dataforxyz/*) -> @ctliz/* migration.
  *
  * - legacy only  -> MIGRATION_REQUIRED (blocked; uninstall-then-install plan)
  * - both present -> DUPLICATE_INSTALL  (blocked; dual-load hard error)
  *
  * A legacy surface is never reported as current/healthy and is never upgraded
- * in place, so setup and update cannot silently overwrite a connect.1 install.
+ * in place, so setup and update cannot silently overwrite a 0.11.0-connect.1 install.
  */
 export async function diagnoseNamespaceMigration(options: {
   agentDir: string;
@@ -416,7 +429,7 @@ export async function diagnoseNamespaceMigration(options: {
       code: "DUPLICATE_INSTALL",
       blocked: true,
       summary:
-        `Both ${LEGACY_NPM_SCOPE}/* (connect.1) and ${CANONICAL_NPM_SCOPE}/* (connect.2) install surfaces are present. `
+        `Both ${LEGACY_NPM_SCOPE}/* (0.11.0-connect.1) and ${CANONICAL_NPM_SCOPE}/* install surfaces are present. `
         + "Across npm/global/project/active-session surfaces they can load as separate extensions with conflicting binaries and separate broker registration paths.",
       legacySurfaces,
       canonicalSurfaces,
@@ -433,14 +446,14 @@ export async function diagnoseNamespaceMigration(options: {
     return {
       code: "MIGRATION_REQUIRED",
       blocked: true,
-      summary: `Only ${LEGACY_NPM_SCOPE}/* (connect.1) install surfaces are present; connect.2 uses ${CANONICAL_NPM_SCOPE}/*.`,
+      summary: `Only ${LEGACY_NPM_SCOPE}/* (0.11.0-connect.1) install surfaces are present; canonical uses ${CANONICAL_NPM_SCOPE}/*.`,
       legacySurfaces,
       canonicalSurfaces,
       remediation: [
         "Back up the exact specs, lock files, and settings of every installed component.",
         "Stop or close the installed broker-capable adapters.",
         `Remove the ${LEGACY_NPM_SCOPE}/* specs, packages, and binary links listed above.`,
-        `Install the ${CANONICAL_NPM_SCOPE}/* connect.2 exact tags for the components you actually use.`,
+        `Install the ${CANONICAL_NPM_SCOPE}/* exact tags for the components you actually use.`,
         "Reload or restart, then verify exactly one broker is running.",
       ],
     };
@@ -518,8 +531,8 @@ export async function inspectAdapterFamily(options: {
       // Fail closed: a retired-namespace install is never "current" and is
       // never upgraded in place. Migration must remove it first.
       blockedReason =
-        `MIGRATION_REQUIRED: ${legacyPackageName(adapter)} (connect.1) is installed. `
-        + `connect.2 ships as ${adapter.packageName}. Remove the legacy install before installing connect.2; `
+        `MIGRATION_REQUIRED: ${legacyPackageName(adapter)} (0.11.0-connect.1) is installed. `
+        + `canonical ships as ${adapter.packageName}. Remove the legacy install before installing canonical; `
         + "side-by-side installation is not supported.";
     } else if (sourceSpec) {
       if (/@v?\d+\.\d+\.\d+(?:$|[#?])/.test(sourceSpec)) {
@@ -582,7 +595,7 @@ export function formatUpdatePlan(adapters: AdapterVersion[]): string {
   if (migrating.length > 0) {
     const lines = [
       `MIGRATION_REQUIRED: ${migrating.length} adapter(s) still use the retired ${LEGACY_NPM_SCOPE}/* namespace.`,
-      "Side-by-side installation is not supported. Remove connect.1 before installing connect.2.",
+      `Side-by-side installation is not supported. Remove legacy 0.11.0-connect.1 (${LEGACY_NPM_SCOPE}/*) before installing canonical ${CANONICAL_NPM_SCOPE}/*.`,
     ];
     for (const adapter of migrating) {
       lines.push(`- ${adapter.id}: ${adapter.blockedReason ?? "legacy install detected"}`);

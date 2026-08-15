@@ -16,8 +16,8 @@ The setup path is preview-first. It does not overwrite unrelated Pi settings, pr
 Install the Intercom control plane and Orchestrator if they are not already available:
 
 ```bash
-pi install git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2
-pi install git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2
+pi install git:github.com/ctliz/agent-intercom-pi@v0.12.0-connect.1
+pi install git:github.com/ctliz/agent-intercom-orchestrator@v0.12.0-connect.1
 ```
 
 The Orchestrator package exposes `agent-intercom-boss-setup`. If your Pi package installation does not place package bins on `PATH`, invoke the package's `src/boss-setup-cli.mjs` with Node from its resolved Pi package directory.
@@ -86,8 +86,8 @@ For an already reviewed noninteractive transaction, add `--yes`. This is confirm
 Setup may add these Git sources when they are missing:
 
 ```bash
-pi install git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2
-pi install git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2
+pi install git:github.com/ctliz/agent-intercom-pi@v0.12.0-connect.1
+pi install git:github.com/ctliz/agent-intercom-orchestrator@v0.12.0-connect.1
 pi install git:github.com/dataforxyz/pi-extensions
 pi install git:github.com/dataforxyz/pi-return-on
 ```

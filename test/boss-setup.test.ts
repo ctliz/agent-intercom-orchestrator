@@ -45,8 +45,8 @@ test("Boss inventory recognizes the global four-resource stack and monorepo Ralp
       resource(agentDir, "pi-return-on", "pi-return-on", "src/index.ts"),
     ]);
     await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: [
-      "git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2",
-      "git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2",
+      "git:github.com/ctliz/agent-intercom-pi@v0.12.0-connect.1",
+      "git:github.com/ctliz/agent-intercom-orchestrator@v0.12.0-connect.1",
       { source: "git:github.com/dataforxyz/pi-extensions", extensions: ["pi-ralph-wiggum/index.ts"] },
       "git:github.com/dataforxyz/pi-return-on",
     ] }));
@@ -89,8 +89,8 @@ test("Boss inventory blocks dirty, pinned, duplicate, filtered, and missing reso
     await writeFile(join(agentDir, "git", "github.com", "ctliz", "agent-intercom-pi", "dirty.txt"), "dirty\n");
     await resource(agentDir, "pi-extensions", "pi-extensions", "pi-ralph-wiggum/index.ts");
     const settings = { theme: "preserve-me", packages: [
-      "git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2",
-      "git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2",
+      "git:github.com/ctliz/agent-intercom-pi@v0.12.0-connect.1",
+      "git:github.com/ctliz/agent-intercom-pi@v0.12.0-connect.1",
       { source: "git:github.com/dataforxyz/pi-extensions#deadbeef", extensions: ["other.ts"], untouched: true },
     ] };
     await writeFile(join(agentDir, "settings.json"), JSON.stringify(settings));
@@ -124,8 +124,8 @@ test("Boss setup apply installs only missing resources and preserves unrelated c
     const configPath = join(agentDir, "intercom", "orchestrator", "config.json");
     await writeFile(configPath, JSON.stringify({ custom: { keep: true }, boss: { future: "keep" } }));
     const definitions = {
-      "git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2": ["agent-intercom-pi", "@ctliz/agent-intercom-pi", "index.ts"],
-      "git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2": ["agent-intercom-orchestrator", "@ctliz/agent-intercom-orchestrator", "src/index.ts"],
+      "git:github.com/ctliz/agent-intercom-pi@v0.12.0-connect.1": ["agent-intercom-pi", "@ctliz/agent-intercom-pi", "index.ts"],
+      "git:github.com/ctliz/agent-intercom-orchestrator@v0.12.0-connect.1": ["agent-intercom-orchestrator", "@ctliz/agent-intercom-orchestrator", "src/index.ts"],
       "git:github.com/dataforxyz/pi-extensions": ["pi-extensions", "pi-extensions", "pi-ralph-wiggum/index.ts"],
       "git:github.com/dataforxyz/pi-return-on": ["pi-return-on", "pi-return-on", "src/index.ts"],
     } as const;
@@ -246,7 +246,7 @@ test("Boss setup apply refuses unsafe existing package state before install or c
   try {
     await resource(agentDir, "agent-intercom-pi", "@ctliz/agent-intercom-pi", "index.ts");
     await writeFile(join(agentDir, "git", "github.com", "ctliz", "agent-intercom-pi", "dirty"), "dirty");
-    await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: ["git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2"] }));
+    await writeFile(join(agentDir, "settings.json"), JSON.stringify({ packages: ["git:github.com/ctliz/agent-intercom-pi@v0.12.0-connect.1"] }));
     let installs = 0;
     await assert.rejects(applyBossSetup({ agentDir, onboarding, install: async () => { installs += 1; } }), /BOSS_SETUP_BLOCKED.*dirty/s);
     assert.equal(installs, 0);
@@ -271,8 +271,8 @@ test("packed-style setup launcher emits stable JSON and apply requires onboardin
     assert.equal(output.report.changes.length, 4);
     const piChange = output.report.changes.find((c: any) => c.resource === "intercom-pi");
     const orcChange = output.report.changes.find((c: any) => c.resource === "orchestrator");
-    assert.equal(piChange?.command, "pi install git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2");
-    assert.equal(orcChange?.command, "pi install git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2");
+    assert.equal(piChange?.command, "pi install git:github.com/ctliz/agent-intercom-pi@v0.12.0-connect.1");
+    assert.equal(orcChange?.command, "pi install git:github.com/ctliz/agent-intercom-orchestrator@v0.12.0-connect.1");
     const applied = spawnSync(process.execPath, [launcher.pathname, "--apply"], { encoding: "utf8", env: { ...process.env, PI_CODING_AGENT_DIR: agentDir } });
     assert.equal(applied.status, 3);
     assert.match(applied.stderr, /BOSS_SETUP_ONBOARDING_REQUIRED/);

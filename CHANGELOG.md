@@ -1,8 +1,22 @@
 # Changelog
 
+## 0.12.0-connect.1 - 2026-08-15
+
+- Bundle canonical `@ctliz/agent-intercom-core` 0.2.0 with exact registry provenance and team-manifest support.
+- Enforce strict launcher identity boundary: add `src/identity-env-launcher.mjs` for non-hardened units to strip inherited `AGENT_INTERCOM_*`, `TMUXDECK_*`, and harness identity variables unless explicitly allowlisted, while preserving explicit assigned worker/manager/role/Boss environment and unrelated normal environment.
+- Refine hardened `clean-env-launcher.mjs` to require explicit allowlisting for `AGENT_INTERCOM_SCOPE_ID` and ensure team manifest paths are never base-allowed.
+- Scrub inherited TmuxDeck team manifests and ambient scopes from child workers, ensuring Orchestrator-owned child processes remain clean, independent team members.
+- Coordinate version references across bundled skills, documentation, and Boss setup presets.
+
+## 0.11.0-connect.2 - 2026-08-14
+
+- First canonical `@ctliz/*` package namespace migration from legacy `@dataforxyz/*`.
+- Introduce fail-closed namespace migration diagnostics and remove-before-install upgrade tooling across install surfaces.
+- Align canonical GitHub owner to `ctliz`.
+
 ## 0.11.0-connect.1 - 2026-08-14
 
-- Support Protocol v4 broker-enforced scope isolation (`AGENT_INTERCOM_SCOPE_ID`) and canonical `ctliz` distribution.
+- Support Protocol v4 broker-enforced scope isolation (`AGENT_INTERCOM_SCOPE_ID`) under historical `@dataforxyz` namespace.
 - Pin Core dependency to canonical commit `aad1985e125516b318181560293145bf2507cc6d` (`v0.1.0-connect.1`).
 - Treat a verified live WorkerStore owner PID as authoritative regardless of lock-directory age, with bounded exponential contender backoff, so long-lived owners never churn through the reclaim guard or risk live-lock recovery attempts.
 - Keep high-volume WorkerStore timing telemetry opt-in behind `AGENT_INTERCOM_ORCHESTRATOR_METRICS=1` instead of writing every operation to the interactive Pi terminal by default.

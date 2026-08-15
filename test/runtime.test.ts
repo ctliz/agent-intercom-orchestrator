@@ -26,6 +26,99 @@ test("clean environment launcher drops unrelated manager secrets", () => {
   assert.doesNotMatch(result.stdout, /UNEXPECTED_SECRET_DO_NOT_INHERIT/);
 });
 
+test("clean environment launcher removes ambient scope and manifest unless explicitly allowlisted", () => {
+  const launcher = fileURLToPath(new URL("../src/clean-env-launcher.mjs", import.meta.url));
+  const result = spawnSync(process.execPath, [launcher, "--", "/usr/bin/env"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      AGENT_INTERCOM_SCOPE_ID: "ambient_scope_1234567890",
+      AGENT_INTERCOM_TEAM_MANIFEST: "/tmp/ambient_manifest.json",
+      EXPLICIT_ALLOWED: "kept",
+      AGENT_INTERCOM_ENV_ALLOWLIST: "EXPLICIT_ALLOWED",
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^EXPLICIT_ALLOWED=kept$/m);
+  assert.doesNotMatch(result.stdout, /AGENT_INTERCOM_SCOPE_ID/);
+  assert.doesNotMatch(result.stdout, /AGENT_INTERCOM_TEAM_MANIFEST/);
+});
+
+test("identity environment launcher scrubs inherited launcher/manifest/harness IDs while preserving normal and assigned env", () => {
+  const launcher = fileURLToPath(new URL("../src/identity-env-launcher.mjs", import.meta.url));
+  const result = spawnSync(process.execPath, [launcher, "--", "/usr/bin/env"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      NORMAL_USER_VARIABLE: "user_value",
+      CUSTOM_PROJECT_ROOT: "/home/user/project",
+      // Inherited TmuxDeck and team manifest keys to be stripped
+      TMUXDECK_WORKSPACE: "deck_main",
+      TMUXDECK_PANE_ID: "%3",
+      TMUXDECK_ROLE: "lead",
+      AGENT_INTERCOM_TEAM_MANIFEST: "/tmp/teams/team_123.json",
+      AGENT_INTERCOM_GENERIC_INHERITED: "inherited_generic_value",
+      // Inherited harness identities to be stripped
+      PI_INTERCOM_NAME: "inherited_pi_name",
+      PI_SESSION_ID: "inherited_pi_sess",
+      PI_SUBAGENT_INTERCOM_SESSION_ID: "inherited_pi_subagent_sess",
+      PI_SUBAGENT_INTERCOM_SESSION_NAME: "inherited_pi_subagent_name",
+      CLAUDE_PEER_ID: "inherited_claude_peer_id",
+      CLAUDE_PEER_NAME: "inherited_claude_peer_name",
+      CLAUDE_INTERCOM_NAME: "inherited_claude_name",
+      CLAUDE_SESSION_ID: "inherited_claude_sess",
+      CODEX_PEER_ID: "inherited_codex_peer_id",
+      CODEX_PEER_NAME: "inherited_codex_peer_name",
+      CODEX_INTERCOM_NAME: "inherited_codex_name",
+      CODEX_SESSION_ID: "inherited_codex_sess",
+      OPENCODE_SESSION_ID: "inherited_opencode_sess",
+      OPENCODE_PEER_NAME: "inherited_opencode_peer_name",
+      OPENCODE_INTERCOM_NAME: "inherited_opencode_name",
+      // Explicitly assigned child environment retained via allowlist
+      AGENT_INTERCOM_WORKER_ID: "assigned_worker_42",
+      AGENT_INTERCOM_ROLE: "builder",
+      AGENT_INTERCOM_MANAGER_TARGET: "manager_session_target_99",
+      AGENT_INTERCOM_SCOPE_ID: "scope_assigned_abc",
+      AGENT_INTERCOM_BOSS_RUN_ID: "boss_run_assigned_xyz",
+      AGENT_INTERCOM_BOSS_AUTHORITY_PUBKEY: "boss_pubkey_assigned",
+      OPENCODE_INTERCOM_SESSION_ID: "opencode_sess_assigned_100",
+      AGENT_INTERCOM_ENV_ALLOWLIST: "AGENT_INTERCOM_WORKER_ID,AGENT_INTERCOM_ROLE,AGENT_INTERCOM_MANAGER_TARGET,AGENT_INTERCOM_SCOPE_ID,AGENT_INTERCOM_BOSS_RUN_ID,AGENT_INTERCOM_BOSS_AUTHORITY_PUBKEY,OPENCODE_INTERCOM_SESSION_ID",
+    },
+  });
+  assert.equal(result.status, 0, result.stderr);
+  // Preserved normal user environment
+  assert.match(result.stdout, /^NORMAL_USER_VARIABLE=user_value$/m);
+  assert.match(result.stdout, /^CUSTOM_PROJECT_ROOT=\/home\/user\/project$/m);
+  // Retained assigned identity variables
+  assert.match(result.stdout, /^AGENT_INTERCOM_WORKER_ID=assigned_worker_42$/m);
+  assert.match(result.stdout, /^AGENT_INTERCOM_ROLE=builder$/m);
+  assert.match(result.stdout, /^AGENT_INTERCOM_MANAGER_TARGET=manager_session_target_99$/m);
+  assert.match(result.stdout, /^AGENT_INTERCOM_SCOPE_ID=scope_assigned_abc$/m);
+  assert.match(result.stdout, /^AGENT_INTERCOM_BOSS_RUN_ID=boss_run_assigned_xyz$/m);
+  assert.match(result.stdout, /^AGENT_INTERCOM_BOSS_AUTHORITY_PUBKEY=boss_pubkey_assigned$/m);
+  assert.match(result.stdout, /^OPENCODE_INTERCOM_SESSION_ID=opencode_sess_assigned_100$/m);
+  // Stripped inherited variables
+  assert.doesNotMatch(result.stdout, /TMUXDECK_/);
+  assert.doesNotMatch(result.stdout, /AGENT_INTERCOM_TEAM_MANIFEST/);
+  assert.doesNotMatch(result.stdout, /AGENT_INTERCOM_GENERIC_INHERITED/);
+  assert.doesNotMatch(result.stdout, /inherited_pi_/);
+  assert.doesNotMatch(result.stdout, /PI_SESSION_ID/);
+  assert.doesNotMatch(result.stdout, /PI_SUBAGENT_INTERCOM_/);
+  assert.doesNotMatch(result.stdout, /inherited_claude_/);
+  assert.doesNotMatch(result.stdout, /CLAUDE_PEER_/);
+  assert.doesNotMatch(result.stdout, /CLAUDE_SESSION_ID/);
+  assert.doesNotMatch(result.stdout, /CLAUDE_INTERCOM_/);
+  assert.doesNotMatch(result.stdout, /inherited_codex_/);
+  assert.doesNotMatch(result.stdout, /CODEX_PEER_/);
+  assert.doesNotMatch(result.stdout, /CODEX_SESSION_ID/);
+  assert.doesNotMatch(result.stdout, /CODEX_INTERCOM_/);
+  assert.doesNotMatch(result.stdout, /inherited_opencode_/);
+  assert.doesNotMatch(result.stdout, /OPENCODE_SESSION_ID/);
+  assert.doesNotMatch(result.stdout, /OPENCODE_PEER_/);
+  assert.doesNotMatch(result.stdout, /OPENCODE_INTERCOM_NAME/);
+  assert.doesNotMatch(result.stdout, /AGENT_INTERCOM_ENV_ALLOWLIST/);
+});
+
 test("clean launcher removes a sentinel inherited from the systemd user manager", (t) => {
   if (process.platform !== "linux" || spawnSync("systemctl", ["--user", "show-environment"]).status !== 0) {
     t.skip("systemd user manager is unavailable");

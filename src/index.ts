@@ -85,6 +85,7 @@ const ADAPTER_READINESS_LAUNCHER = fileURLToPath(new URL("./adapter-readiness-la
 const OPENCODE_PEER_LAUNCHER = fileURLToPath(new URL("./opencode-peer-launcher.mjs", import.meta.url));
 const GIT_GUARD_BIN = fileURLToPath(new URL("./guard-bin", import.meta.url));
 const CLEAN_ENV_LAUNCHER = fileURLToPath(new URL("./clean-env-launcher.mjs", import.meta.url));
+const IDENTITY_ENV_LAUNCHER = fileURLToPath(new URL("./identity-env-launcher.mjs", import.meta.url));
 const SANDBOX_SUPERVISOR = fileURLToPath(new URL("./sandbox-supervisor.mjs", import.meta.url));
 const FLEET_CLEANUP_SCRIPT = fileURLToPath(new URL("./agent-fleet-cleanup.mjs", import.meta.url));
 const ORCHESTRATOR_EXTENSION = fileURLToPath(import.meta.url);
@@ -1574,9 +1575,12 @@ export default function agentIntercomOrchestrator(pi: ExtensionAPI) {
           AGENT_INTERCOM_ADAPTER_HEALTH_PATH: workerHealthPath!,
         } : {}),
       };
+      unitEnvironment.AGENT_INTERCOM_ENV_ALLOWLIST = [...new Set([...Object.keys(profile.env ?? {}), ...Object.keys(unitEnvironment)])].join(",");
       if (permissionProfile.hardened) {
-        unitEnvironment.AGENT_INTERCOM_ENV_ALLOWLIST = [...new Set([...Object.keys(profile.env ?? {}), ...Object.keys(unitEnvironment)])].join(",");
         args = [CLEAN_ENV_LAUNCHER, "--", process.execPath, SANDBOX_SUPERVISOR, "--", launchCommand, ...args];
+        launchCommand = process.execPath;
+      } else {
+        args = [IDENTITY_ENV_LAUNCHER, "--", launchCommand, ...args];
         launchCommand = process.execPath;
       }
       await launchUnit(runner, {

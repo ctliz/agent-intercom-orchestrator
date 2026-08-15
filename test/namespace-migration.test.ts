@@ -359,3 +359,52 @@ test("missing manifest with exact connect.2 ctliz git spec is recognized as OK",
   }
 });
 
+test("canonical v0.12.0-connect.1 ctliz git spec is recognized as OK and not blocked", async () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(
+      join(fixture.agentDir, "settings.json"),
+      JSON.stringify({ packages: [
+        `git:github.com/${CANONICAL_GITHUB_OWNER}/agent-intercom-pi@v0.12.0-connect.1`,
+        `git:github.com/${CANONICAL_GITHUB_OWNER}/agent-intercom-orchestrator@v0.12.0-connect.1`,
+      ] }),
+    );
+
+    const result = await diagnoseNamespaceMigration({
+      agentDir: fixture.agentDir,
+      globalRoot: fixture.globalRoot,
+      pathDirs: [fixture.binDir],
+    });
+
+    assert.equal(result.code, "OK");
+    assert.equal(result.blocked, false);
+    assert.equal(result.legacySurfaces.length, 0);
+    assert.equal(result.canonicalSurfaces.length, 2);
+  } finally {
+    fixture.cleanup();
+  }
+});
+
+test("historical ctliz v0.11.0-connect.1 git spec remains blocked as MIGRATION_REQUIRED", async () => {
+  const fixture = makeFixture();
+  try {
+    writeFileSync(
+      join(fixture.agentDir, "settings.json"),
+      JSON.stringify({ packages: [`git:github.com/${CANONICAL_GITHUB_OWNER}/agent-intercom-pi@v0.11.0-connect.1`] }),
+    );
+
+    const result = await diagnoseNamespaceMigration({
+      agentDir: fixture.agentDir,
+      globalRoot: fixture.globalRoot,
+      pathDirs: [fixture.binDir],
+    });
+
+    assert.equal(result.code, "MIGRATION_REQUIRED");
+    assert.equal(result.blocked, true);
+    assert.ok(result.legacySurfaces.some((s) => s.kind === "pi-settings"));
+    assert.equal(result.canonicalSurfaces.length, 0);
+  } finally {
+    fixture.cleanup();
+  }
+});
+

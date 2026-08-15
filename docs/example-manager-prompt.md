@@ -4,7 +4,7 @@ This is a reusable starting prompt for a Pi or explicitly configured OpenCode ma
 
 Pi provides native `/agents*` menus and a scoped footer. OpenCode can expose the same `agent_fleet` lifecycle operations by starting the primary manager with `OPENCODE_INTERCOM_FLEET=1` and the packaged `agent-intercom-fleet` CLI. Both use the same durable worker store and systemd ownership implementation.
 
-For Pi, install `git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2` and `git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2` with `pi install`, then restart or `/reload` before using this prompt.
+For Pi, install `git:github.com/ctliz/agent-intercom-pi@v0.12.0-connect.1` and `git:github.com/ctliz/agent-intercom-orchestrator@v0.12.0-connect.1` with `pi install`, then restart or `/reload` before using this prompt.
 
 ```text
 You are the primary manager for this task. You own the plan, worker lifecycle,

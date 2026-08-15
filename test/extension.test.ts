@@ -1443,10 +1443,80 @@ test("persistent OpenCode spawn persists resumable state before returning ready"
       assert.ok(systemdArgs.some((arg) => arg.startsWith("--setenv=AGENT_INTERCOM_REAL_GCLOUD=")));
     }
     assert.ok(systemdArgs.some((arg) => arg.includes("clean-env-launcher.mjs")));
+    assert.ok(systemdArgs.some((arg) => arg.startsWith("--setenv=AGENT_INTERCOM_ENV_ALLOWLIST=")));
     const state = JSON.parse(await readFile(join(orchestratorDir, "worker-runtime", "state-race", "state-race.state.json"), "utf8"));
     assert.equal(state.workerId, "state-race");
     assert.equal(state.sessionId, "ses_immediate_state");
     assert.equal(state.directory, "/tmp");
+
+    await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    await rm(agentDir, { recursive: true, force: true });
+  }
+});
+
+test("non-hardened worker launch wraps through identity-env-launcher and sets allowlist", { skip: !hasFlock() }, async () => {
+  const agentDir = await mkdtemp(join(tmpdir(), "agent-intercom-orchestrator-nonhardened-test-"));
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    const orchestratorDir = join(agentDir, "intercom", "orchestrator");
+    await mkdir(orchestratorDir, { recursive: true });
+    await writeFile(join(agentDir, "intercom", "config.json"), JSON.stringify({
+      version: 1,
+      profiles: {
+        "custom-nonhardened": {
+          harness: "pi",
+          command: "pi",
+          args: ["--mode", "rpc"],
+          permissionProfile: "trusted",
+          mode: "persistent",
+        },
+      },
+    }));
+
+    const lifecycle = new Map<string, (...args: any[]) => any>();
+    const tools = new Map<string, any>();
+    let systemdArgs: string[] = [];
+    const pi: any = {
+      on(name: string, handler: (...args: any[]) => any) { lifecycle.set(name, handler); },
+      events: { on() { return () => {}; }, emit() {} },
+      registerTool(tool: any) { tools.set(tool.name, tool); },
+      registerCommand() {},
+      async exec(command: string, args: string[]) {
+        if (command === "systemd-run") {
+          systemdArgs = [...args];
+          return commandResult();
+        }
+        if (command === "systemctl" && args.includes("show")) {
+          return { ...commandResult(), stdout: "LoadState=loaded\nActiveState=active\nSubState=running\nMainPID=456\nResult=success\nExecMainStatus=0\n" };
+        }
+        return commandResult();
+      },
+    };
+    const ctx: any = {
+      cwd: "/tmp", mode: "rpc", hasUI: false,
+      sessionManager: { getSessionId: () => "mgr-nonhardened", getSessionFile: () => undefined },
+      ui: { setStatus() {}, notify() {} },
+    };
+    const extensionUrl = new URL(`../src/index.ts?nonhardened=${Date.now()}`, import.meta.url);
+    const { default: extension } = await import(extensionUrl.href);
+    extension(pi);
+    await lifecycle.get("session_start")?.({}, ctx);
+
+    await tools.get("agent_fleet").execute(
+      "spawn-nonhardened",
+      { action: "spawn", profile: "custom-nonhardened", id: "worker-nonhardened", cwd: "/tmp", task: "work" },
+      new AbortController().signal,
+      () => {},
+      ctx,
+    );
+
+    assert.ok(systemdArgs.some((arg) => arg.includes("identity-env-launcher.mjs")), "Non-hardened launch must use identity-env-launcher");
+    assert.equal(systemdArgs.some((arg) => arg.includes("clean-env-launcher.mjs")), false);
+    assert.ok(systemdArgs.some((arg) => arg.startsWith("--setenv=AGENT_INTERCOM_ENV_ALLOWLIST=")), "Must compute allowlist for non-hardened launch");
 
     await lifecycle.get("session_shutdown")?.({ reason: "reload" }, ctx);
   } finally {

@@ -81,6 +81,26 @@ test("launcher scope inheritance across harnesses and explicit scope clearing", 
   }
 });
 
+test("ambient scope absent when captured scope absent and manifest is never emitted", () => {
+  const previousScope = process.env.AGENT_INTERCOM_SCOPE_ID;
+  const previousManifest = process.env.AGENT_INTERCOM_TEAM_MANIFEST;
+  try {
+    process.env.AGENT_INTERCOM_SCOPE_ID = "Ambient_Scope_12345";
+    process.env.AGENT_INTERCOM_TEAM_MANIFEST = "/tmp/teams/team_ambient.json";
+
+    const env = buildWorkerEnvironment("pi", "worker-ambient", "advisor", undefined, undefined, { intercomScopeId: undefined });
+    assert.equal(env.AGENT_INTERCOM_SCOPE_ID, undefined, "Worker environment must NOT inherit ambient scope when captured scope is absent");
+    assert.equal(Object.hasOwn(env, "AGENT_INTERCOM_TEAM_MANIFEST"), false, "Worker environment must NOT emit team manifest");
+    assert.equal(Object.hasOwn(env, "TMUXDECK_WORKSPACE"), false);
+    assert.equal(Object.hasOwn(env, "TMUXDECK_PANE_ID"), false);
+  } finally {
+    if (previousScope === undefined) delete process.env.AGENT_INTERCOM_SCOPE_ID;
+    else process.env.AGENT_INTERCOM_SCOPE_ID = previousScope;
+    if (previousManifest === undefined) delete process.env.AGENT_INTERCOM_TEAM_MANIFEST;
+    else process.env.AGENT_INTERCOM_TEAM_MANIFEST = previousManifest;
+  }
+});
+
 test("legacy v3 wire payload shape validation and version negotiation predicate", () => {
   // Real v3 registration payload (version: 3, no scopeId)
   const legacyV3Registration = {

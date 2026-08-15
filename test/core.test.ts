@@ -123,6 +123,18 @@ test("harness launch args include identity or the initial task", () => {
   assert.equal(ownedEnv.AGENT_INTERCOM_MANAGER_SESSION_ID, "manager-a");
   assert.equal(ownedEnv.AGENT_INTERCOM_MANAGER_TARGET, "manager-a");
   assert.equal(ownedEnv.AGENT_INTERCOM_FRESH, "1");
+  assert.equal(ownedEnv.AGENT_INTERCOM_ROLE, "advisor");
+  assert.equal(ownedEnv.AGENT_INTERCOM_OWNED, "1");
+  assert.equal(ownedEnv.AGENT_INTERCOM_SCOPE_ID, "scope_1234567890abcdef");
+  assert.equal(Object.hasOwn(ownedEnv, "AGENT_INTERCOM_TEAM_MANIFEST"), false);
+  assert.equal(Object.hasOwn(ownedEnv, "TMUXDECK_WORKSPACE"), false);
+
+  const opencodeEnv = buildWorkerEnvironment("opencode", "worker-oc", "builder", undefined, {
+    runId: "run-oc", unit: "worker-oc.service", managerSessionId: "mgr-oc",
+  });
+  assert.equal(opencodeEnv.OPENCODE_INTERCOM_NAME, "worker-oc");
+  assert.equal(opencodeEnv.OPENCODE_INTERCOM_SESSION_ID, "worker-oc");
+  assert.equal(opencodeEnv.AGENT_INTERCOM_MANAGER_TARGET, "mgr-oc");
 });
 
 test("systemd durations are validated before configuration is saved", () => {

@@ -23,8 +23,8 @@ interface BossResourceDefinition {
 
 const REQUIRED_RESOURCES: readonly BossResourceDefinition[] = [
   // Agent Intercom packages moved to the ctliz owner in connect.2.
-  { id: "intercom-pi", packageName: "@ctliz/agent-intercom-pi", source: "git:github.com/ctliz/agent-intercom-pi@v0.11.0-connect.2", repositoryPath: "ctliz/agent-intercom-pi", extensionPath: "index.ts" },
-  { id: "orchestrator", packageName: "@ctliz/agent-intercom-orchestrator", source: "git:github.com/ctliz/agent-intercom-orchestrator@v0.11.0-connect.2", repositoryPath: "ctliz/agent-intercom-orchestrator", extensionPath: "src/index.ts" },
+  { id: "intercom-pi", packageName: "@ctliz/agent-intercom-pi", source: "git:github.com/ctliz/agent-intercom-pi@v0.12.0-connect.1", repositoryPath: "ctliz/agent-intercom-pi", extensionPath: "index.ts" },
+  { id: "orchestrator", packageName: "@ctliz/agent-intercom-orchestrator", source: "git:github.com/ctliz/agent-intercom-orchestrator@v0.12.0-connect.1", repositoryPath: "ctliz/agent-intercom-orchestrator", extensionPath: "src/index.ts" },
   // Third-party dependencies that genuinely live under the dataforxyz owner.
   { id: "ralph", packageName: "pi-extensions", source: "git:github.com/dataforxyz/pi-extensions", repositoryPath: "dataforxyz/pi-extensions", extensionPath: "pi-ralph-wiggum/index.ts" },
   { id: "return-on", packageName: "pi-return-on", source: "git:github.com/dataforxyz/pi-return-on", repositoryPath: "dataforxyz/pi-return-on", extensionPath: "src/index.ts", unpublished: true },
